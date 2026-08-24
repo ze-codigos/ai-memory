@@ -35,7 +35,10 @@ dirs.workspace = true
 figment.workspace = true
 flate2.workspace = true
 fs2.workspace = true
-rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
+# `reqwest` liga `reqwest?/rustls`: sem TLS o bridge só alcança upstream
+# http:// (loopback) — um `--server-url https://…` falha com
+# "invalid URL, scheme is not http" no connect.
+rmcp = { workspace = true, features = ["client", "reqwest", "transport-streamable-http-client-reqwest"] }
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
