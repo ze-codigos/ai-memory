@@ -112,13 +112,16 @@ jobs:
 
       - name: Create manifest list
         working-directory: ${{ runner.temp }}/digests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ghcr.io/${{ env.IMAGE_NAME }}
         run: |
           args=""
-          for t in ${{ steps.meta.outputs.tags }}; do
+          for t in $TAGS; do
             args="$args --tag $t"
           done
           for f in *; do
-            args="$args ghcr.io/${{ env.IMAGE_NAME }}@sha256:$f"
+            args="$args $IMAGE@sha256:$f"
           done
           docker buildx imagetools create $args
 
