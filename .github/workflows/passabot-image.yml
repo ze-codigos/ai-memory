@@ -3,14 +3,11 @@ name: passabot-image
 # ze-codigos fork addition: publish the patched server image to GHCR.
 # Complements upstream's ci.yml (fmt/clippy/test) and replaces upstream's
 # Docker Hub publication (release.yml) for our deployment path — the EC2 host
-# pulls from here (or from the ECR mirror in shared-services).
+# pulls from here (or from the ECR mirror in the target account).
 #
-# Triggers:
-#   - pushes to passabot/* patch branches (image tagged with the branch name,
-#     for POCs and homolog)
-#   - tags v<X.Y.Z>-passabot.<N> (versioned pinning target for production;
-#     the host compose pins by digest after mirroring to ECR)
-#   - manual dispatch
+# Multi-arch via a runner matrix (native amd64 + native arm64 — the repo is a
+# public fork, so the free ubuntu-24.04-arm runners are available; emulated
+# qemu arm64 builds of this workspace take 3-4x longer).
 
 on:
   push:
@@ -20,17 +17,78 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 permissions:
   contents: read
   packages: write
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Prepare platform pair
+        id: plat
+        run: |
+          platform=${{ matrix.platform }}
+          echo "pair=${platform//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=build-${{ steps.plat.outputs.pair }}
+          cache-to: type=gha,mode=max,scope=build-${{ steps.plat.outputs.pair }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ steps.plat.outputs.pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -46,20 +104,20 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
             type=sha,prefix={{branch}}-sha-
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(printf -- '--tag %s ' $(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' ')) \
+            $(printf -- 'https://ghcr.io/%s@sha256:%s ' "${{ env.IMAGE_NAME }}" *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
