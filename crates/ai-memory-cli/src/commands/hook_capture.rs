@@ -356,6 +356,7 @@ pub async fn post_hook(
         .header("Content-Type", "application/json")
         .timeout(timeout)
         .body(body.to_owned());
+    req = crate::http_client::apply_extra_headers(req);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -420,6 +421,7 @@ pub async fn post_batch(
         .header("Content-Type", "application/json")
         .timeout(timeout)
         .body(payload.to_owned());
+    req = crate::http_client::apply_extra_headers(req);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -494,6 +496,7 @@ pub async fn get_handoff(
     timeout: Duration,
 ) -> Option<String> {
     let mut req = client.get(url).timeout(timeout);
+    req = crate::http_client::apply_extra_headers(req);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }

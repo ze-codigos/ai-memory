@@ -1,0 +1,65 @@
+name: passabot-image
+
+# ze-codigos fork addition: publish the patched server image to GHCR.
+# Complements upstream's ci.yml (fmt/clippy/test) and replaces upstream's
+# Docker Hub publication (release.yml) for our deployment path — the EC2 host
+# pulls from here (or from the ECR mirror in shared-services).
+#
+# Triggers:
+#   - pushes to passabot/* patch branches (image tagged with the branch name,
+#     for POCs and homolog)
+#   - tags v<X.Y.Z>-passabot.<N> (versioned pinning target for production;
+#     the host compose pins by digest after mirroring to ECR)
+#   - manual dispatch
+
+on:
+  push:
+    branches: ["passabot/**"]
+    tags: ["v*-passabot.*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix={{branch}}-sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

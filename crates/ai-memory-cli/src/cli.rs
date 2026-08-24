@@ -1675,6 +1675,11 @@ pub struct McpBridgeArgs {
     /// Remote ai-memory base URL or full `/mcp` endpoint.
     #[arg(long)]
     pub server_url: Option<String>,
+    /// Extra HTTP header stamped on every upstream request, as `Name: value`.
+    /// Repeatable; merged on top of AI_MEMORY_HTTP_EXTRA_HEADERS. For edge
+    /// authenticating proxies (e.g. `cf-access-token` for Cloudflare Access).
+    #[arg(long = "extra-header")]
+    pub extra_header: Vec<String>,
 }
 
 /// Transport for the MCP server.

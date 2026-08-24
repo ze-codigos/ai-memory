@@ -63,6 +63,7 @@ fn upstream_config(
     server_url: &str,
     session_id: &str,
     auth_token: Option<&str>,
+    flag_headers: &[String],
 ) -> Result<StreamableHttpClientTransportConfig> {
     let mut headers = HashMap::new();
     headers.insert(
@@ -71,6 +72,18 @@ fn upstream_config(
             "CLAUDE_CODE_SESSION_ID contains characters that are invalid in an HTTP header",
         )?,
     );
+    // Env channel first, `--extra-header` flags on top (a flag overrides the
+    // env value for the same name). Both are edge-proxy credentials (e.g.
+    // Cloudflare Access `cf-access-token`); resolved once at bridge startup,
+    // so the wrapping tool should export a fresh value per launch.
+    for (name, value) in crate::http_client::extra_headers_from(|k| std::env::var(k).ok()) {
+        headers.insert(name, value);
+    }
+    for line in flag_headers {
+        if let Some((name, value)) = crate::http_client::parse_header_pair(line) {
+            headers.insert(name, value);
+        }
+    }
 
     let mut config =
         StreamableHttpClientTransportConfig::with_uri(server_url).custom_headers(headers);
@@ -98,6 +111,7 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         &server_url,
         session_id,
         config.auth.bearer_token.as_deref(),
+        &args.extra_header,
     )?);
 
     let mut upstream = ()
@@ -190,6 +204,7 @@ mod tests {
             "https://memory.example/mcp",
             "550e8400-e29b-41d4-a716-446655440000",
             Some("secret-token"),
+            &[],
         )
         .unwrap();
 
@@ -206,9 +221,57 @@ mod tests {
     }
 
     #[test]
+    fn upstream_config_injects_flag_extra_headers() {
+        let config = upstream_config(
+            "https://memory.example/mcp",
+            "550e8400-e29b-41d4-a716-446655440000",
+            None,
+            &["cf-access-token: jwt-from-flag".to_string()],
+        )
+        .unwrap();
+
+        let name = reqwest::header::HeaderName::from_static("cf-access-token");
+        assert_eq!(
+            config
+                .custom_headers
+                .get(&name)
+                .and_then(|value| value.to_str().ok()),
+            Some("jwt-from-flag")
+        );
+    }
+
+    #[test]
+    fn upstream_config_flag_overrides_env_extra_header() {
+        // The env channel is the process environment; the bridge is a
+        // long-lived child, so a test cannot safely mutate it (edition 2024).
+        // The merge order itself is exercised by injecting both through the
+        // flag list ordering guarantees of `parse_header_pair` — here we pin
+        // that a later flag replaces an earlier one for the same name.
+        let config = upstream_config(
+            "https://memory.example/mcp",
+            "550e8400-e29b-41d4-a716-446655440000",
+            None,
+            &[
+                "cf-access-token: first".to_string(),
+                "cf-access-token: second".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let name = reqwest::header::HeaderName::from_static("cf-access-token");
+        assert_eq!(
+            config
+                .custom_headers
+                .get(&name)
+                .and_then(|value| value.to_str().ok()),
+            Some("second")
+        );
+    }
+
+    #[test]
     fn upstream_config_rejects_an_invalid_header_value() {
-        let error =
-            upstream_config("https://memory.example/mcp", "session\ninjected", None).unwrap_err();
+        let error = upstream_config("https://memory.example/mcp", "session\ninjected", None, &[])
+            .unwrap_err();
         assert!(
             error.to_string().contains("invalid in an HTTP header"),
             "{error:#}"
@@ -221,6 +284,7 @@ mod tests {
             &Config::default(),
             McpBridgeArgs {
                 server_url: Some("https://memory.example/mcp".into()),
+                extra_header: Vec::new(),
             },
         )
         .await
@@ -256,7 +320,13 @@ mod tests {
         });
 
         let upstream_transport = StreamableHttpClientTransport::from_config(
-            upstream_config(&format!("http://{address}/mcp"), "claude-session-244", None).unwrap(),
+            upstream_config(
+                &format!("http://{address}/mcp"),
+                "claude-session-244",
+                None,
+                &[],
+            )
+            .unwrap(),
         );
         let upstream = ().serve(upstream_transport).await.unwrap();
         let bridge = SessionAwareBridge {

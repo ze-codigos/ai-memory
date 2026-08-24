@@ -17,11 +17,82 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::config::{Config, DEFAULT_SERVER_URL};
 use ai_memory_web::normalize_prefix;
+
+/// Env var carrying extra static headers for hook/MCP HTTP delivery.
+///
+/// Format: one `Name: value` pair per `\n`-separated line. Designed for edge
+/// authenticating proxies (Cloudflare Access sends its user JWT in
+/// `cf-access-token`, which the server's own bearer slot cannot carry): a
+/// wrapping tool resolves the short-lived credential and exports it right
+/// before invoking the CLI. Values are read at request time and are therefore
+/// deliberately never serialized into the hook spool — a token valid at
+/// capture time is routinely expired by drain time.
+pub(crate) const EXTRA_HEADERS_ENV: &str = "AI_MEMORY_HTTP_EXTRA_HEADERS";
+
+/// Header names the extra-header channel must not override: `Authorization`
+/// belongs to the configured bearer path and `Content-Type` to the JSON
+/// payload serialization. Conflicting lines are skipped with a warning rather
+/// than producing duplicate headers on the wire.
+const EXTRA_HEADERS_RESERVED: [&str; 2] = ["authorization", "content-type"];
+
+/// Parse one `Name: value` line into a validated header pair. Returns `None`
+/// (after warning) for malformed lines, reserved names, or values containing
+/// control bytes — the request path must never fail over bad configuration.
+pub(crate) fn parse_header_pair(line: &str) -> Option<(HeaderName, HeaderValue)> {
+    let line = line.trim();
+    let (name, value) = line.split_once(':')?;
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty() || value.is_empty() {
+        eprintln!(
+            "ai-memory warning: ignoring malformed extra header line (expected 'Name: value'): {line:?}"
+        );
+        return None;
+    }
+    if EXTRA_HEADERS_RESERVED.contains(&name.to_ascii_lowercase().as_str()) {
+        eprintln!(
+            "ai-memory warning: extra header {name:?} is reserved and was skipped (configure auth via the token settings instead)"
+        );
+        return None;
+    }
+    let header_name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+    let header_value = HeaderValue::from_str(value).ok()?;
+    Some((header_name, header_value))
+}
+
+/// Resolve the extra headers via an environment lookup (injectable for tests).
+pub(crate) fn extra_headers_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let Some(raw) = lookup(EXTRA_HEADERS_ENV) else {
+        return Vec::new();
+    };
+    raw.split('\n').filter_map(parse_header_pair).collect()
+}
+
+/// Apply [`extra_headers_from`] to a request using the process environment.
+pub(crate) fn apply_extra_headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    apply_extra_headers_with(|k| std::env::var(k).ok(), req)
+}
+
+/// Testable core of [`apply_extra_headers`]: resolve pairs via `lookup` and
+/// stamp them onto `req`.
+pub(crate) fn apply_extra_headers_with(
+    lookup: impl Fn(&str) -> Option<String>,
+    req: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    let mut req = req;
+    for (name, value) in extra_headers_from(lookup) {
+        req = req.header(name, value);
+    }
+    req
+}
 
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
@@ -434,6 +505,86 @@ fn private_output_file(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----------------------------------------------------------------
+    // Extra headers (edge-proxy credentials) — parse + apply
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn parse_header_pair_accepts_a_trimmed_pair() {
+        let (name, value) = parse_header_pair("  cf-access-token:  eyJabc.def  ").unwrap();
+        assert_eq!(name.as_str(), "cf-access-token");
+        assert_eq!(value.to_str().unwrap(), "eyJabc.def");
+    }
+
+    #[test]
+    fn parse_header_pair_rejects_malformed_lines() {
+        assert!(parse_header_pair("no-colon-here").is_none());
+        assert!(parse_header_pair(": value").is_none());
+        assert!(parse_header_pair("name: ").is_none());
+        assert!(parse_header_pair("").is_none());
+        assert!(parse_header_pair("bad name: value").is_none());
+    }
+
+    #[test]
+    fn parse_header_pair_rejects_reserved_names() {
+        assert!(parse_header_pair("Authorization:Bearer x").is_none());
+        assert!(parse_header_pair("authorization: Bearer x").is_none());
+        assert!(parse_header_pair("Content-Type: text/plain").is_none());
+        assert!(parse_header_pair("content-type: text/plain").is_none());
+    }
+
+    #[test]
+    fn extra_headers_from_parses_each_line_and_skips_garbage() {
+        let lookup = |_k: &str| {
+            Some(
+                "cf-access-token: jwt-1\n\
+                 \n\
+                 broken-line\n\
+                 Authorization: Bearer nope\n\
+                 x-custom: yes"
+                    .to_string(),
+            )
+        };
+        let headers = extra_headers_from(lookup);
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert_eq!(headers[0].0.as_str(), "cf-access-token");
+        assert_eq!(headers[0].1.to_str().unwrap(), "jwt-1");
+        assert_eq!(headers[1].0.as_str(), "x-custom");
+    }
+
+    #[test]
+    fn extra_headers_from_returns_empty_when_env_absent() {
+        assert!(extra_headers_from(|_| None).is_empty());
+    }
+
+    #[test]
+    fn apply_extra_headers_with_stamps_the_request() {
+        let client = reqwest::Client::new();
+        let req = apply_extra_headers_with(
+            |_| Some("cf-access-token: jwt-2".to_string()),
+            client.get("http://localhost"),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            req.headers()
+                .get("cf-access-token")
+                .and_then(|v| v.to_str().ok()),
+            Some("jwt-2")
+        );
+        // Reserved names never reach the wire through this channel.
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn apply_extra_headers_with_leaves_request_unchanged_when_unset() {
+        let client = reqwest::Client::new();
+        let req = apply_extra_headers_with(|_| None, client.get("http://localhost"))
+            .build()
+            .unwrap();
+        assert!(req.headers().get("cf-access-token").is_none());
+    }
 
     #[cfg(unix)]
     #[test]
