@@ -113,11 +113,16 @@ jobs:
       - name: Create manifest list
         working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create \
-            $(printf -- '--tag %s ' $(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' ')) \
-            $(printf -- 'https://ghcr.io/%s@sha256:%s ' "${{ env.IMAGE_NAME }}" *)
+          args=""
+          for t in ${{ steps.meta.outputs.tags }}; do
+            args="$args --tag $t"
+          done
+          for f in *; do
+            args="$args ghcr.io/${{ env.IMAGE_NAME }}@sha256:$f"
+          done
+          docker buildx imagetools create $args
 
       - name: Inspect image
         run: |
           docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
