@@ -315,9 +315,18 @@ fn marker_query_suffix_impl(
 /// is pure overhead for a loopback/LAN POST. Built once per invocation and
 /// reused for both the event POST and the handoff GET. Default root certs
 /// are kept so HTTPS targets (e.g. a TLS proxy) still work.
+///
+/// Redirects are NOT followed: the hook API never redirects, so a 3xx can
+/// only be an auth wall (e.g. Cloudflare Access bouncing an expired token to
+/// its login page). Following it turns a failed POST into a 200 login page —
+/// `Delivered` — and the spooled event is deleted without ever reaching the
+/// server; on session-start it also injects the login HTML as agent context.
+/// With redirects off the 3xx surfaces as a non-2xx: the event stays spooled
+/// and the handoff fetch returns None.
 pub fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -631,6 +640,42 @@ mod tests {
         let url = serve_once("202 Accepted", "queued").await;
         let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
         assert_eq!(outcome, PostOutcome::Delivered);
+    }
+
+    /// Serve a 302 whose Location points at a 200 "login page" — the shape of
+    /// an auth wall (e.g. Cloudflare Access bouncing an expired token).
+    async fn serve_once_auth_wall() -> String {
+        let login = serve_once("200 OK", "<html>Sign in</html>").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {login}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}/hook")
+    }
+
+    #[tokio::test]
+    async fn post_hook_auth_wall_redirect_is_failed_not_delivered() {
+        // Regression: with redirect-following, a 302 to a login page becomes a
+        // 200 and the spooled event is deleted as Delivered without ever
+        // reaching the server.
+        let url = serve_once_auth_wall().await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn get_handoff_auth_wall_redirect_is_none_not_login_html() {
+        // Regression: the login HTML must never be injected as agent context.
+        let url = serve_once_auth_wall().await;
+        let got = get_handoff(&build_client(), &url, None, Duration::from_secs(1)).await;
+        assert!(got.is_none(), "auth-wall redirect must not become context");
     }
 
     #[tokio::test]
