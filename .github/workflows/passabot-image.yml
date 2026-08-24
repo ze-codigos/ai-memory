@@ -126,3 +126,34 @@ jobs:
         run: |
           docker buildx imagetools inspect \
             ghcr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+  mirror-ecr:
+    needs: merge
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::192497949691:role/passabot-github-ecr-ai-memory
+          aws-region: us-east-2
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror multi-arch image to ECR
+        run: |
+          TAG="${GITHUB_REF_NAME//\//-}"
+          SRC="ghcr.io/${{ github.repository }}:${TAG}"
+          DST="192497949691.dkr.ecr.us-east-2.amazonaws.com/passabot/ai-memory:${TAG}"
+          docker buildx imagetools create -t "$DST" "$SRC"
+          docker buildx imagetools inspect "$DST" | grep -c Platform
