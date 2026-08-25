@@ -1,0 +1,140 @@
+name: passabot-release
+
+# ze-codigos fork addition: publish prebuilt ai-memory CLI binaries so the
+# passabot-memory onboarding can `curl` them instead of requiring every dev to
+# have Rust + a C toolchain (`cargo install --git` was the #1 onboarding
+# blocker). Complements passabot-image.yml (server image); the artifact set
+# here is CLI-only.
+#
+# Trigger: manual (workflow_dispatch) from the passabot/upstream-patches
+# branch. Tags are named `passabot-v<cargo version>-<suffix>` on purpose:
+# they match neither upstream release.yml (`v*.*.*`) nor passabot-image.yml
+# (`v*-passabot.*`), so no other workflow fires.
+#
+# Targets: linux x86_64 (also covers WSL2), linux aarch64, macos aarch64,
+# macos x86_64. Windows-native is unsupported by policy (WSL2 is the
+# supported path), so no Windows artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      suffix:
+        description: "sufixo do release (r1, r2, ...) — bump a cada re-release da mesma versão"
+        required: true
+        default: "r1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: ai-memory-linux-x86_64
+            runner: ubuntu-22.04
+          - artifact: ai-memory-linux-aarch64
+            runner: ubuntu-22.04-arm
+          - artifact: ai-memory-macos-aarch64
+            runner: macos-15
+          - artifact: ai-memory-macos-x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.95
+        with:
+          toolchain: "1.95"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build release binary
+        env:
+          TAILWIND_SKIP: "1"
+        run: cargo build --release -p ai-memory-cli
+
+      # CLI-only tarball: just the binary + checksum. The passabot-memory
+      # plugin never uses upstream's hooks/packaging/docs payload.
+      - name: Create release tarball
+        env:
+          RELEASE_ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          artifact="$RELEASE_ARTIFACT"
+          mkdir -p "dist/$artifact"
+          cp target/release/ai-memory "dist/$artifact/ai-memory"
+          tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
+          else
+            shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
+          fi
+
+      - name: Smoke test tarball
+        env:
+          RELEASE_ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          artifact="$RELEASE_ARTIFACT"
+          smoke="dist/smoke-$artifact"
+          mkdir -p "$smoke"
+          tar -xzf "$artifact.tar.gz" -C "$smoke"
+          "$smoke/ai-memory" --version
+          grep -Eq "^[0-9a-f]{64}  $artifact\.tar\.gz$" "$artifact.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+
+  release:
+    name: create github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compute release tag
+        id: tag
+        env:
+          SUFFIX: ${{ inputs.suffix }}
+        run: |
+          set -euo pipefail
+          version="$(awk -F ' *= *' '
+            /^\[workspace.package\]$/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && $1 == "version" {
+              gsub(/"/, "", $2);
+              print $2;
+              exit;
+            }
+          ' Cargo.toml)"
+          [ -n "$version" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
+          echo "tag=passabot-v${version}-${SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ai-memory-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -l dist/
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG (binários CLI para o passabot-memory)" \
+            --notes "Binários pré-buildados do \`ai-memory\` (fork ze-codigos, branch \`passabot/upstream-patches\`, commit ${GITHUB_SHA}) consumidos pelo \`install.sh\` do plugin passabot-memory. Targets: linux x86_64/aarch64, macos aarch64/x86_64 (Windows = WSL2, usa o linux x86_64)." \
+            dist/*.tar.gz dist/*.tar.gz.sha256
