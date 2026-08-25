@@ -6,22 +6,23 @@ name: passabot-release
 # blocker). Complements passabot-image.yml (server image); the artifact set
 # here is CLI-only.
 #
-# Trigger: manual (workflow_dispatch) from the passabot/upstream-patches
-# branch. Tags are named `passabot-v<cargo version>-<suffix>` on purpose:
-# they match neither upstream release.yml (`v*.*.*`) nor passabot-image.yml
-# (`v*-passabot.*`), so no other workflow fires.
+# Trigger: push of a `passabot-v<cargo version>-<suffix>` tag (e.g.
+# passabot-v1.28.0-r1) on the passabot/upstream-patches branch — bump the
+# suffix (r2, r3, ...) to re-release the same version. Tag-push triggers use
+# the workflow file at the tag's commit, so this works without living on the
+# default branch (workflow_dispatch would require that, and `main` is the
+# upstream mirror). The pattern matches neither upstream release.yml
+# (`v*.*.*`) nor passabot-image.yml (`v*-passabot.*`), so no other workflow
+# fires.
 #
 # Targets: linux x86_64 (also covers WSL2), linux aarch64, macos aarch64,
 # macos x86_64. Windows-native is unsupported by policy (WSL2 is the
 # supported path), so no Windows artifact.
 
 on:
-  workflow_dispatch:
-    inputs:
-      suffix:
-        description: "sufixo do release (r1, r2, ...) — bump a cada re-release da mesma versão"
-        required: true
-        default: "r1"
+  push:
+    tags:
+      - "passabot-v*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -102,10 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Compute release tag
-        id: tag
-        env:
-          SUFFIX: ${{ inputs.suffix }}
+      - name: Validate tag against Cargo.toml version
         run: |
           set -euo pipefail
           version="$(awk -F ' *= *' '
@@ -118,7 +116,10 @@ jobs:
             }
           ' Cargo.toml)"
           [ -n "$version" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
-          echo "tag=passabot-v${version}-${SUFFIX}" >> "$GITHUB_OUTPUT"
+          case "$GITHUB_REF_NAME" in
+            "passabot-v${version}-"*) ;;
+            *) echo "tag $GITHUB_REF_NAME não bate com a versão do Cargo.toml ($version) — use passabot-v${version}-rN" >&2; exit 1 ;;
+          esac
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -129,12 +130,11 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           ls -l dist/
           gh release create "$TAG" \
-            --target "$GITHUB_SHA" \
             --title "$TAG (binários CLI para o passabot-memory)" \
             --notes "Binários pré-buildados do \`ai-memory\` (fork ze-codigos, branch \`passabot/upstream-patches\`, commit ${GITHUB_SHA}) consumidos pelo \`install.sh\` do plugin passabot-memory. Targets: linux x86_64/aarch64, macos aarch64/x86_64 (Windows = WSL2, usa o linux x86_64)." \
             dist/*.tar.gz dist/*.tar.gz.sha256
