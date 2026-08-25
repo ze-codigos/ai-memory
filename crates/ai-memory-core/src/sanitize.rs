@@ -65,6 +65,20 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
     // URL-embedded credentials: scheme://user:pass@host.
     r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^:/\s]+:[^@\s]+@[^\s]+",
+    // Pasted HTTP snippets (curl / httpie / fetch): the credential rides in
+    // `-u user:pass`, a Basic header, a sensitive header name, a JSON body
+    // field, or a query-string parameter.
+    // curl `-u`/`--user` inline credentials.
+    r#"(?i)(?:^|\s)--?u(?:ser)?[ =]+["']?[^\s:"']+:[^\s"']+"#,
+    // HTTP Basic auth header value (base64 blob after "Basic").
+    r#"(?i)\bbasic\s+[A-Za-z0-9+/=]{16,}"#,
+    // Sensitive header names with their value (hyphenated shapes the
+    // generic env-var catch-all below cannot reach).
+    r#"(?i)\b(?:x-api-key|api-key|apikey|x-auth-token|x-access-token|x-goog-api-key|x-amz-security-token|private-token|cf-access-token|client[-_]secret|access[-_]token|refresh[-_]token)\b["']?\s*[:=]\s*["']?\S{6,}"#,
+    // JSON body secret fields: {"password": "…"}, {"senha": "…"}, etc.
+    r#"(?i)"(?:password|passwd|senha|secret|api_?key|token|access_token|refresh_token|client_secret|private_key|authorization)"\s*:\s*"[^"]{4,}""#,
+    // Query-string credentials: ?api_key=… / &token=… / ?signature=…
+    r#"(?i)[?&](?:api_?key|apikey|token|access_token|refresh_token|secret|client_secret|password|passwd|senha|signature|sig|auth)=[^&\s"']+"#,
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
     // even without `sk-` shape).
@@ -269,6 +283,91 @@ mod tests {
         let out = s().scrub("slack=xoxb-1234567890-abcdefghij");
         assert!(out.contains("[REDACTED]"));
         assert!(!out.contains("xoxb-1234"));
+    }
+
+    // --- pasted HTTP snippets (curl / httpie / fetch) -------------------
+    // Devs paste whole curl commands into agent chats; the credential can
+    // ride in `-u`, a header flag, a JSON body field, or a query string.
+
+    #[test]
+    fn scrubs_curl_user_flag_credentials() {
+        for cmd in [
+            "curl -u admin:hunter2secret https://api.example.com/v1/report",
+            "curl --user svc-report:p4ssw0rdlong https://internal/report",
+        ] {
+            let out = s().scrub(cmd);
+            assert!(out.contains("[REDACTED]"), "not redacted: {cmd}");
+            assert!(
+                !out.contains("hunter2secret") && !out.contains("p4ssw0rdlong"),
+                "credential survived: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrubs_basic_auth_header_value() {
+        let out = s().scrub("curl -H 'Authorization: Basic YWRtaW46aHVudGVyMnNlY3JldA=='");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("YWRtaW46"));
+    }
+
+    #[test]
+    fn scrubs_sensitive_header_flag_values() {
+        for txt in [
+            r#"curl -H "x-api-key: 9f8e7d6c5b4a39281706fedcba" https://api.example.com"#,
+            r#"curl -H 'X-Auth-Token: tok9f8e7d6c5b4a3928' https://api.example.com"#,
+            r#"-H "cf-access-token: opaque-edge-token-value-123456""#,
+            r#"headers = {"apikey": "9f8e7d6c5b4a39281706"}"#,
+        ] {
+            let out = s().scrub(txt);
+            assert!(out.contains("[REDACTED]"), "not redacted: {txt}");
+            assert!(
+                !out.contains("9f8e7d6c5b4a3928")
+                    && !out.contains("opaque-edge-token-value"),
+                "secret survived: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrubs_json_body_secret_fields() {
+        for txt in [
+            r#"curl -d '{"username": "x", "password": "hunter2!"}' https://api"#,
+            r#"payload: {"senha": "minhasenha123"}"#,
+            r#"{"client_secret": "cs_9f8e7d6c5b4a"}"#,
+        ] {
+            let out = s().scrub(txt);
+            assert!(out.contains("[REDACTED]"), "not redacted: {txt}");
+            assert!(
+                !out.contains("hunter2!")
+                    && !out.contains("minhasenha123")
+                    && !out.contains("cs_9f8e7d6c5b4a"),
+                "secret survived: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrubs_query_string_credentials() {
+        for txt in [
+            "curl 'https://api.example.com/v1/x?api_key=9f8e7d6c5b4a&foo=1'",
+            "GET https://h.example.com/cb?token=tok9f8e7d6c5b4a3928",
+            "https://s3.example.com/obj?signature=abcDEF123456789&expires=99",
+        ] {
+            let out = s().scrub(txt);
+            assert!(out.contains("[REDACTED]"), "not redacted: {txt}");
+            assert!(
+                !out.contains("9f8e7d6c5b4a") && !out.contains("abcDEF123456789"),
+                "secret survived: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_innocuous_curl_untouched() {
+        let cmd = "curl -s https://api.example.com/health -H 'Accept: application/json'";
+        let out = s().scrub(cmd);
+        assert_eq!(out, cmd, "innocuous curl must survive unchanged");
     }
 
     #[test]
