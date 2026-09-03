@@ -10,7 +10,7 @@
 //!    semantic pages, feeds them to the LLM with a structured-output
 //!    prompt asking for contradictions / stale claims.
 //!
-//! Findings are written to `wiki/_lint/<YYYY-MM-DD>.md` so they're
+//! Findings are written to `wiki/_lint/report.md` so they're
 //! grep-able and tracked in git.
 
 /// System prompt for the contradiction-detection lint pass. Loaded
@@ -81,13 +81,83 @@ pub enum LintError {
 const US_PER_DAY: f64 = 86_400_000_000.0;
 /// Cap on pages fed to the LLM contradiction pass (token budget).
 pub const LLM_CLUSTER_CAP: usize = 20;
-/// Stale threshold: an unused page this many days old is flagged.
+/// Stale threshold at the default `[decay] lambda`, in days.
+///
+/// Kept for callers that want the historical constant; the live threshold
+/// comes from [`stale_days_for`].
 pub const STALE_DAYS: f64 = 30.0;
+
+/// Decay score at which an unread episodic page is called stale:
+/// `exp(-0.02 * 30)`, the score the old fixed 30-day threshold implied at
+/// the default lambda. Stored as its negative log so the day count is a
+/// plain division.
+const STALE_SCORE_LN: f64 = 0.6;
+
+/// Days after which an unread episodic page is flagged stale, derived from
+/// the operator's `[decay] lambda`.
+///
+/// The rule only fires on pages with `access_count == 0`, and for those the
+/// decay score reduces exactly to `salience * exp(-lambda * age)` — the M8
+/// reinforcement term carries `ln(1 + access_count)`, which is zero. So the
+/// lint was already measuring decay; it just measured it against a constant
+/// instead of against the operator's lambda, and the two diverged by a
+/// growing factor as lambda moved.
+///
+/// Concretely, at `lambda = 0.008` real eviction lands near day 201 while a
+/// fixed threshold still called the page stale on day 31 — and because the
+/// lint wrote `_lint/<date>.md` whenever any finding exists, one page
+/// nobody intends to read produced a new page every day, forever (#426).
+/// (The report now supersedes a single `_lint/report.md`, so even a
+/// permanently-stale page costs one page, not one per day.)
+///
+/// `lambda = 0.02` (the default) yields exactly 30 days, so an operator who
+/// never touched decay sees no change.
+#[must_use]
+pub fn stale_days_for(lambda: f64) -> f64 {
+    if lambda.is_finite() && lambda > 0.0 {
+        STALE_SCORE_LN / lambda
+    } else {
+        // Fail back to the historical constant rather than emitting
+        // infinity (which would silence the rule) or NaN (which would make
+        // every comparison false).
+        STALE_DAYS
+    }
+}
+
+/// Options for [`run_lint`].
+///
+/// A struct rather than three positional parameters: `false, false` at a
+/// call site said nothing about which switch was which, and the threshold
+/// input has to travel alongside them.
+#[derive(Debug, Clone, Copy)]
+pub struct LintOptions {
+    /// When `true`, no `_lint/report.md` page is written (and no legacy
+    /// dated reports are pruned).
+    pub dry_run: bool,
+    /// When `false`, the LLM contradiction pass is skipped even if a
+    /// provider was supplied.
+    pub use_llm: bool,
+    /// The operator's `[decay] lambda`. The stale threshold is derived from
+    /// it — see [`stale_days_for`].
+    pub decay_lambda: f64,
+}
+
+impl Default for LintOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            use_llm: true,
+            decay_lambda: 0.02,
+        }
+    }
+}
 
 /// Run the lint pass.
 ///
 /// * `llm` — when `Some`, the contradiction pass runs; otherwise the
 ///   report contains only rule-based findings.
+/// * `decay_lambda` — the operator's `[decay] lambda`; the stale
+///   threshold is derived from it (see [`stale_days_for`]).
 /// * `dry_run` — when `true`, no file is written.
 /// * `use_llm` — when `false`, the contradiction pass is skipped even
 ///   if a provider is present. Lets operators run rule-based-only lint
@@ -101,11 +171,15 @@ pub async fn run_lint(
     llm: Option<&std::sync::Arc<dyn LlmProvider>>,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-    dry_run: bool,
-    use_llm: bool,
+    options: LintOptions,
 ) -> Result<LintReport, LintError> {
+    let LintOptions {
+        dry_run,
+        use_llm,
+        decay_lambda,
+    } = options;
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
-    let mut findings = rule_based_findings(&candidates);
+    let mut findings = rule_based_findings(&candidates, stale_days_for(decay_lambda));
 
     // Dangling cross-project links: a `[[project:path]]` dependency that does
     // not resolve. A broken inter-project edge is high-signal — surface it
@@ -135,6 +209,32 @@ pub async fn run_lint(
             severity: "warning".into(),
             message,
             pages: vec![dangling.from_path],
+            detail: None,
+        });
+    }
+
+    // Declared contradictions (typed `contradicts` edges, 2.0 item 3):
+    // an author or the consolidator explicitly said two pages disagree —
+    // the highest-signal zero-LLM contradiction finding possible.
+    for edge in reader.contradiction_edges(workspace_id, project_id).await? {
+        let message = if edge.resolved {
+            format!(
+                "Page {} declares it contradicts {} — reconcile them or \
+                 supersede the outdated one",
+                edge.from_path, edge.to_path,
+            )
+        } else {
+            format!(
+                "Page {} declares it contradicts {}, which does not resolve \
+                 to a page (deleted or renamed) — the declaration is stale",
+                edge.from_path, edge.to_path,
+            )
+        };
+        findings.push(LintFinding {
+            kind: "contradiction".into(),
+            severity: "warning".into(),
+            message,
+            pages: vec![edge.from_path, edge.to_path],
             detail: None,
         });
     }
@@ -186,24 +286,37 @@ pub async fn run_lint(
 
     let report = LintReport { findings };
 
-    if !dry_run && !report.findings.is_empty() {
-        write_report_page(wiki, workspace_id, project_id, &report).await?;
+    if !dry_run {
+        if report.findings.is_empty() {
+            // A clean project carries no lint page at all: a stale
+            // report claiming findings that no longer exist is itself
+            // the kind of noise the lint exists to flag.
+            remove_report_page(wiki, workspace_id, project_id, &candidates).await;
+        } else {
+            write_report_page(wiki, workspace_id, project_id, &report).await?;
+        }
+        // One report per project: the daily `_lint/<YYYY-MM-DD>.md`
+        // pages the pre-2.0.1 lint accumulated (thousands across a
+        // long-lived store — indexed, searched, and embedded) are
+        // machinery, not knowledge. Each pass prunes any it finds, so
+        // existing stores self-heal without a migration.
+        prune_legacy_dated_reports(wiki, workspace_id, project_id, &candidates).await;
     }
 
     Ok(report)
 }
 
-fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
+fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<LintFinding> {
     let now_us = Timestamp::now().as_microsecond();
     let mut out = Vec::new();
     let mut titles: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
     for c in candidates {
-        // Stale: episodic, >30d, zero accesses.
+        // Stale: episodic, older than the lambda-derived threshold, zero accesses.
         #[allow(clippy::cast_precision_loss)]
         let age_days = (now_us - c.updated_at_us) as f64 / US_PER_DAY;
-        if c.tier == Tier::Episodic && age_days > STALE_DAYS && c.access_count == 0 {
+        if c.tier == Tier::Episodic && age_days > stale_days && c.access_count == 0 {
             out.push(LintFinding {
                 kind: "stale".into(),
                 severity: "info".into(),
@@ -340,6 +453,87 @@ async fn contradiction_pass(
     Ok(report.findings)
 }
 
+/// Stable per-project lint report path — superseded in place each run.
+const REPORT_PATH: &str = "_lint/report.md";
+
+/// Matches the legacy daily report naming: `_lint/YYYY-MM-DD.md`.
+fn is_legacy_dated_report(path: &str) -> bool {
+    let Some(name) = path
+        .strip_prefix("_lint/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+    else {
+        return false;
+    };
+    name.len() == 10
+        && name.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// Delete `_lint/report.md` when the current pass found nothing.
+/// Best-effort: a delete rejected by an admission webhook or racing
+/// write only leaves a stale report for the next pass to retry.
+async fn remove_report_page(
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    candidates: &[ai_memory_store::DecayCandidate],
+) {
+    if !candidates.iter().any(|c| c.path.as_str() == REPORT_PATH) {
+        return;
+    }
+    let Ok(path) = PagePath::new(REPORT_PATH) else {
+        return;
+    };
+    if let Err(e) = wiki
+        .delete_page(
+            workspace_id,
+            project_id,
+            &path,
+            Some(AdmissionContext {
+                op: AdmissionOp::Consolidate,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+    {
+        warn!(error = %e, "lint: could not remove clean project's stale report");
+    }
+}
+
+/// Delete the accumulated pre-2.0.1 daily reports. Best-effort per
+/// page; anything that survives is retried by the next pass.
+async fn prune_legacy_dated_reports(
+    wiki: &Wiki,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    candidates: &[ai_memory_store::DecayCandidate],
+) {
+    for cand in candidates {
+        if !is_legacy_dated_report(cand.path.as_str()) {
+            continue;
+        }
+        let path = cand.path.clone();
+        if let Err(e) = wiki
+            .delete_page(
+                workspace_id,
+                project_id,
+                &path,
+                Some(AdmissionContext {
+                    op: AdmissionOp::Consolidate,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+        {
+            warn!(path = %cand.path, error = %e, "lint: could not prune legacy dated report");
+        }
+    }
+}
+
 async fn write_report_page(
     wiki: &Wiki,
     workspace_id: WorkspaceId,
@@ -350,7 +544,10 @@ async fn write_report_page(
         .to_zoned(TimeZone::UTC)
         .strftime("%Y-%m-%d")
         .to_string();
-    let path = PagePath::new(format!("_lint/{date}.md"))?;
+    // One stable path per project: each run supersedes the previous
+    // report (history stays in the version chain) instead of minting a
+    // new page per day.
+    let path = PagePath::new(REPORT_PATH)?;
     let title = format!("Lint report {date}");
     let body = render_markdown(report);
     wiki.write_page(WritePageRequest {
@@ -406,6 +603,82 @@ fn render_markdown(report: &LintReport) -> String {
 mod tests {
     use super::*;
 
+    /// The whole point of #426: an operator who never touched `[decay]`
+    /// must see byte-identical behaviour. `0.6 / 0.02` is exactly 30.
+    #[test]
+    fn default_lambda_reproduces_the_historical_thirty_day_threshold() {
+        assert!(
+            (stale_days_for(0.02) - STALE_DAYS).abs() < f64::EPSILON,
+            "default lambda must reproduce {STALE_DAYS} days, got {}",
+            stale_days_for(0.02)
+        );
+    }
+
+    /// Slower decay must push the lint out with it, not keep flagging on
+    /// day 31 while real eviction is 200 days away.
+    #[test]
+    fn stale_threshold_tracks_lambda() {
+        assert!(
+            (stale_days_for(0.008) - 75.0).abs() < 1e-9,
+            "{}",
+            stale_days_for(0.008)
+        );
+        assert!(
+            (stale_days_for(0.04) - 15.0).abs() < 1e-9,
+            "{}",
+            stale_days_for(0.04)
+        );
+        // Monotonic: slower decay (smaller lambda) => later staleness.
+        assert!(stale_days_for(0.008) > stale_days_for(0.02));
+        assert!(stale_days_for(0.04) < stale_days_for(0.02));
+    }
+
+    /// A nonsensical lambda must not silence the rule (infinity) or make
+    /// every comparison false (NaN); it falls back to the constant.
+    #[test]
+    fn stale_threshold_fails_back_on_invalid_lambda() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let days = stale_days_for(bad);
+            assert!(
+                (days - STALE_DAYS).abs() < f64::EPSILON,
+                "lambda {bad} must fall back to {STALE_DAYS}, got {days}"
+            );
+        }
+    }
+
+    /// End-to-end through the rule: a 60-day unread episodic page is stale
+    /// at the default lambda but NOT at the slower one the reporter runs.
+    #[test]
+    fn slower_decay_stops_flagging_a_sixty_day_page() {
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        let sixty_days_ago = now_us - (60.0 * US_PER_DAY) as i64;
+        let candidate = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("sessions/2026-06-20.md").unwrap(),
+            tier: Tier::Episodic,
+            pinned: false,
+            updated_at_us: sixty_days_ago,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "A session nobody reopened"}"#.into(),
+            expires_at_us: None,
+            salience: None,
+        };
+
+        let default_lambda =
+            rule_based_findings(std::slice::from_ref(&candidate), stale_days_for(0.02));
+        assert!(
+            default_lambda.iter().any(|f| f.kind == "stale"),
+            "60d page must be stale at the default lambda"
+        );
+
+        let slow_lambda = rule_based_findings(&[candidate], stale_days_for(0.008));
+        assert!(
+            !slow_lambda.iter().any(|f| f.kind == "stale"),
+            "at lambda=0.008 the threshold is 75d, so a 60d page is not stale yet"
+        );
+    }
+
     #[test]
     fn lint_prompt_rejects_embedded_wiki_instructions() {
         assert!(LINT_SYSTEM_PROMPT.contains("## SECURITY BOUNDARY"));
@@ -428,7 +701,7 @@ mod tests {
             expires_at_us: None,
             salience: None,
         }];
-        let findings = rule_based_findings(&candidates);
+        let findings = rule_based_findings(&candidates, STALE_DAYS);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, "stale");
     }
@@ -451,7 +724,7 @@ mod tests {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
             ..a.clone()
         };
-        let findings = rule_based_findings(&[a, b]);
+        let findings = rule_based_findings(&[a, b], STALE_DAYS);
         let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
         assert_eq!(dupes.len(), 1);
         assert_eq!(dupes[0].pages.len(), 2);
@@ -474,7 +747,7 @@ mod tests {
             expires_at_us: None,
             salience: None,
         };
-        let findings = rule_based_findings(&[candidate]);
+        let findings = rule_based_findings(&[candidate], STALE_DAYS);
         let rules: Vec<_> = findings
             .iter()
             .filter(|f| f.kind == "rule_suggestion")
@@ -500,7 +773,7 @@ mod tests {
             expires_at_us: None,
             salience: None,
         };
-        let findings = rule_based_findings(&[candidate]);
+        let findings = rule_based_findings(&[candidate], STALE_DAYS);
         assert!(
             findings.iter().any(|f| f.kind == "rule_suggestion"),
             "expected a rule_suggestion finding for _rules/ page",
@@ -524,7 +797,7 @@ mod tests {
             expires_at_us: None,
             salience: None,
         };
-        let findings = rule_based_findings(&[candidate]);
+        let findings = rule_based_findings(&[candidate], STALE_DAYS);
         assert!(
             findings.iter().all(|f| f.kind != "rule_suggestion"),
             "non-rule page must not produce a rule_suggestion finding",
@@ -582,7 +855,7 @@ mod tests {
         }];
         // rule_based_findings is the exact code path that `use_llm=false`
         // keeps active. Confirm it still fires.
-        let findings = rule_based_findings(&candidates);
+        let findings = rule_based_findings(&candidates, STALE_DAYS);
         assert!(
             findings.iter().any(|f| f.kind == "stale"),
             "rule-based stale finding must be present regardless of use_llm flag",

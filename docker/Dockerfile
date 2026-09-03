@@ -53,6 +53,12 @@ ENV AI_MEMORY_DATA_DIR=/data
 # exposed/homelab deployments still set their own `AI_MEMORY_ALLOWED_HOSTS`,
 # which replaces this value entirely.
 ENV AI_MEMORY_ALLOWED_HOSTS="localhost,127.0.0.1,::1,host.docker.internal"
+# Tell the server it is containerised, so the unauthenticated-bind guard in
+# `serve` knows the `0.0.0.0` bind below is a namespace requirement rather
+# than evidence of network exposure (issue #407). `/.dockerenv` covers Docker
+# and `/run/.containerenv` covers Podman; this makes the signal explicit and
+# runtime-independent.
+ENV AI_MEMORY_IN_CONTAINER=1
 WORKDIR /data
 EXPOSE 49374
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

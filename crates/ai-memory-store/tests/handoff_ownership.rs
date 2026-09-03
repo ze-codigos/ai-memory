@@ -131,8 +131,8 @@ async fn one_operators_handoff_is_not_delivered_to_another() {
         .await
         .unwrap()
         .expect("Alice keeps her own handoff");
-    assert_eq!(alice.summary, "resume the OAuth refactor");
-    assert_eq!(alice.owner_user, Some(operator("alice")));
+    assert_eq!(alice.content.summary, "resume the OAuth refactor");
+    assert_eq!(alice.origin.owner_user, Some(operator("alice")));
 }
 
 /// The SQL query must exclude foreign rows before it deserializes any of their
@@ -173,7 +173,7 @@ async fn latest_lookup_filters_foreign_rows_before_deserialization() {
         .await
         .expect("a foreign corrupt row must not affect Alice's lookup")
         .expect("Alice keeps her valid baton");
-    assert_eq!(alice.summary, "alice's valid baton");
+    assert_eq!(alice.content.summary, "alice's valid baton");
 }
 
 #[tokio::test]
@@ -235,7 +235,14 @@ async fn ownership_writes_reject_malformed_identity_keys() {
         "the accepting identity and owner filter must not disagree"
     );
     assert_eq!(
-        store.reader.handoff_by_id(id).await.unwrap().unwrap().state,
+        store
+            .reader
+            .handoff_by_id(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .state,
         ai_memory_core::HandoffState::Open
     );
 
@@ -391,7 +398,7 @@ async fn another_operator_cannot_claim_the_handoff() {
     // The acceptance is attributed to a person, not just an agent kind, so
     // "who took my baton" is answerable after the fact.
     let row = store.reader.handoff_by_id(id).await.unwrap().unwrap();
-    assert_eq!(row.accepted_by_user, Some(operator("alice")));
+    assert_eq!(row.lifecycle.accepted_by_user, Some(operator("alice")));
 }
 
 /// An unattributed reader — the read-only `/api/v1` surface a browser reaches —
@@ -513,7 +520,14 @@ async fn destructive_handoff_updates_recheck_scope_atomically() {
         "even a root recovery cancel must not cross its resolved project"
     );
     assert_eq!(
-        store.reader.handoff_by_id(id).await.unwrap().unwrap().state,
+        store
+            .reader
+            .handoff_by_id(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .state,
         ai_memory_core::HandoffState::Open
     );
     assert!(
@@ -603,7 +617,7 @@ async fn handoff_listing_is_owner_scoped_and_covers_every_state() {
                 .await
                 .unwrap()
                 .into_iter()
-                .map(|h| h.summary)
+                .map(|h| h.content.summary)
                 .collect::<Vec<_>>()
         }
     };
@@ -674,7 +688,7 @@ async fn an_owner_name_with_a_quote_filters_like_any_other() {
         .await
         .unwrap()
         .into_iter()
-        .map(|h| h.summary)
+        .map(|h| h.content.summary)
         .collect::<Vec<_>>();
     assert!(seen.contains(&"quoted".to_string()), "own row: {seen:?}");
     assert!(seen.contains(&"team".to_string()), "shared row: {seen:?}");
@@ -688,7 +702,7 @@ async fn an_owner_name_with_a_quote_filters_like_any_other() {
         .await
         .unwrap()
         .into_iter()
-        .map(|h| h.summary)
+        .map(|h| h.content.summary)
         .collect::<Vec<_>>();
     assert_eq!(open.len(), 2, "own + shared, still no leak: {open:?}");
 
@@ -786,6 +800,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
             .await
             .unwrap()
             .unwrap()
+            .lifecycle
             .state,
         HandoffState::Open,
         "another operator's SessionEnd must not expire Bob's baton"
@@ -800,6 +815,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
             .await
             .unwrap()
             .unwrap()
+            .lifecycle
             .state,
         HandoffState::Expired,
         "within one operator, the same-cwd sweep still bounds accumulation"
@@ -828,6 +844,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
             .await
             .unwrap()
             .unwrap()
+            .lifecycle
             .state,
         HandoffState::Open,
         "Alice's session start must not expire Bob's pending baton"
@@ -840,7 +857,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
         .await
         .unwrap()
         .expect("Bob's baton survives another operator's accept");
-    assert_eq!(bobs.summary, "bob's baton");
+    assert_eq!(bobs.content.summary, "bob's baton");
 }
 
 /// Sessions record their operator (V40), and the open-session lookup behind

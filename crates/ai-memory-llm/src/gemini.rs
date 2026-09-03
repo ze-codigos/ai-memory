@@ -30,23 +30,23 @@ pub struct GeminiProvider {
     api_key: SecretString,
     base_url: String,
     model: String,
+    timeout: Duration,
 }
 
 impl GeminiProvider {
     /// Construct a provider given an API key and model id (e.g.
-    /// `gemini-2.5-flash`).
+    /// `gemini-3.5-flash`).
     ///
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?;
+        let client = reqwest::Client::builder().build()?;
         Ok(Self {
             client,
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -54,6 +54,14 @@ impl GeminiProvider {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]).
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
         self
     }
 }
@@ -228,6 +236,7 @@ impl GeminiProvider {
         let resp = self
             .client
             .post(&url)
+            .timeout(self.timeout)
             .header("x-goog-api-key", self.api_key.expose_secret())
             .header("content-type", "application/json")
             .json(body)
@@ -247,7 +256,21 @@ impl GeminiProvider {
 
 fn default_thinking_config_for(model: &str) -> Option<GeminiThinkingConfig> {
     let model = model.to_ascii_lowercase();
-    if model.contains("gemini-2.5-flash") {
+    // These matches are substring matches, so `gemini-N.5-flash` also covers
+    // `gemini-N.5-flash-lite`. That is correct for 2.5 and WRONG for 3.5:
+    // verified against the live API, `gemini-2.5-flash-lite` accepts
+    // `thinkingConfig.thinkingBudget = 0` (HTTP 200) while
+    // `gemini-3.5-flash-lite` rejects the field outright (HTTP 400,
+    // "Request contains an invalid argument") and succeeds only when it is
+    // omitted. Sending it there breaks every call for that model.
+    //
+    // So 3.5 excludes `-lite` explicitly and 2.5 keeps its existing
+    // behaviour unchanged — narrowing 2.5 as well would re-enable its
+    // default thinking and let hidden thought tokens truncate strict JSON,
+    // which is the whole reason this function exists.
+    let is_25_flash = model.contains("gemini-2.5-flash");
+    let is_35_flash_non_lite = model.contains("gemini-3.5-flash") && !model.contains("-lite");
+    if is_25_flash || is_35_flash_non_lite {
         return Some(GeminiThinkingConfig { thinking_budget: 0 });
     }
     None
@@ -585,16 +608,44 @@ mod tests {
         assert_eq!(prepared.get("nullable").unwrap(), &json!(true));
     }
 
-    #[test]
-    fn build_request_disables_default_thinking_for_25_flash() {
-        let provider =
-            GeminiProvider::new(SecretString::from("test-key"), "gemini-2.5-flash").unwrap();
+    fn assert_thinking_budget_disabled(model: &str) {
+        let provider = GeminiProvider::new(SecretString::from("test-key"), model).unwrap();
         let request = ChatRequest::user_prompt("emit json");
         let body = serde_json::to_value(provider.build_request(&request, None)).unwrap();
         assert_eq!(
             body.pointer("/generationConfig/thinkingConfig/thinkingBudget"),
             Some(&json!(0))
         );
+    }
+
+    #[test]
+    fn build_request_disables_default_thinking_for_25_flash() {
+        assert_thinking_budget_disabled("gemini-2.5-flash");
+    }
+
+    #[test]
+    fn build_request_disables_default_thinking_for_35_flash() {
+        assert_thinking_budget_disabled("gemini-3.5-flash");
+    }
+
+    /// `gemini-3.5-flash-lite` rejects `thinkingConfig` with HTTP 400 while
+    /// `gemini-2.5-flash-lite` accepts it — verified against the live API.
+    /// The substring match must therefore split the two, or every call on
+    /// 3.5-lite fails.
+    #[test]
+    fn build_request_omits_thinking_config_for_35_flash_lite_only() {
+        let lite =
+            GeminiProvider::new(SecretString::from("test-key"), "gemini-3.5-flash-lite").unwrap();
+        let body =
+            serde_json::to_value(lite.build_request(&ChatRequest::user_prompt("x"), None)).unwrap();
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "3.5-flash-lite rejects thinkingConfig (HTTP 400); it must be omitted: {body}"
+        );
+
+        // 2.5-flash-lite accepts it, and stripping it there would let hidden
+        // thought tokens truncate strict JSON. Behaviour must not change.
+        assert_thinking_budget_disabled("gemini-2.5-flash-lite");
     }
 
     #[test]

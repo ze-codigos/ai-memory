@@ -24,6 +24,8 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         auth: config.provider_auth(provider, api_key_override),
         base_url: args.base_url.or_else(|| config.llm_test_base_url()),
         compat_strict: config.llm_compat_strict,
+        request_timeout_secs: config.llm_timeout_secs,
+        reasoning_effort: config.llm_reasoning_effort,
     };
     let client = build_provider(provider_config).context("building LLM provider")?;
     info!(

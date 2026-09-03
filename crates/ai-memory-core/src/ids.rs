@@ -87,6 +87,7 @@ id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
 id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
+id_newtype!(pub ApiCredentialId, "Identifier for one native `aim_` API credential.");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
 id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
@@ -106,6 +107,33 @@ impl PagePath {
     ///
     /// # Errors
     /// Returns [`MemoryError::InvalidPagePath`] when the input is empty or
+    /// Reject a path that cannot be materialised and checkpointed on every
+    /// supported platform.
+    ///
+    /// Deliberately **not** part of [`PagePath::new`]. Persisted rows are
+    /// reconstructed through that constructor on every read
+    /// (`reader.rs` does so in the recency, search, vector and graph
+    /// queries), so tightening it would make any already-stored
+    /// non-portable page unreadable — and because those are list queries,
+    /// one such page would break a whole listing rather than just itself.
+    /// The rule therefore applies where a *new* path enters the system.
+    ///
+    /// The rule is the same on every platform on purpose. A wiki authored
+    /// on Linux is expected to be usable on Windows by the same release;
+    /// making the check platform-conditional would let a Linux session
+    /// create pages a Windows session cannot read, which is the defect
+    /// being fixed rather than a fix for it (#462).
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::InvalidPagePath`] naming the offending
+    /// component and the reason.
+    pub fn ensure_portable(&self) -> Result<(), MemoryError> {
+        for component in self.as_str().split('/') {
+            ensure_portable_component(component, self.as_str())?;
+        }
+        Ok(())
+    }
+
     /// contains a path component that would escape or alias the wiki root.
     pub fn new(raw: impl Into<String>) -> Result<Self, MemoryError> {
         let raw = raw.into();
@@ -216,6 +244,10 @@ pub enum AgentKind {
     CommandCode,
     /// Hermes Agent (Nous Research).
     Hermes,
+    /// Pool (Poolside Agent CLI).
+    Pool,
+    /// ZCode (z.ai) coding agent.
+    Zcode,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -226,7 +258,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 21] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -245,6 +277,8 @@ impl AgentKind {
         Self::KiroCli,
         Self::CommandCode,
         Self::Hermes,
+        Self::Pool,
+        Self::Zcode,
         Self::Other,
     ];
 
@@ -270,6 +304,8 @@ impl AgentKind {
             Self::KiroCli => "kiro-cli",
             Self::CommandCode => "command-code",
             Self::Hermes => "hermes",
+            Self::Pool => "pool",
+            Self::Zcode => "zcode",
             Self::Other => "other",
         }
     }
@@ -298,6 +334,8 @@ impl AgentKind {
             "kiro-cli" | "kiro" => Self::KiroCli,
             "command-code" | "commandcode" | "cmdc" | "cmd" => Self::CommandCode,
             "hermes" | "hermes-agent" => Self::Hermes,
+            "pool" | "poolside" => Self::Pool,
+            "zcode" | "zai" => Self::Zcode,
             _ => Self::Other,
         }
     }
@@ -323,11 +361,29 @@ impl AgentKind {
     /// dispatch return, verified in the v0.28.1 source), so the handoff is
     /// delivered on `UserPromptSubmit` instead — see
     /// [`Self::user_prompt_injects_handoff`].
+    ///
+    /// Pool (Poolside Agent CLI) tolerates plain hook stdout, but model-visible
+    /// context injection from `SessionStart` stdout is not demonstrated
+    /// (verified against Poolside CLI v1.0.16), so Pool fails safe like other
+    /// unproven agents: the handoff stays available on demand via the MCP
+    /// `memory_handoff_accept` tool.
+    ///
+    /// ZCode (z.ai) DOES inject: a `hookSpecificOutput.additionalContext`
+    /// canary printed by the session-start hook appeared verbatim inside a
+    /// `<system-reminder>` text block of the first user message sent to the
+    /// model (verified live against the embedded engine v0.16.5, capture logs
+    /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
             self,
-            Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Hermes | Self::Other
+            Self::Crush
+                | Self::Grok
+                | Self::Zero
+                | Self::KimiCode
+                | Self::Hermes
+                | Self::Pool
+                | Self::Other
         )
     }
 
@@ -448,6 +504,45 @@ mod tests {
         );
         assert!(!AgentKind::Hermes.session_start_injects_handoff());
         assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_pool_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Pool.as_str(), "pool");
+        assert_eq!(AgentKind::from_wire("pool"), AgentKind::Pool);
+        assert_eq!(AgentKind::from_wire("poolside"), AgentKind::Pool);
+        assert_eq!(serde_json::to_string(&AgentKind::Pool).unwrap(), "\"pool\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"pool\"").unwrap(),
+            AgentKind::Pool
+        );
+        assert_eq!(AgentKind::from_wire("pool-2"), AgentKind::Other);
+        // Pool's SessionStart stdout injection is not demonstrated, so the
+        // destructive handoff fetch must not happen from its native hook.
+        assert!(!AgentKind::Pool.session_start_injects_handoff());
+        assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_zcode_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::Zcode.as_str(), "zcode");
+        assert_eq!(AgentKind::from_wire("zcode"), AgentKind::Zcode);
+        assert_eq!(AgentKind::from_wire("zai"), AgentKind::Zcode);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Zcode).unwrap(),
+            "\"zcode\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"zcode\"").unwrap(),
+            AgentKind::Zcode
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("zcode-2"), AgentKind::Other);
+        // ZCode injects SessionStart stdout as additionalContext (live canary
+        // capture against engine v0.16.5), so the destructive handoff fetch
+        // is safe from its native hook.
+        assert!(AgentKind::Zcode.session_start_injects_handoff());
+        assert!(!AgentKind::Zcode.user_prompt_injects_handoff());
     }
 
     #[test]
@@ -576,5 +671,128 @@ mod tests {
             serde_json::from_str::<AgentKind>(&devin).unwrap(),
             AgentKind::Devin
         );
+    }
+}
+
+/// Names Windows reserves regardless of extension: `CON.md` is still the
+/// console device.
+const DOS_DEVICE_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Characters Windows refuses in a filename. `/` is the separator and is
+/// handled by the caller; `\\` and a drive prefix are already rejected by
+/// [`PagePath::new`].
+const WINDOWS_RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryError> {
+    let invalid = |reason: &str| {
+        Err(MemoryError::InvalidPagePath(format!(
+            "page path {full:?}: component {component:?} {reason}"
+        )))
+    };
+
+    if let Some(bad) = component
+        .chars()
+        .find(|c| WINDOWS_RESERVED_CHARS.contains(c))
+    {
+        return invalid(&format!(
+            "contains {bad:?}, which Windows refuses in a filename"
+        ));
+    }
+    if let Some(bad) = component.chars().find(|c| (*c as u32) < 0x20) {
+        return invalid(&format!(
+            "contains control character U+{:04X}, which is not a legal filename byte",
+            bad as u32
+        ));
+    }
+    // A trailing dot or space is silently stripped by the Win32 layer, so the
+    // file lands under a different name than the one recorded in the index.
+    if component.ends_with('.') || component.ends_with(' ') {
+        return invalid("ends with a dot or space, which Windows strips on create");
+    }
+    // Device names match on the stem, so `CON`, `CON.md` and `con.markdown`
+    // are all the console.
+    let stem = component.split('.').next().unwrap_or(component);
+    if DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
+        return invalid(&format!(
+            "uses the reserved DOS device name {stem:?}; Windows resolves it to a device, not a file"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod portable_page_path_tests {
+    use super::PagePath;
+
+    /// Every shape #462 reproduced on native Windows. Each either fails late
+    /// with a 500, or writes but cannot be checkpointed by libgit2 and cannot
+    /// be deleted through the normal API — silent partial state, which is
+    /// worse than a clean rejection.
+    #[test]
+    fn windows_hostile_paths_are_rejected() {
+        for raw in [
+            "CON.md",
+            "notes/aux.md",
+            "notes/NUL.md",
+            "notes/com1.md",
+            "notes/LPT9.txt",
+            "notes/trailing./x.md",
+            "notes/trailing /x.md",
+            "notes/end.md.",
+            "notes/end.md ",
+            "notes/a<b.md",
+            "notes/a>b.md",
+            "notes/a\"b.md",
+            "notes/a|b.md",
+            "notes/a?b.md",
+            "notes/a*b.md",
+            "notes/a:b.md",
+            "notes/a\u{1}b.md",
+        ] {
+            let path = PagePath::new(raw).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} is not portable and must be refused at write time"
+            );
+        }
+    }
+
+    /// The rule must not reject ordinary pages. `con` is only reserved as a
+    /// whole component, so `concepts/` and `icon.md` are fine.
+    #[test]
+    fn ordinary_paths_stay_writable() {
+        for raw in [
+            "notes/portable.md",
+            "concepts/no-impl-without-test.md",
+            "sessions/2026-08-22.md",
+            "notes/icon.md",
+            "notes/console.md",
+            "prn-notes/aux-iliary.md",
+            "a/b/c/deep.md",
+            "notes/dot.in.middle.md",
+            "notes/UPPER.MD",
+        ] {
+            let path = PagePath::new(raw).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "{raw:?} is portable and must stay writable"
+            );
+        }
+    }
+
+    /// Reads must keep working for pages already stored under a
+    /// non-portable name: `PagePath::new` stays tolerant so a listing does
+    /// not break on one bad row.
+    #[test]
+    fn existing_non_portable_pages_remain_constructible() {
+        for raw in ["CON.md", "notes/a|b.md", "notes/trailing./x.md"] {
+            assert!(
+                PagePath::new(raw).is_ok(),
+                "{raw:?} must still construct so persisted rows stay readable"
+            );
+        }
     }
 }

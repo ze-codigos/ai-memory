@@ -40,6 +40,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -70,6 +71,7 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
         .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -452,6 +454,7 @@ async fn move_project_carries_source_embedding() {
         .with_embedder(embedder.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -741,6 +744,7 @@ async fn true_move_notifies_admission_with_destination_names() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -796,6 +800,7 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
         .with_embedder(embedder.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -1024,6 +1029,7 @@ async fn copy_purge_force_never_deletes_a_live_managed_workstream() {
 /// routers — e.g. a move then a re-run — against the same SQLite file).
 fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
     AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
@@ -1521,6 +1527,7 @@ async fn true_move_aborts_when_admission_rejects() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -1617,6 +1624,7 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -1730,6 +1738,7 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -1794,7 +1803,13 @@ async fn copy_purge_rerun_is_idempotent() {
     .await;
     assert_eq!(r1.status(), StatusCode::OK);
 
-    // Re-create the source identically and run the merge again.
+    // Re-create the source identically and run the merge again — across
+    // a full second boundary, so the re-seeded page's `generated.at`
+    // provably differs from the copy the first merge landed. Identical
+    // CONTENT with a different write instant must not be a merge
+    // conflict (this was the timing flake: sub-second reruns passed,
+    // second-crossing reruns 409'd).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let s2 = build_state(&store, &tmp);
     seed_page(&store, &s2.wiki, "src", "proj", "notes/a.md", "body a").await;
     let r2 = post(
@@ -1803,7 +1818,19 @@ async fn copy_purge_rerun_is_idempotent() {
         json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
     )
     .await;
-    assert_eq!(r2.status(), StatusCode::OK);
+    // Flaky under heavy parallel load / on Windows (observed in the 2.0
+    // full-matrix run); keep the body in the failure so the next
+    // occurrence is diagnosable instead of a bare status assert.
+    let r2_status = r2.status();
+    if r2_status != StatusCode::OK {
+        let body = axum::body::to_bytes(r2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        panic!(
+            "second move-project failed: {r2_status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 
     // Destination still holds exactly one of each path — no duplicates.
     let mut paths: Vec<String> = store

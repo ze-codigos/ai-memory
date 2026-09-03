@@ -20,7 +20,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, Usage};
 
 /// GitHub Copilot's public OAuth client id used by Copilot clients.
 pub const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -185,6 +185,7 @@ pub struct CopilotProvider {
     model: String,
     auth: CopilotAuth,
     stored: Mutex<CopilotToken>,
+    timeout: Duration,
 }
 
 impl CopilotProvider {
@@ -206,7 +207,6 @@ impl CopilotProvider {
             )));
         }
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
             .user_agent(COPILOT_USER_AGENT)
             .build()
             .map_err(LlmError::from)?;
@@ -215,7 +215,17 @@ impl CopilotProvider {
             model: model.into(),
             auth,
             stored: Mutex::new(stored),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
         })
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]). Also bounds the
+    /// GitHub token-exchange request.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
     }
 
     async fn current_token(&self) -> LlmResult<CopilotApiToken> {
@@ -251,7 +261,7 @@ impl CopilotProvider {
             })?;
 
         info!("copilot API token expired or missing, exchanging GitHub token");
-        let exchanged = exchange_copilot_token(&self.client, &github).await?;
+        let exchanged = exchange_copilot_token(&self.client, self.timeout, &github).await?;
         guard.copilot_access = Some(exchanged.access.clone());
         guard.copilot_expires_at_ms = Some(exchanged.expires_at_ms);
         guard.api_base_url = Some(resolve_copilot_api_base_url(
@@ -277,6 +287,7 @@ impl CopilotProvider {
         let resp = self
             .client
             .post(&url)
+            .timeout(self.timeout)
             .bearer_auth(token.access.expose_secret())
             .headers(copilot_runtime_headers())
             .json(body)
@@ -356,10 +367,12 @@ struct CopilotExchangeResponse {
 
 async fn exchange_copilot_token(
     client: &reqwest::Client,
+    timeout: Duration,
     github_token: &SecretString,
 ) -> LlmResult<CopilotApiToken> {
     let resp = client
         .get(GITHUB_COPILOT_TOKEN_URL)
+        .timeout(timeout)
         .bearer_auth(github_token.expose_secret())
         .headers(copilot_token_exchange_headers())
         .send()
@@ -396,10 +409,7 @@ fn build_chat_request<'a>(
     }
     for m in &request.messages {
         messages.push(CopilotMsg {
-            role: match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            },
+            role: m.role.as_str(),
             content: &m.content,
         });
     }
@@ -622,7 +632,6 @@ fn unix_epoch_to_ms(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret as _;
     use serde_json::json;
 
     use super::*;
@@ -801,10 +810,7 @@ mod tests {
     fn chat_request_uses_openai_compatible_shape() {
         let request = ChatRequest {
             system: Some("sys".into()),
-            messages: vec![crate::types::ChatMessage {
-                role: Role::User,
-                content: "hello".into(),
-            }],
+            messages: vec![crate::types::ChatMessage::user("hello")],
             temperature: Some(0.2),
             max_tokens: 123,
         };

@@ -12,6 +12,9 @@
 #   ai-memory run ...       Use a cached native client so it can exec host agents.
 #   ai-memory show ...      Use that client for host project/harness discovery.
 #   ai-memory continue ...  Use that client to resume the newest linked checkout.
+#   ai-memory workstreams   Use that client to inspect the host checkout identity.
+#   ai-memory rename-workstream
+#                           Same: the rename is keyed on host repo identity.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         docker image (default: akitaonrails/ai-memory:latest)
@@ -28,7 +31,7 @@
 #                           likewise
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
-#   AI_MEMORY_NATIVE_BIN    native binary used for `run`/`show`/`continue` (optional)
+#   AI_MEMORY_NATIVE_BIN    native binary used for managed host commands (optional)
 #   AI_MEMORY_WRAPPER_URL   wrapper release asset override (optional; its
 #                           .sha256 companion is required)
 #   AI_MEMORY_WRAPPER_SHA256_URL  wrapper checksum URL override (optional)
@@ -139,6 +142,112 @@ self_upgrade_script() {
   AI_MEMORY_SKIP_SELF_UPGRADE=1 exec "${script_path}" upgrade
 }
 
+
+# Reconstruct the `docker run` that created a running container, so a
+# non-compose install can be recreated on the freshly pulled image without
+# the operator having to remember their original flags (issue #407).
+#
+# Written to a 0600 file rather than echoed: the environment of a real
+# install carries provider API keys and AI_MEMORY_AUTH_TOKEN, and printing
+# those into terminal scrollback — or into a piped install log — is exactly
+# the kind of leak this project exists to prevent.
+#
+# Reconstructs the flags that matter for an ai-memory container: name,
+# restart policy, published ports, mounts, operator-supplied environment,
+# and an overridden command. It does NOT reproduce every possible `docker
+# run` flag (networks, capabilities, resource limits, devices); the script
+# says so in its own header so a reader can add anything exotic back.
+emit_docker_run_script() {
+  local container="$1" out="$2" image
+  image="$("${DOCKER}" inspect "${container}" --format '{{.Config.Image}}' 2>/dev/null)" || return 1
+  [ -n "${image}" ] || return 1
+
+  local ports volumes restart cmd
+  ports="$("${DOCKER}" inspect "${container}" --format \
+    '{{range $p, $bindings := .HostConfig.PortBindings}}{{range $bindings}}-p {{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}} {{end}}{{end}}' 2>/dev/null)"
+  volumes="$("${DOCKER}" inspect "${container}" --format \
+    '{{range .Mounts}}{{if eq .Type "volume"}}-v {{.Name}}:{{.Destination}} {{else}}-v {{.Source}}:{{.Destination}} {{end}}{{end}}' 2>/dev/null)"
+  restart="$("${DOCKER}" inspect "${container}" --format \
+    '{{with .HostConfig.RestartPolicy.Name}}{{if ne . "no"}}--restart {{.}}{{end}}{{end}}' 2>/dev/null)"
+
+  # Only the command if the operator overrode the image default; otherwise
+  # let the new image supply its own (that is the point of upgrading).
+  local image_cmd container_cmd
+  image_cmd="$("${DOCKER}" inspect "${image}" --format '{{json .Config.Cmd}}' 2>/dev/null)"
+  container_cmd="$("${DOCKER}" inspect "${container}" --format '{{json .Config.Cmd}}' 2>/dev/null)"
+  cmd=""
+  if [ "${image_cmd}" != "${container_cmd}" ]; then
+    cmd="$("${DOCKER}" inspect "${container}" --format \
+      '{{range .Config.Cmd}}{{printf "%q " .}}{{end}}' 2>/dev/null)"
+  fi
+
+  # Likewise, carry only environment the operator actually passed. Anything
+  # baked into the image is re-applied by the new image anyway, and pinning
+  # it here would freeze a value this upgrade is meant to move forward.
+  local image_env container_env env_flags=""
+  image_env="$("${DOCKER}" inspect "${image}" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)"
+  container_env="$("${DOCKER}" inspect "${container}" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)"
+  local kv
+  while IFS= read -r kv; do
+    [ -n "${kv}" ] || continue
+    if printf '%s\n' "${image_env}" | grep -qxF -- "${kv}"; then
+      continue
+    fi
+    env_flags="${env_flags} -e $(printf '%q' "${kv}")"
+  done <<ENVEOF
+${container_env}
+ENVEOF
+
+  ( umask 077 && : > "${out}" ) || return 1
+  {
+    echo "#!/usr/bin/env bash"
+    echo "# Reconstructed by \`ai-memory upgrade\` from the running '${container}'"
+    echo "# container, before it was removed. Review it, then run it."
+    echo "#"
+    echo "# Contains this install's environment (API keys, auth token) — it is"
+    echo "# mode 0600 for that reason. Delete it once the container is back up."
+    echo "#"
+    echo "# Covers name, restart policy, ports, mounts, operator-set environment"
+    echo "# and an overridden command. If your original command used anything"
+    echo "# else (custom network, capabilities, resource limits), re-add it."
+    echo "set -euo pipefail"
+    echo
+    echo "docker stop ${container}"
+    echo "docker rm ${container}"
+    printf 'docker run -d --name %s' "${container}"
+    [ -n "${restart}" ] && printf ' %s' "${restart}"
+    [ -n "${ports}" ] && printf ' %s' "${ports% }"
+    [ -n "${volumes}" ] && printf ' %s' "${volumes% }"
+    [ -n "${env_flags}" ] && printf '%s' "${env_flags}"
+    printf ' %s' "${image}"
+    [ -n "${cmd}" ] && printf ' %s' "${cmd% }"
+    printf '\n'
+  } >> "${out}"
+  chmod 600 "${out}" 2>/dev/null || true
+  return 0
+}
+
+# A compose file found in a conventional location is only relevant when its
+# project actually owns the running container. A stale or unrelated file may
+# declare the same container_name and `compose up` would then fail with a name
+# conflict instead of taking the safe standalone recovery path.
+compose_manages_container() {
+  local container="$1" compose_dir="$2" container_id compose_id
+  container_id="$("${DOCKER}" inspect "${container}" --format '{{.Id}}' 2>/dev/null)" || return 1
+  [ -n "${container_id}" ] || return 1
+
+  while IFS= read -r compose_id; do
+    [ -n "${compose_id}" ] || continue
+    case "${container_id}" in
+      "${compose_id}"*) return 0 ;;
+    esac
+    case "${compose_id}" in
+      "${container_id}"*) return 0 ;;
+    esac
+  done < <((cd "${compose_dir}" && "${DOCKER}" compose ps -q) 2>/dev/null)
+  return 1
+}
+
 cmd_upgrade() {
   if [ -z "${AI_MEMORY_SKIP_SELF_UPGRADE:-}" ]; then
     self_upgrade_script
@@ -186,11 +295,9 @@ cmd_upgrade() {
        | grep -q '^ai-memory$'; then
     # A LOCAL ai-memory container is running. We've just pulled a new
     # image; `docker restart` won't recreate from the new image, so we
-    # need to stop+remove+recreate. The safe way is via `docker compose
-    # up -d` when a compose file is reachable (it remembers all the
-    # ports/volumes/env). Without compose we can't recreate safely
-    # because we don't know the original `docker run` args — fall
-    # back to a clear instruction.
+    # need to stop+remove+recreate. Use `docker compose up -d` only when
+    # the discovered project owns this container; otherwise reconstruct
+    # the standalone `docker run` from its inspected runtime settings.
     local compose_dir=""
     if [ -f "$(pwd)/docker/docker-compose.yml" ]; then
       compose_dir="$(pwd)/docker"
@@ -199,17 +306,34 @@ cmd_upgrade() {
     elif [ -f "${HOME}/deploy/ai-memory/docker-compose.yml" ]; then
       compose_dir="${HOME}/deploy/ai-memory"
     fi
-    if [ -n "${compose_dir}" ]; then
+    if [ -n "${compose_dir}" ] && compose_manages_container "ai-memory" "${compose_dir}"; then
       echo "→ restarting local ai-memory container via docker compose (${compose_dir})"
       ( cd "${compose_dir}" && "${DOCKER}" compose up -d ) \
         || echo "  (compose restart failed; re-run manually: cd ${compose_dir} && docker compose up -d)"
     else
-      echo "→ a local ai-memory container is running but no compose file"
-      echo "  was found in \$PWD/docker-compose.yml, ./docker/docker-compose.yml,"
-      echo "  or ~/deploy/ai-memory/docker-compose.yml. Restart it manually so"
-      echo "  the new image takes effect:"
-      echo "      docker stop ai-memory && docker rm ai-memory"
-      echo "      # then re-run your docker-run command from the README Quick start"
+      if [ -n "${compose_dir}" ]; then
+        echo "→ the compose file at ${compose_dir} does not manage the running ai-memory container"
+        echo "  Treating it as a standalone docker run install to avoid a container-name conflict."
+      else
+        echo "→ a local ai-memory container is running but no compose file"
+        echo "  was found in \$PWD/docker-compose.yml, ./docker/docker-compose.yml,"
+        echo "  or ~/deploy/ai-memory/docker-compose.yml."
+      fi
+      local recreate_script="${CACHE_DIR}/recreate-ai-memory.sh"
+      mkdir -p "${CACHE_DIR}" 2>/dev/null || true
+      if emit_docker_run_script "ai-memory" "${recreate_script}"; then
+        echo "  Wrote the equivalent stop/remove/run for THIS container to:"
+        echo "      ${recreate_script}"
+        echo "  Review it and run it so the new image takes effect:"
+        echo "      less ${recreate_script} && bash ${recreate_script}"
+        echo "  (mode 0600 — it carries the environment of this install, including"
+        echo "  any API keys and AI_MEMORY_AUTH_TOKEN. Delete it once you are up.)"
+      else
+        echo "  Could not inspect the running container to reconstruct its"
+        echo "  command. Restart it manually so the new image takes effect:"
+        echo "      docker stop ai-memory && docker rm ai-memory"
+        echo "      # then re-run your docker-run command from the README Quick start"
+      fi
     fi
   fi
 
@@ -229,7 +353,7 @@ cmd_upgrade() {
   touch "${VERSION_CHECK_FILE}"
 }
 
-# `ai-memory run`, `show`, and `continue` must execute on the host: checkouts, harnesses,
+# Managed launch/discovery commands must execute on the host: checkouts, harnesses,
 # and native transcript stores are host resources, not contents of the helper
 # container. Keep a checksum-verified release client beside the wrapper cache.
 native_host_binary() {
@@ -248,7 +372,7 @@ native_host_binary() {
     Darwin) os="macos" ;;
     *)
       echo "ai-memory: the Docker wrapper cannot provide managed host launches on this OS" >&2
-      echo "install the native release binary to use ai-memory run/show/continue" >&2
+      echo "install the native release binary to use ai-memory run/show/continue/resume/workstreams/rename-workstream" >&2
       return 1
       ;;
   esac
@@ -323,7 +447,7 @@ case "${1:-}" in
     cmd_upgrade
     exit 0
     ;;
-  run | show | continue)
+  run | show | continue | resume | workstreams | rename-workstream)
     NATIVE_HOST_COMMAND=$1
     shift
     NATIVE_HOST_BIN=$(native_host_binary)
@@ -377,6 +501,7 @@ for var in \
   COPILOT_API_URL \
   VOYAGE_API_KEY \
   LLM_API_KEY \
+  EMBEDDING_API_KEY \
   RUST_LOG
 do
   if [ -n "${!var:-}" ]; then

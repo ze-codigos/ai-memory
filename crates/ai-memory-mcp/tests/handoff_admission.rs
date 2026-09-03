@@ -425,6 +425,7 @@ async fn unauthorised_any_owner_cancel_reaches_no_webhook() {
             .await
             .expect("read back")
             .expect("row still there")
+            .lifecycle
             .state,
         ai_memory_core::HandoffState::Open,
         "the refused cancel must not have discarded the baton",

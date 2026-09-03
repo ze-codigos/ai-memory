@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod consolidator;
 pub mod curator;
 pub mod embed;
+pub mod experience;
 pub mod lint;
 pub mod projection;
 pub mod sweep;
@@ -63,8 +64,12 @@ pub use curator::{
 pub use embed::{
     EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,
 };
-pub use lint::{LintError, LintFinding, LintReport, run_lint};
-pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep, run_sweep_with_breadth};
+pub use experience::{EXPERIENCE_SYSTEM_PROMPT, ExperienceConfig, run_experience_review};
+pub use lint::{LintError, LintFinding, LintOptions, LintReport, run_lint, stale_days_for};
+pub use sweep::{
+    DEFAULT_OBSERVATION_PRUNE_BATCH, EvictedPage, ObservationRetention, SweepError, SweepReport,
+    run_sweep, run_sweep_with_breadth, run_sweep_with_options,
+};
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,
     SlotKind,

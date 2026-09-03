@@ -18,7 +18,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{OpenAiProvider, RequestDialect, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
-use crate::types::{ChatRequest, ChatResponse};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
 // Compiled once. Matches <think>, <thinking>, <analysis>, <reasoning> blocks
 // (case-insensitive, non-greedy, DOTALL) that reasoning models emit before
@@ -98,6 +98,32 @@ impl OpenAiCompatProvider {
         self.strict = strict;
         self
     }
+
+    /// Override the per-request timeout on the wrapped
+    /// [`OpenAiProvider`]. The factory calls this with
+    /// `ProviderConfig::request_timeout_secs`.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.inner = self.inner.with_timeout_secs(secs);
+        self
+    }
+
+    /// Forward reasoning effort to the inner Chat Completions client.
+    /// OpenRouter and xAI hosts use their native request shapes.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<crate::ReasoningEffort>) -> Self {
+        self.inner = self.inner.with_reasoning_effort(effort);
+        self
+    }
+
+    pub(crate) fn with_client_headers(
+        mut self,
+        user_agent: &'static str,
+        operation_id: &'static str,
+    ) -> Self {
+        self.inner = self.inner.with_client_headers(user_agent, operation_id);
+        self
+    }
 }
 
 #[async_trait]
@@ -111,13 +137,46 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        self.inner.complete(request).await
+        self.complete_with_operation_id(request, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_with_operation_id(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
+        self.inner
+            .complete_with_operation_id(request, operation_id)
+            .await
     }
 
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
         schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured_raw_with_operation_id(request, schema, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured(request, schema, operation_id)
+            .await
+    }
+}
+
+impl OpenAiCompatProvider {
+    async fn complete_structured(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
         // Strict mode: modern local engines
         // honour `response_format=json_schema`. Normalise the schema
@@ -147,11 +206,15 @@ impl LlmProvider for OpenAiCompatProvider {
         if self.strict {
             let mut strict_schema = schema.clone();
             enforce_strict_object_schemas(&mut strict_schema);
-            match self
+            let strict_result = self
                 .inner
-                .complete_structured_raw(request.clone(), strict_schema)
-                .await
-            {
+                .complete_structured_raw_with_operation_id(
+                    request.clone(),
+                    strict_schema,
+                    operation_id,
+                )
+                .await;
+            match strict_result {
                 Ok(v) if v.is_object() => return Ok(v),
                 Ok(_) => {
                     debug!("compat strict: non-object response, falling back to tolerant parser");
@@ -173,7 +236,10 @@ impl LlmProvider for OpenAiCompatProvider {
         // Default (and strict fallback): most older local engines don't
         // honour `response_format`. Ask for JSON and extract the first
         // balanced `{…}` object from the text.
-        let res = self.inner.complete(request).await?;
+        let res = self
+            .inner
+            .complete_with_operation_id(request, operation_id)
+            .await?;
         // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
         // `<think>…</think>` before the JSON. Strip those blocks (and any
         // surrounding markdown fences) before trying to parse — otherwise
@@ -286,6 +352,17 @@ mod tests {
         assert!(!p.strict);
         let p = p.with_strict(true);
         assert!(p.strict);
+    }
+
+    #[test]
+    fn timeout_override_reaches_the_inner_provider() {
+        let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "mistral-nemo")
+            .expect("provider builds")
+            .with_timeout_secs(45);
+        assert_eq!(
+            p.inner.request_timeout(),
+            std::time::Duration::from_secs(45)
+        );
     }
 
     #[test]

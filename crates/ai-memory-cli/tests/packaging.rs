@@ -122,6 +122,75 @@ fn systemd_units_use_explicit_native_paths() {
     assert!(!user.contains("/var/lib/ai-memory"));
 }
 
+const LAUNCHD_AGENT_PLIST: &str = "packaging/launchd/com.github.akitaonrails.ai-memory.plist";
+
+#[test]
+fn launchd_agent_plist_is_home_independent_and_unthrottled() {
+    let agent = read_repo(LAUNCHD_AGENT_PLIST);
+
+    // launchd expands nothing: no %h, no $HOME, no ~. Every path in a plist is
+    // a literal, so the two the template cannot know stay placeholders.
+    assert!(agent.contains("__AI_MEMORY_BIN__"));
+    assert!(agent.contains("__HOME__/Library/Logs/ai-memory/"));
+    for unexpandable in ["%h", "$HOME", "${HOME}", "~/"] {
+        assert!(
+            !agent.contains(unexpandable),
+            "launchd would take {unexpandable} literally instead of expanding it"
+        );
+    }
+
+    // The macOS data dir and the config file inside it are already the binary's
+    // defaults, so passing them would only reintroduce a home-dependent path.
+    assert!(!agent.contains("--data-dir"));
+    assert!(!agent.contains("--config"));
+
+    // An unset ProcessType makes launchd throttle CPU and I/O bandwidth, which
+    // the hook ingress budget cannot absorb. Adaptive keys off XPC
+    // transactions, which ai-memory never opens, so it decays to Background.
+    assert!(agent.contains("<key>ProcessType</key>\n  <string>Interactive</string>"));
+
+    assert!(agent.contains("<key>RunAtLoad</key>\n  <true/>"));
+    assert!(agent.contains("<key>KeepAlive</key>\n  <true/>"));
+
+    // launchctl addresses the job by Label, so a Label that disagrees with the
+    // filename silently invalidates every bootout/kickstart command we publish.
+    let label = Path::new(LAUNCHD_AGENT_PLIST)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("the plist path has a file stem");
+    assert!(agent.contains(&format!("<key>Label</key>\n  <string>{label}</string>")));
+}
+
+// Substring assertions cannot see malformed XML, and a plist launchd refuses to
+// parse fails at bootstrap time with no useful diagnostic.
+#[cfg(target_os = "macos")]
+#[test]
+fn launchd_agent_plist_is_a_valid_property_list() {
+    let path = repo_root().join(LAUNCHD_AGENT_PLIST);
+    let output = Command::new("plutil")
+        .arg("-lint")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "plutil -lint rejected {}: {}{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn macos_release_tarball_ships_the_launchd_agent_plist() {
+    let release = read_repo(".github/workflows/release.yml");
+    assert!(release.contains("cp -a packaging/launchd \"dist/$artifact/packaging/launchd\""));
+    assert!(
+        release.contains(LAUNCHD_AGENT_PLIST),
+        "the macOS tarball smoke test must prove the plist actually shipped"
+    );
+}
+
 #[test]
 fn aur_packages_install_all_native_assets() {
     for path in ["packaging/aur/PKGBUILD", "packaging/aur/PKGBUILD-bin"] {
@@ -205,11 +274,18 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
 
     let ci = read_repo(".github/workflows/ci.yml");
     assert!(ci.contains("ci-ai-memory-${{ matrix.artifact }}"));
-    assert!(ci.contains("artifact: linux-x86_64"));
-    assert!(ci.contains("artifact: macos-aarch64"));
-    assert!(ci.contains("artifact: macos-x86_64"));
-    assert!(ci.contains("runner: macos-15"));
-    assert!(ci.contains("runner: macos-15-intel"));
+    // The release-build matrix is a conditional expression since the
+    // fast-CI split: Linux always, the macOS legs on full-ci/dispatch.
+    // The full branch must keep every release artifact and runner.
+    assert!(ci.contains(r#"{"artifact": "linux-x86_64", "runner": "ubuntu-22.04"}"#));
+    assert!(ci.contains(r#"{"artifact": "macos-aarch64", "runner": "macos-15"}"#));
+    assert!(ci.contains(r#"{"artifact": "macos-x86_64", "runner": "macos-15-intel"}"#));
+    // and the reduced branch still builds the Linux artifact docker uses
+    assert!(
+        ci.matches(r#"{"artifact": "linux-x86_64", "runner": "ubuntu-22.04"}"#)
+            .count()
+            >= 2
+    );
     assert!(ci.contains("--target runtime-prebuilt-amd64"));
 }
 
@@ -835,6 +911,9 @@ fn managed_host_commands_use_native_path_and_remote_server_without_docker() {
         &["run", "codex", "--yolo", "resume"],
         &["show", "--json", "--no-scan"],
         &["continue", "--workspace", "work", "--yolo"],
+        &["resume", "--workspace", "work", "--limit", "5"],
+        &["workstreams", "--limit", "5", "--json"],
+        &["rename-workstream", "--from", "old", "--to", "new"],
     ];
     for args in commands {
         let output = shell_script_command(&repo_root().join("bin/ai-memory"))
@@ -1444,6 +1523,102 @@ fn powershell_wrapper_trims_paths_with_single_character_separators() {
     );
 }
 
+// The PowerShell counterpart of run_wrapper_on_fake_macos: a fake `docker.cmd`
+// records the argv the wrapper built. No `uname` shadowing is needed because
+// the Windows arm under test is selected by running on Windows at all.
+#[cfg(windows)]
+fn run_powershell_wrapper(args: &[&str]) -> String {
+    run_powershell_wrapper_with_server_url(args, None)
+}
+
+#[cfg(windows)]
+fn run_powershell_wrapper_with_server_url(args: &[&str], server_url: Option<&str>) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    let docker_args = tmp.path().join("docker-args.txt");
+    let docker = tmp.path().join("docker.cmd");
+    std::fs::write(
+        &docker,
+        "@echo off\r\n>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\nexit /b 0\r\n",
+    )
+    .unwrap();
+
+    let mut command = Command::new("powershell.exe");
+    // See the execution-policy note on the OAuth-token test below.
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(repo_root().join("bin/ai-memory.ps1"))
+        .args(args)
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
+        .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env_remove("AI_MEMORY_DATA_DIR");
+    match server_url {
+        Some(url) => command.env("AI_MEMORY_SERVER_URL", url),
+        None => command.env_remove("AI_MEMORY_SERVER_URL"),
+    };
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "PowerShell wrapper failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_to_string(docker_args).unwrap()
+}
+
+// The Windows mirror of macos_wrapper_routes_urls_by_real_subcommand: Docker
+// Desktop gives Linux containers no host networking on Windows either, so the
+// helper container cannot reach the host-published server over loopback.
+#[cfg(windows)]
+#[test]
+fn windows_wrapper_routes_urls_by_real_subcommand() {
+    for subcommand in ["install-mcp", "install-hooks", "setup-agent"] {
+        let args = run_powershell_wrapper(&[subcommand]);
+        assert!(
+            !args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+            "{subcommand} renders host-side config and must keep loopback defaults; got {args}"
+        );
+    }
+
+    let args = run_powershell_wrapper(&["status"]);
+    assert!(
+        args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "thin-client commands must reach the host server through Docker Desktop; got {args}"
+    );
+
+    let args = run_powershell_wrapper(&["search", "install-hooks"]);
+    assert!(
+        args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "only the actual subcommand should control URL routing; got {args}"
+    );
+
+    let args = run_powershell_wrapper(&["--config", "C:\\tmp\\config.toml", "install-hooks"]);
+    assert!(
+        !args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "global options before install-hooks must not hide the real subcommand; got {args}"
+    );
+
+    // A homelab/remote server is configured through the environment, and the
+    // helper container must not be redirected back at the local Docker host.
+    let args =
+        run_powershell_wrapper_with_server_url(&["status"], Some("http://192.168.1.50:49374"));
+    assert!(
+        !args.contains("AI_MEMORY_SERVER_URL=http://host.docker.internal:49374"),
+        "an explicit AI_MEMORY_SERVER_URL must win over the Docker Desktop alias; got {args}"
+    );
+    assert!(
+        args.contains("-e AI_MEMORY_SERVER_URL"),
+        "an explicit AI_MEMORY_SERVER_URL must still be forwarded by name; got {args}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn powershell_wrapper_forwards_subscription_oauth_tokens_without_putting_values_in_argv() {
@@ -1462,7 +1637,22 @@ fn powershell_wrapper_forwards_subscription_oauth_tokens_without_putting_values_
     ];
     let mut command = Command::new("powershell.exe");
     command
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+        // -ExecutionPolicy Bypass: `-File` loads a script from disk, and execution policy
+        // governs script *files*, so on a machine left at the Windows client default of
+        // `Restricted` the unsigned bin/ai-memory.ps1 is refused (`UnauthorizedAccess`) and
+        // the wrapper never runs — failing this test for a reason unrelated to what it
+        // checks. The other in-repo invocation (render_shared.rs) uses `-Command`, which is
+        // not policy-gated and therefore needs no override; the generated hook commands pass
+        // Bypass defensively. GitHub's runner is permissive enough that this passes there
+        // today, so the fix is for running the suite on a stock Windows install.
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
         .arg(repo_root().join("bin/ai-memory.ps1"))
         .args(["llm-test", "--provider", "anthropic-oauth"])
         .env("AI_MEMORY_DOCKER", &docker)

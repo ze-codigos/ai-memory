@@ -26,6 +26,16 @@
 //!   otherwise parse the first balanced `{…}` from the text body.
 //!   No tenacity-style 8-128s backoff (cognee #2840 lesson).
 
+/// Default per-request timeout applied by every chat provider.
+///
+/// 300s tolerates Ollama / llama-swap cold-loading a 30B+ model from disk
+/// on first request. Once `OLLAMA_KEEP_ALIVE` keeps it warm, subsequent
+/// requests return in seconds — but the first one after the model unloaded
+/// needs the headroom. Slow hosted gateways that stream long completions
+/// may need more; operators override it with `AI_MEMORY_LLM_TIMEOUT_SECS`
+/// (read once by `Config::load`, applied to every chat provider).
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
 pub mod anthropic;
 pub mod auth;
 pub mod copilot;
@@ -35,6 +45,8 @@ pub mod factory;
 pub mod gemini;
 pub mod google;
 pub mod health;
+#[cfg(feature = "local-embeddings")]
+pub mod local;
 pub mod oidc;
 pub mod openai;
 pub mod openai_compat;
@@ -69,6 +81,8 @@ pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
     ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
 };
+#[cfg(feature = "local-embeddings")]
+pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
 pub use oidc::{
     DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
     OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,
@@ -82,7 +96,9 @@ pub use openai_oauth::{
     OpenAiOAuthTokenResponse,
 };
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
-pub use provider::{LlmProvider, complete_structured};
+pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
-pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};
+pub use types::{
+    ChatMessage, ChatRequest, ChatResponse, LlmOperationId, ReasoningEffort, Role, Usage,
+};

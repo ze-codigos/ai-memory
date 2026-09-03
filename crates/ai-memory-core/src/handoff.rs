@@ -110,15 +110,20 @@ pub struct HandoffAcceptance {
     pub receiving_cwd: Option<String>,
 }
 
-/// Materialised view of a handoff row.
+/// Row identity and tenancy for a handoff.
 #[derive(Debug, Clone, Serialize)]
-pub struct Handoff {
+pub struct HandoffScope {
     /// Stable identifier.
     pub id: HandoffId,
     /// Owning workspace.
     pub workspace_id: WorkspaceId,
     /// Owning project.
     pub project_id: ProjectId,
+}
+
+/// Where a handoff came from and who it's for.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffOrigin {
     /// Session that produced this handoff, if any.
     pub from_session_id: Option<SessionId>,
     /// Agent CLI that produced this handoff.
@@ -127,6 +132,14 @@ pub struct Handoff {
     pub to_agent: Option<AgentKind>,
     /// Working directory at handoff time.
     pub cwd: Option<String>,
+    /// Operator this handoff belongs to ([`crate::IdentityKey::storage_key`]
+    /// form); `None` means shared with the project.
+    pub owner_user: Option<String>,
+}
+
+/// The handoff payload itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffContent {
     /// Summary.
     pub summary: String,
     /// Open questions.
@@ -135,6 +148,11 @@ pub struct Handoff {
     pub next_steps: Vec<String>,
     /// Files touched.
     pub files_touched: Vec<String>,
+}
+
+/// State machine and acceptance record for a handoff.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffLifecycle {
     /// State.
     pub state: HandoffState,
     /// Creation timestamp.
@@ -145,10 +163,28 @@ pub struct Handoff {
     pub accepted_at: Option<Timestamp>,
     /// Session that accepted, if any.
     pub accepted_by_session: Option<SessionId>,
-    /// Operator this handoff belongs to ([`crate::IdentityKey::storage_key`]
-    /// form); `None` means shared with the project.
-    pub owner_user: Option<String>,
-    /// Operator that accepted it. Unlike [`Handoff::accepted_by`] (the agent
-    /// CLI), this answers "which teammate took the baton".
+    /// Operator that accepted it. Unlike [`HandoffLifecycle::accepted_by`]
+    /// (the agent CLI), this answers "which teammate took the baton".
     pub accepted_by_user: Option<String>,
+}
+
+/// Materialised view of a handoff row.
+///
+/// Grouped into sub-structs (identity, origin, content, lifecycle) instead
+/// of 18 flat fields; each is `#[serde(flatten)]`ed so the MCP wire JSON
+/// stays exactly as flat as before this split.
+#[derive(Debug, Clone, Serialize)]
+pub struct Handoff {
+    /// Row identity and tenancy.
+    #[serde(flatten)]
+    pub scope: HandoffScope,
+    /// Where it came from and who it's for.
+    #[serde(flatten)]
+    pub origin: HandoffOrigin,
+    /// The payload.
+    #[serde(flatten)]
+    pub content: HandoffContent,
+    /// State machine and acceptance record.
+    #[serde(flatten)]
+    pub lifecycle: HandoffLifecycle,
 }

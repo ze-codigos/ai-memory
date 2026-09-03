@@ -222,7 +222,7 @@ async fn single_operator_handoff_is_stamped_shared() {
         .expect("list");
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        rows[0].owner_user, None,
+        rows[0].origin.owner_user, None,
         "a deployment that separates nobody must stamp nobody",
     );
 }

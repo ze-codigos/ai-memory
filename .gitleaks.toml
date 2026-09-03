@@ -40,6 +40,17 @@ regexes = [
     '''ghp_FAKE[A-Z0-9]+''',
     '''github_pat_FAKE[A-Z0-9_]+''',
     '''AKIAFAKE[A-Z0-9]+''',
+    '''ASIAFAKE[A-Z0-9]+''',
+    # Stripe *restricted* key fixture, same FAKE convention as the keys above.
+    '''rk_live_FAKEfake[A-Za-z0-9]+''',
+    # Telegram bot-token fixture: the example Telegram itself publishes in its
+    # Bot API documentation — a shape anyone can look up, not an issued token.
+    # The sanitizer test asserts that exact documented form is redacted.
+    # Listed twice on purpose: gitleaks matches an allowlist against the
+    # secret a rule *extracted*, and `generic-api-key` extracts only the tail
+    # after the colon, so the full-token form alone would not exempt it.
+    '''123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11''',
+    '''ABC-DEF1234ghIkl-zyx57W2v1u123ew11''',
     '''Bearer abcdef0123456789ABCDEF0123456789''',
     '''xoxb-1234567890-abcdefghij''',
 

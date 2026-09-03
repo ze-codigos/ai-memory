@@ -39,6 +39,7 @@
 //! - **No SQL outside the writer actor.** Use [`WriterHandle`] methods so all
 //!   writes go through the single-writer channel (invariant #2).
 
+mod m2026_09_okf_conformance;
 mod runner;
 
 use std::path::Path;
@@ -95,8 +96,7 @@ pub trait WikiMigration: Send + Sync {
 /// of pre-existing data.
 #[must_use]
 pub fn registry() -> Vec<Box<dyn WikiMigration>> {
-    // Keep this empty until a structural change actually needs migrating
-    // existing installs. Appending to an empty vec is a zero-diff PR for
-    // future contributors.
-    vec![]
+    vec![Box::new(
+        m2026_09_okf_conformance::OkfConformance::from_env(),
+    )]
 }

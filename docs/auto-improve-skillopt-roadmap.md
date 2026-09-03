@@ -268,16 +268,28 @@ Required tests:
 
 ## Phase 5 — Slow / Meta Update Later
 
-Defer this until patch proposals, edit budgets, rejections, and optional evals
-produce enough data.
+Status: report-only step implemented; `_meta` update and cross-project
+optimizer memory not started.
 
-First version should be report-only. Later, a protected `_meta` section can be
-updated through a normal pending proposal, never directly by a per-session review.
-Cross-project optimizer memory is explicitly out of scope until there is evidence
-it helps ai-memory users.
+Defer the rest until patch proposals, edit budgets, rejections, and optional
+evals produce enough data.
+
+First version should be report-only. `auto_improve_telemetry.rs` ships this:
+a structured `AutoImproveTelemetryReport` (terminal rates, bounded findings,
+blind spots) built from persisted proposal outcomes, staged and approved like
+any other report — approval writes the report page only and performs no
+learning-memory changes, and it explicitly does not edit rules, procedures,
+notes, or `_meta` pages.
+
+Later, a protected `_meta` section can be updated through a normal pending
+proposal, never directly by a per-session review. Cross-project optimizer
+memory is explicitly out of scope until there is evidence it helps ai-memory
+users. Neither has been started.
 
 ## Completion Criteria
 
 This roadmap is complete when phases 1–4 are implemented with docs, migrations,
 tests, and changelog entries, and phase 5 has either a report-only design or a
-documented deferral with evidence requirements.
+documented deferral with evidence requirements. Phases 1–4 and phase 5's
+report-only step are done; the `_meta` update and cross-project optimizer
+memory remain deferred pending evidence.

@@ -16,6 +16,19 @@ pub struct ConsolidatedPage {
     /// Up to ~5 short tags surfaced into the page's frontmatter.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// One line of plain prose saying what this page covers, shown beside the
+    /// title in retrieval listings. See [`ConsolidatedPageUpdate::summary`]
+    /// for the shape it has to keep. Defaults to absent so existing stored
+    /// outputs still deserialise.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Typed edges to existing pages (2.0 item 3). Keys are the closed
+    /// vocabulary `causes` / `fixes` / `contradicts`; values are wiki
+    /// paths of the target pages. Only declare a relation when the
+    /// session's evidence states it plainly — an empty map is the
+    /// normal case. Unknown keys are dropped at the write boundary.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub relations: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Semantic classification of one consolidated page. Surfaced into
@@ -117,6 +130,14 @@ pub struct ConsolidatedPageUpdate {
     pub title: String,
     /// New markdown body.
     pub body_markdown: String,
+    /// One line of plain prose saying what this page covers, shown beside
+    /// the title in retrieval listings. Write a complete sentence: not a
+    /// heading, not a `- **key:** value` bullet, and not a repeat of the
+    /// title — the reader drops all three and would fall back to echoing
+    /// this field verbatim. Omit it rather than guessing. Defaults to absent
+    /// so existing structured outputs still deserialise.
+    #[serde(default)]
+    pub summary: Option<String>,
     /// Optional tags surfaced into frontmatter.
     #[serde(default)]
     pub tags: Vec<String>,

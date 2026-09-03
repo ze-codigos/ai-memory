@@ -32,6 +32,30 @@ const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","param
 /// mode. Returns the `Store` too so the writer actor stays alive for the
 /// duration of the test.
 async fn make_router(tmp: &TempDir, stateful: bool) -> (Router, Store) {
+    make_router_with_strip(tmp, stateful, false).await
+}
+
+/// [`make_router`] with the `strip_root_combinators` server toggle exposed.
+async fn make_router_with_strip(
+    tmp: &TempDir,
+    stateful: bool,
+    strip_root_combinators: bool,
+) -> (Router, Store) {
+    make_router_with_dialect(tmp, stateful, strip_root_combinators, false).await
+}
+
+/// [`make_router`] with the `gemini_safe_schemas` server toggle on.
+async fn make_router_gemini_safe(tmp: &TempDir, stateful: bool) -> (Router, Store) {
+    make_router_with_dialect(tmp, stateful, false, true).await
+}
+
+/// [`make_router`] with both schema-dialect toggles exposed.
+async fn make_router_with_dialect(
+    tmp: &TempDir,
+    stateful: bool,
+    strip_root_combinators: bool,
+    gemini_safe_schemas: bool,
+) -> (Router, Store) {
     let store = Store::open(tmp.path()).unwrap();
     let ws = store
         .writer
@@ -43,7 +67,9 @@ async fn make_router(tmp: &TempDir, stateful: bool) -> (Router, Store) {
         .get_or_create_project(ws, "scratch".to_string(), None)
         .await
         .unwrap();
-    let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+    let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+        .with_strip_root_combinators(strip_root_combinators)
+        .with_gemini_safe_schemas(gemini_safe_schemas);
     let svc = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
@@ -237,17 +263,143 @@ async fn stateless_bedrock_flavor_strips_root_any_of() {
     assert!(schema.get("properties").is_some());
 }
 
-/// Control: without the marker, tools/list keeps the upstream root `anyOf`.
+/// Generic clients (OpenCode, Cursor) never send the `?flavor=` marker, yet
+/// forward tool schemas verbatim to strict upstreams. The
+/// `strip_root_combinators` toggle must serve the restricted dialect to them
+/// anyway (issue #412) — same transport wiring, no flavor parameter.
 #[tokio::test]
-async fn stateless_tools_list_without_flavor_keeps_root_any_of() {
+async fn stateless_config_strip_strips_root_any_of_without_flavor() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router_with_strip(&tmp, false, true).await;
+
+    let resp = router.oneshot(post_to("/mcp", TOOLS_LIST)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "config strip must remove root `{key}` without a flavor marker: {schema}"
+        );
+    }
+    assert!(
+        schema.get("properties").is_some(),
+        "the flat schema must keep describing the args: {schema}"
+    );
+}
+
+/// #577 inverted the default: the source schema no longer carries a
+/// root `anyOf` at all, so even with the strip toggle OFF and no flavor
+/// marker, every Messages-API-routed client gets a session-safe schema.
+/// (#155's early refusal moved to descriptions + runtime validation.)
+#[tokio::test]
+async fn stateless_config_without_strip_is_already_root_combinator_free() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router.oneshot(post_to("/mcp", TOOLS_LIST)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "the default schema must be root-combinator-free (#577): {schema}"
+        );
+    }
+    assert!(
+        schema.get("properties").is_some(),
+        "the flat schema must keep describing the args: {schema}"
+    );
+}
+
+/// A pass-through client on a Gemini/Vertex model 400s on the union types
+/// `schemars` emits for optional args ("specified other fields alongside
+/// any_of"). `?flavor=gemini` must collapse them to Google's single-`type` plus
+/// `nullable` form, and strip the root combinators the older dialects strip.
+#[tokio::test]
+async fn stateless_gemini_flavor_collapses_nullable_unions() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router
+        .oneshot(post_to("/mcp?flavor=gemini", TOOLS_LIST))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "gemini flavor must strip root `{key}`: {schema}"
+        );
+    }
+    assert_eq!(
+        schema["properties"]["query"]["type"],
+        serde_json::json!("string"),
+        "the nullable union must collapse to a single type: {schema}"
+    );
+    assert_eq!(
+        schema["properties"]["query"]["nullable"],
+        serde_json::json!(true),
+        "optionality must survive as `nullable`: {schema}"
+    );
+}
+
+/// OpenCode and friends cannot carry a `?flavor=` marker, so the config toggle
+/// has to serve the same dialect without one — the issue #412 rationale, now
+/// for Vertex.
+#[tokio::test]
+async fn stateless_config_gemini_safe_collapses_unions_without_flavor() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router_gemini_safe(&tmp, false).await;
+
+    let resp = router.oneshot(post_to("/mcp", TOOLS_LIST)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    assert!(
+        schema.get("anyOf").is_none(),
+        "gemini_safe_schemas implies stripping the root anyOf: {schema}"
+    );
+    assert_eq!(
+        schema["properties"]["query"]["type"],
+        serde_json::json!("string"),
+        "config toggle must collapse unions without a marker: {schema}"
+    );
+}
+
+/// The Moonshot/Bedrock dialect must not start collapsing unions: it is a
+/// narrower patch, and changing it would alter shipped behavior for Kimi/Kiro.
+#[tokio::test]
+async fn stateless_moonshot_flavor_keeps_nullable_unions() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router
+        .oneshot(post_to("/mcp?flavor=moonshot", TOOLS_LIST))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    assert_eq!(
+        schema["properties"]["query"]["type"],
+        serde_json::json!(["string", "null"]),
+        "the root-combinator dialect must leave union types alone: {schema}"
+    );
+}
+
+/// Unflavored tools/list is root-combinator-free too (#577): the safe
+/// shape is the default, not a per-flavor patch.
+#[tokio::test]
+async fn stateless_tools_list_without_flavor_is_root_combinator_free() {
     let tmp = TempDir::new().unwrap();
     let (router, _store) = make_router(&tmp, false).await;
 
     let resp = router.oneshot(post(TOOLS_LIST)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let schema = read_page_input_schema(&body_string(resp).await);
-    assert!(
-        schema.get("anyOf").is_some(),
-        "unflavored tools/list must keep the upstream root anyOf: {schema}"
-    );
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "unflavored tools/list must be root-combinator-free (#577): {schema}"
+        );
+    }
 }

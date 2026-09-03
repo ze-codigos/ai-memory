@@ -7,6 +7,7 @@
 //! provider only defines its extras and its response mapping.
 
 use std::path::Path;
+use std::time::Duration;
 
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -126,6 +127,10 @@ where
 {
     let resp = client
         .post(token_endpoint)
+        // Bounded here because callers hand us their shared client, whose
+        // global timeout was removed in favour of per-request timeouts —
+        // a token exchange is quick, so the default ceiling is plenty.
+        .timeout(Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS))
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),

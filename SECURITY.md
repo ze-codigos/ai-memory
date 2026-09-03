@@ -37,7 +37,17 @@ what the project is and is not designed to defend against.
 
   The server fails closed before serving unauthenticated non-loopback HTTP.
   `--allow-insecure-no-auth` is a deliberate dangerous override for an
-  intentional plain-HTTP LAN deployment. Authentication does not encrypt
+  intentional plain-HTTP LAN deployment.
+
+  **Inside a container this check warns instead of refusing.** Publishing a
+  port with `-p` requires binding `0.0.0.0` in the namespace, so the bind
+  address says nothing about reachability there — that is decided by the
+  host-side publish spec, which the process cannot see. In a container the
+  thing to check is your own `-p`: `-p 127.0.0.1:49374:49374` is loopback-only
+  and safe without a token; anything broader needs `AI_MEMORY_AUTH_TOKEN`.
+  Note the `Host` allowlist is not a substitute — it defends against DNS
+  rebinding, where a browser sets the header, and a client that can route to
+  the port sets `Host` freely. Authentication does not encrypt
   bearer tokens, so use a TLS reverse proxy for traffic beyond loopback; see
   [`docs/https-via-proxy.md`](docs/https-via-proxy.md).
 

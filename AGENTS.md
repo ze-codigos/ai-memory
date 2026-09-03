@@ -178,7 +178,7 @@ crates/
 ├── ai-memory-workstream/  read-only native transcript + launch adapters (`ai-memory run`).
 └── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 evals/                     live A/B harness; workspace member, not shipped.
-companions/ai-memory-importer/  standalone OMC wiki importer; NOT a root
+companions/ai-memory-importer/  standalone OMC + external-conversation importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
@@ -221,9 +221,17 @@ cargo deny check                                          # dependency policy (i
   `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
 - CI additionally runs `cargo build --release --bin ai-memory` on
   Linux/macOS, a Docker image smoke test, `cargo audit` (with the ignores
-  listed in `ci.yml`), differential gitleaks scanning, and a non-gating
-  Windows test job. `.github/workflows/secret-scan.yml` runs the separate
-  weekly/manual full-history gitleaks scan.
+  listed in `ci.yml`), and differential gitleaks scanning.
+  `.github/workflows/secret-scan.yml` runs the separate weekly/manual
+  full-history gitleaks scan.
+- **Windows runs in its own workflow** (`.github/workflows/windows.yml`):
+  every push to `main`, nightly, on demand, and on any PR labelled
+  `windows`. It is the only place `#[cfg(windows)]` tests compile, and it
+  is ~4x slower than the same tests on Linux — keeping it out of `ci.yml`
+  is what holds PR feedback near the eight minutes the gating jobs take.
+  **Add the `windows` label** to a PR touching path handling, file
+  locking, or git plumbing, so the check runs before the merge rather
+  than after it.
 
 ## Code style guidelines
 
@@ -269,8 +277,11 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
    wrapper libraries.
 8. **`{provider, model, dim}` denormalized next to every embedding**;
    stale vectors are warned about and ignored on config mismatch.
-9. **Live-process check before destructive ops** (`reset`, `backup`,
-   `restore` consult `sysinfo`).
+9. **Live-process check before direct-disk lifecycle ops.** `reset`, `restore`,
+   `reindex`, and `uninstall --purge-data` consult `sysinfo`; the uninstall
+   guard is conditional on `--purge-data`. `backup` stays online: its thin HTTP
+   client asks the server to snapshot SQLite with the online backup API while
+   the writer remains live.
 10. **Atomic file writes** (tmp + rename + fsync); the watcher ignores
     its own writes by filename prefix.
 11. **Absolute canonical data dir**, logged loudly at startup.
@@ -282,6 +293,36 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
     directly.
 15. **Tracing subscribers explicitly filter their own module** — no
     feedback loops.
+
+16. **Multi-session and multi-user access to one project is a core
+    capability.** One operator running several harnesses at once, and
+    several operators sharing one server, must both work — and knowledge
+    written by either must be readable by the other in the same project.
+    Concretely:
+    - **Pages are shared, batons are owned.** `pages.author_id` exists for
+      attribution and must never become a read filter; `OwnerFilter` applies
+      to handoffs and stays there. A change that scopes page reads by
+      operator silently stops a team collaborating while every single-user
+      test still passes.
+    - **A divergent concurrent write supersedes, never destroys.** Two
+      harnesses editing one path produce a supersession chain; the loser
+      stays reachable. "Last write wins" must not come to mean "the other
+      version is gone".
+    - **A handoff is claimed exactly once**, by two independent `state =
+      'open'` guards (the metadata lookup and the claim `UPDATE`). Keep both;
+      they are defence in depth, not duplication.
+    - **The active-project pointer is keyed by the caller's coordinate**
+      (`ActiveProjectMode::PerActor` by default), so parallel harnesses and
+      separate operators cannot overwrite each other's notion of "current
+      project" — which unscoped *writes* also resolve through.
+
+    Unit tests do not cover this: they exercise one session at a time, which
+    is the exact shape that cannot see a collaboration or concurrency defect.
+    `crates/ai-memory-store/tests/multi_session.rs` and the pointer tests in
+    `ai-memory-core::active_project` are the guards. Any change to scope
+    resolution, page supersession, session identity, handoff acceptance, the
+    writer actor, or owner filters must be argued against this invariant
+    explicitly rather than assumed safe.
 
 Additional boundary rules:
 
@@ -354,6 +395,13 @@ Additional boundary rules:
   `Added`/`Changed`/`Fixed` heading, past-tense, trailing `(#NNN)`
   reference) and update the relevant README/docs references in the same
   commit. Internal refactors and test-only churn are exempt.
+- **CI pacing: fast per merge, full matrix before release.** Every
+  implementation merge gates on the fast Linux jobs only. The slow
+  macOS/Windows legs run on a `full-ci` PR label, nightly (windows), or
+  manual dispatch — and running them is **mandatory right before a
+  release**: dispatch `ci` (macOS legs) and `windows` on the exact
+  release-candidate SHA and wait for green before tagging. Never tag a
+  release whose SHA lacks a green full matrix.
 - **No version bumps or release tags without explicit user approval.**
   Do not bump crate/package versions automatically.
 - **PR evaluation:** report pros, cons, and recommended fix, then ask for
@@ -363,8 +411,19 @@ Additional boundary rules:
   regression tests asserting every tool appears in both prompt surfaces.
   The tool count is currently 18 (see `docs/ARCHITECTURE.md`).
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
-  subcommands, MCP tools, config keys); major = breaking (on-disk format
-  without migration, removed subcommands, breaking MCP schema changes).
+  subcommands, MCP tools, config keys, a new agent harness or LLM
+  provider); major = breaking (on-disk format without migration, removed
+  subcommands, breaking MCP schema changes, big rewrites).
+- **Release cadence and ordering.** Batch tickets by semver impact and
+  ship fixes as a patch release promptly — never let a bug fix wait on
+  unreleased feature work. The `[Unreleased]` section signals the bump:
+  only `### Fixed` → patch; any `### Added` → minor; anything breaking →
+  major. Releases cut from `main` (trunk-based). If `main` already holds
+  unreleased feature work and a fix must ship, cut `release/X.Y` from
+  the last tag, cherry-pick the fix (it lands on `main` first, always),
+  tag from the branch, then let the branch go dormant — no standing
+  develop/gitflow branches. Bucket incoming work at triage with the
+  `breaking-change` label and version milestones.
 - Keep `CLAUDE.md` as a pointer to this file.
 
 ## Documentation map

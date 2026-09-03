@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
-use crate::commands::render_shared::{ts_capture_policy_v1, ts_string_literal};
+use crate::commands::render_shared::{ts_capture_policy_v1, ts_spool_runtime, ts_string_literal};
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
 pub(crate) const PACKAGE_NAME: &str = "@ai-memory/openclaw-plugin";
@@ -311,7 +311,7 @@ fn build_plugin(
 
 import {{ definePluginEntry }} from "openclaw/plugin-sdk/plugin-entry";
 import {{ execFileSync }} from "node:child_process";
-import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync }} from "node:fs";
+import {{ closeSync, existsSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, unlinkSync, writeFileSync }} from "node:fs";
 import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
@@ -446,7 +446,7 @@ function postPreCompact(event: any, ctx: any): void {{
   postHook("pre-compact", payload(event, ctx, {{ reason: event?.reason }}));
 }}
 
-function postHook(eventName: string, body: Record<string, unknown>): void {{
+{spool_runtime}function postHook(eventName: string, body: Record<string, unknown>): void {{
   const url = new URL(`${{SERVER}}/hook`);
   url.searchParams.set("event", eventName);
   url.searchParams.set("agent", AGENT);
@@ -454,14 +454,23 @@ function postHook(eventName: string, body: Record<string, unknown>): void {{
   const policy = capturePolicy(body, typeof body.cwd === "string" ? body.cwd : undefined);
   if (policy.disposition === "drop") return;
   try {{
+    // Fire-and-forget, but never silent loss: an unreachable server or
+    // 5xx spools the event in the CLI hook-spool format for a later
+    // drain (#580); a delivered post opportunistically drains backlog.
     void fetch(url, {{
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
       signal: timeoutSignal(500),
-    }}).catch(() => undefined);
+    }})
+      .catch(() => undefined)
+      .then((resp) => {{
+        if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);
+        else requestSpoolDrain();
+      }})
+      .catch(() => undefined);
   }} catch (_e) {{
-    // Fire-and-forget. Hooks must never block OpenClaw.
+    try {{ spoolFailedHook(url, policy.payload); }} catch (_e2) {{}}
   }}
 }}
 
@@ -546,6 +555,7 @@ export default definePluginEntry({{
 "#,
         server_literal = ts_string_literal(server_url),
         token_line = token_line,
+        spool_runtime = ts_spool_runtime(),
     )
 }
 
@@ -553,6 +563,33 @@ export default definePluginEntry({{
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn openclaw_plugin_spools_failed_deliveries() {
+        // #580: OpenClaw's fire-and-forget postHook must persist failures
+        // in the CLI hook-spool format and drain the backlog on success.
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        assert!(plugin.contains("function spoolFailedHook("));
+        assert!(plugin.contains("async function drainHookSpool()"));
+        assert!(
+            plugin
+                .contains("if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);")
+        );
+        assert!(plugin.contains("else requestSpoolDrain();"));
+        assert!(plugin.contains(r#"return join(env, "hook-spool");"#));
+        for f in [
+            "mkdirSync",
+            "writeFileSync",
+            "renameSync",
+            "readdirSync",
+            "unlinkSync",
+        ] {
+            assert!(
+                plugin.contains(&format!("{f},")) || plugin.contains(&format!("{f} }}")),
+                "node:fs import missing {f}"
+            );
+        }
+    }
 
     #[test]
     fn package_has_manifest_and_hook_entrypoint() {

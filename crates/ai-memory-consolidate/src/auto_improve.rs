@@ -12,7 +12,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+};
 use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de};
@@ -57,7 +59,7 @@ const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
 // this window to influence the reviewer.
 const MAX_OBSERVATION_BODY_CHARS: usize = 1_500;
 const PROMPT_SCAFFOLD_RESERVE_CHARS: usize = 4_000;
-const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
+pub(crate) const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
 const MAX_REJECTION_PATH_CHARS: usize = 256;
 const MAX_REJECTION_REASON_CHARS: usize = 512;
 const MAX_REJECTION_FINGERPRINT_CHARS: usize = 128;
@@ -261,7 +263,15 @@ impl<'de> Deserialize<'de> for AutoImproveEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutoImproveProposal {
     /// Currently only `create_or_update` is supported.
+    ///
+    /// Advertised to the model as a single-value enum so providers with
+    /// constrained decoding cannot generate anything else. The field stays a
+    /// `String` rather than becoming a Rust enum on purpose: a provider
+    /// *without* constrained decoding that emits `"create"` should be
+    /// normalised by [`normalize_operation`], not fail to deserialise and take
+    /// the whole proposal with it.
     #[serde(default = "default_operation")]
+    #[schemars(extend("enum" = ["create_or_update"]))]
     pub operation: String,
     /// Relative wiki path that would be created or updated.
     #[serde(default)]
@@ -315,8 +325,33 @@ pub struct AutoImprovePatchEdit {
     pub context: Option<String>,
 }
 
+/// The one operation this pipeline performs.
+pub const CANONICAL_OPERATION: &str = "create_or_update";
+
 fn default_operation() -> String {
-    "create_or_update".into()
+    CANONICAL_OPERATION.into()
+}
+
+/// Map the ways a model spells the single supported operation onto its
+/// canonical form.
+///
+/// Deliberately narrow: only spellings that unambiguously mean "write this
+/// page" are folded in. Anything else is left untouched so it still fails
+/// validation — the point is to stop losing work to a wording difference,
+/// not to accept an operation the pipeline cannot perform.
+fn normalize_operation(raw: &str) -> String {
+    let squashed: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-' | '/'))
+        .collect();
+    match squashed.as_str() {
+        "createorupdate" | "create" | "update" | "upsert" | "createupdate" | "write" => {
+            CANONICAL_OPERATION.to_string()
+        }
+        _ => raw.to_string(),
+    }
 }
 
 fn default_edit_mode() -> String {
@@ -480,7 +515,8 @@ pub async fn run_auto_improve_review(
         max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
-    let raw: AutoImproveLlmResponse = complete_structured(llm, request).await?;
+    let raw: AutoImproveLlmResponse =
+        complete_structured_with_operation_id(llm, request, session_id.into()).await?;
     let (mut proposals, mut rejected_candidates, mut warnings) =
         validate_response(raw, &cfg, &existing_index);
     rejected_candidates.extend(prompt_input.rejected_candidates);
@@ -543,7 +579,7 @@ struct AutoImproveEvalResponse {
     reason: Option<String>,
 }
 
-async fn apply_eval_gate(
+pub(crate) async fn apply_eval_gate(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -820,29 +856,29 @@ fn eval_rejection(
     }
 }
 
-struct PromptInput {
-    prompt: String,
-    patchable_paths: BTreeSet<String>,
-    rejected_candidates: Vec<AutoImproveRejectedCandidate>,
-    warnings: Vec<String>,
+pub(crate) struct PromptInput {
+    pub(crate) prompt: String,
+    pub(crate) patchable_paths: BTreeSet<String>,
+    pub(crate) rejected_candidates: Vec<AutoImproveRejectedCandidate>,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Default)]
-struct RenderedPatchablePages {
-    text: String,
-    included_paths: BTreeSet<String>,
+pub(crate) struct RenderedPatchablePages {
+    pub(crate) text: String,
+    pub(crate) included_paths: BTreeSet<String>,
 }
 
 #[derive(Debug, Default)]
-struct ExistingPageIndex {
+pub(crate) struct ExistingPageIndex {
     paths: BTreeSet<String>,
     titles: BTreeSet<String>,
     patchable: BTreeMap<String, PatchablePageContext>,
 }
 
 #[derive(Debug, Clone)]
-struct PatchablePageContext {
-    path: String,
+pub(crate) struct PatchablePageContext {
+    pub(crate) path: String,
     title: String,
     kind: String,
     body: String,
@@ -860,7 +896,10 @@ struct MarkdownSection {
 }
 
 impl ExistingPageIndex {
-    fn from_pages(pages: &[BriefingPage], patchable_pages: &[PatchablePageContext]) -> Self {
+    pub(crate) fn from_pages(
+        pages: &[BriefingPage],
+        patchable_pages: &[PatchablePageContext],
+    ) -> Self {
         Self {
             paths: pages.iter().map(|page| page.path.clone()).collect(),
             titles: pages
@@ -897,7 +936,7 @@ fn normalize_title(title: &str) -> String {
         .to_lowercase()
 }
 
-async fn load_patchable_pages(
+pub(crate) async fn load_patchable_pages(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -928,7 +967,7 @@ async fn load_patchable_pages(
     Ok(out)
 }
 
-async fn load_rejection_context(
+pub(crate) async fn load_rejection_context(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -1067,7 +1106,7 @@ fn rejection_context_char_budget(usable_chars: usize) -> usize {
     (usable_chars / 8).min(MAX_REJECTION_CONTEXT_CHARS)
 }
 
-fn render_rejection_context(
+pub(crate) fn render_rejection_context(
     rejections: &[AutoImproveRejectionSummary],
     max_total_chars: usize,
 ) -> String {
@@ -1154,7 +1193,7 @@ fn render_session_page(
     )
 }
 
-fn render_recent_pages(pages: &[BriefingPage]) -> String {
+pub(crate) fn render_recent_pages(pages: &[BriefingPage]) -> String {
     if pages.is_empty() {
         return "(none)".into();
     }
@@ -1168,7 +1207,7 @@ fn render_recent_pages(pages: &[BriefingPage]) -> String {
     out
 }
 
-fn render_patchable_pages(
+pub(crate) fn render_patchable_pages(
     pages: &[PatchablePageContext],
     max_body_chars: usize,
     max_total_chars: usize,
@@ -1364,7 +1403,7 @@ fn preflight_rejection(
     None
 }
 
-fn validate_response(
+pub(crate) fn validate_response(
     raw: AutoImproveLlmResponse,
     cfg: &AutoImproveReviewConfig,
     existing_index: &ExistingPageIndex,
@@ -1511,7 +1550,15 @@ fn validate_proposal(
     cfg: &AutoImproveReviewConfig,
     existing_index: &ExistingPageIndex,
 ) -> Result<(), String> {
-    if proposal.operation != "create_or_update" {
+    // Normalise before comparing. The field description next door says the
+    // path "would be created or updated", which invites exactly the values
+    // rejected here, and models take the invitation: two different local
+    // models emitted `"create"` for 6/6 candidates, so every run finished
+    // with zero validated proposals and the learning loop silently did
+    // nothing (#458). Rejecting a wording difference is not a safety
+    // property — there is only one operation.
+    proposal.operation = normalize_operation(&proposal.operation);
+    if proposal.operation != CANONICAL_OPERATION {
         return Err("unsupported_operation".into());
     }
     if proposal.confidence < cfg.min_confidence {
@@ -1791,7 +1838,7 @@ fn session_duration_secs(observations: &[Observation]) -> u64 {
     u64::try_from(diff_us / 1_000_000).unwrap_or(0)
 }
 
-fn estimate_tokens(text: &str) -> usize {
+pub(crate) fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(CHARS_PER_TOKEN)
 }
 
@@ -2933,6 +2980,39 @@ mod tests {
         }
     }
 
+    /// The end-to-end shape of #458: a model emits `"operation": "create"`
+    /// and every candidate is rejected `unsupported_operation`, so with
+    /// `require_approval = false` the loop finishes having done nothing.
+    /// Reproduced there with two local models, 6/6 candidates.
+    #[test]
+    fn a_proposal_saying_create_is_validated_not_rejected() {
+        let cfg = AutoImproveReviewConfig::default();
+        let index = ExistingPageIndex::default();
+
+        for spelling in ["create", "update", "create/update", "CREATE"] {
+            let mut candidate = proposal("notes/thing.md", "note", 0.91);
+            candidate.operation = spelling.into();
+            let outcome = validate_proposal(&mut candidate, &cfg, &index);
+            assert!(
+                outcome.is_ok(),
+                "{spelling:?} must validate, got {outcome:?}"
+            );
+            assert_eq!(
+                candidate.operation, CANONICAL_OPERATION,
+                "validation should also canonicalise the stored value"
+            );
+        }
+
+        // An operation the pipeline cannot perform still fails, and fails
+        // with the same reason as before.
+        let mut deleting = proposal("notes/thing.md", "note", 0.91);
+        deleting.operation = "delete".into();
+        assert_eq!(
+            validate_proposal(&mut deleting, &cfg, &index),
+            Err("unsupported_operation".into())
+        );
+    }
+
     #[test]
     fn patch_to_missing_or_non_context_target_rejects() {
         let raw = AutoImproveLlmResponse {
@@ -3271,5 +3351,74 @@ mod tests {
         assert!(accepted.is_empty());
         assert!(rejected.iter().any(|r| r.reason == "duplicate_anchor"));
         assert!(rejected.iter().any(|r| r.reason == "patch_extra_h1"));
+    }
+}
+
+#[cfg(test)]
+mod operation_normalization_tests {
+    use super::*;
+
+    /// #458: two local models emitted `"create"` for every candidate, so the
+    /// loop rejected 6/6 as `unsupported_operation` and silently did nothing.
+    #[test]
+    fn the_spellings_models_actually_emit_are_accepted() {
+        for raw in [
+            "create_or_update",
+            "create",
+            "update",
+            "upsert",
+            "create/update",
+            "create or update",
+            "CREATE",
+            "  Create_Or_Update  ",
+            "write",
+        ] {
+            assert_eq!(
+                normalize_operation(raw),
+                CANONICAL_OPERATION,
+                "{raw:?} means write-this-page and must normalise"
+            );
+        }
+    }
+
+    /// The normaliser must not become a rubber stamp: an operation this
+    /// pipeline genuinely cannot perform still has to fail validation.
+    #[test]
+    fn operations_we_cannot_perform_are_left_to_fail() {
+        for raw in ["delete", "rename", "move", "archive", "drop", "merge", ""] {
+            assert_ne!(
+                normalize_operation(raw),
+                CANONICAL_OPERATION,
+                "{raw:?} is not a write and must keep failing validation"
+            );
+        }
+    }
+
+    /// The schema must advertise the constraint, so a provider with
+    /// constrained decoding cannot generate a bad value in the first place.
+    #[test]
+    fn schema_constrains_operation_to_the_canonical_value() {
+        let schema = schemars::schema_for!(AutoImproveProposal);
+        let value = serde_json::to_value(&schema).expect("schema serialises");
+        let op = value
+            .pointer("/properties/operation")
+            .expect("operation property present");
+        let variants = op
+            .get("enum")
+            .and_then(|e| e.as_array())
+            .expect("operation carries an enum constraint");
+        assert_eq!(variants, &vec![serde_json::json!(CANONICAL_OPERATION)]);
+    }
+
+    /// A `String` field, not a Rust enum: a provider without constrained
+    /// decoding that emits `"create"` must still deserialise, so the
+    /// normaliser gets a chance to fix it rather than the whole proposal
+    /// failing to parse.
+    #[test]
+    fn a_non_canonical_operation_still_deserialises() {
+        let parsed: AutoImproveProposal =
+            serde_json::from_value(serde_json::json!({ "operation": "create" }))
+                .expect("must not fail to parse; normalisation happens in validation");
+        assert_eq!(parsed.operation, "create");
     }
 }

@@ -491,17 +491,17 @@ async fn overview_handler(
         Some(h) => {
             let project = state
                 .reader
-                .project_name_by_id(workspace_id, h.project_id)
+                .project_name_by_id(workspace_id, h.scope.project_id)
                 .await
                 .map_err(internal_error)?
                 .unwrap_or_default();
             Some(ApiHandoff {
-                agent: h.from_agent.as_str().to_owned(),
-                at: h.created_at.to_string(),
+                agent: h.origin.from_agent.as_str().to_owned(),
+                at: h.lifecycle.created_at.to_string(),
                 project,
-                summary: h.summary,
-                open_questions: h.open_questions,
-                next_steps: h.next_steps,
+                summary: h.content.summary,
+                open_questions: h.content.open_questions,
+                next_steps: h.content.next_steps,
             })
         }
         None => None,
@@ -752,19 +752,19 @@ async fn handoffs_handler(
     let entries: Vec<ApiHandoffEntry> = handoffs
         .into_iter()
         .map(|h| ApiHandoffEntry {
-            id: h.id.to_string(),
-            agent: h.from_agent.as_str().to_owned(),
-            at: h.created_at.to_string(),
-            state: h.state.as_str().to_owned(),
-            summary: with_body.then_some(h.summary),
-            open_questions: with_body.then_some(h.open_questions),
-            next_steps: with_body.then_some(h.next_steps),
+            id: h.scope.id.to_string(),
+            agent: h.origin.from_agent.as_str().to_owned(),
+            at: h.lifecycle.created_at.to_string(),
+            state: h.lifecycle.state.as_str().to_owned(),
+            summary: with_body.then_some(h.content.summary),
+            open_questions: with_body.then_some(h.content.open_questions),
+            next_steps: with_body.then_some(h.content.next_steps),
             redacted: !with_body,
-            files_touched: h.files_touched,
-            cwd: h.cwd,
-            owner: h.owner_user,
-            accepted_by: h.accepted_by_user,
-            accepted_at: h.accepted_at.map(|t| t.to_string()),
+            files_touched: h.content.files_touched,
+            cwd: h.origin.cwd,
+            owner: h.origin.owner_user,
+            accepted_by: h.lifecycle.accepted_by_user,
+            accepted_at: h.lifecycle.accepted_at.map(|t| t.to_string()),
         })
         .collect();
     Ok(with_no_store(
@@ -790,12 +790,12 @@ async fn project_overview_handler(
         .await
         .map_err(internal_error)?
         .map(|h| ApiHandoff {
-            agent: h.from_agent.as_str().to_owned(),
-            at: h.created_at.to_string(),
+            agent: h.origin.from_agent.as_str().to_owned(),
+            at: h.lifecycle.created_at.to_string(),
             project: project.clone(),
-            summary: h.summary,
-            open_questions: h.open_questions,
-            next_steps: h.next_steps,
+            summary: h.content.summary,
+            open_questions: h.content.open_questions,
+            next_steps: h.content.next_steps,
         });
 
     let briefing = state

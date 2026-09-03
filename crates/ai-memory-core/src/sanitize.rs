@@ -14,8 +14,11 @@
 //! ## What we redact
 //!
 //! Built-in patterns cover bearer tokens, vendor-prefixed API keys
-//! (Anthropic / OpenAI / OpenRouter sk-…, Stripe sk_live_…, GitHub PATs,
-//! Google AIza…, Slack xoxb/xoxp…, AWS AKIA…), PEM-bracketed private
+//! (Anthropic / OpenAI / OpenRouter sk-…, Stripe sk_live_/rk_live_…,
+//! all GitHub token prefixes ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained
+//! github_pat_…, Google AIza… plus OAuth refresh tokens 1//…, Meta /
+//! Facebook Graph EAA…, Telegram bot tokens, GoHighLevel pit-…, Slack
+//! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
 //! keys, URL-embedded credentials (`postgres://user:pass@host`), and
 //! anything matching the generic `*_(KEY|TOKEN|SECRET|PASSWORD|
 //! CREDENTIAL)=value` shape. Operators can extend the list via
@@ -50,12 +53,55 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#,
     // Vendor-prefixed API keys.
     r"sk-[A-Za-z0-9_\-]{16,}",
-    r"sk_live_[A-Za-z0-9_\-]{16,}",
-    r"ghp_[A-Za-z0-9]{20,}",
+    // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
+    // full-access, but the scope is operator-chosen and routinely includes
+    // charges/refunds — not meaningfully safer than `sk_live_`.
+    r"(?:sk|rk)_live_[A-Za-z0-9_\-]{16,}",
+    // Every GitHub token prefix, not only personal-access: `gho_` (OAuth —
+    // what `gh auth login` stores on disk), `ghu_` (user-to-server),
+    // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
+    r"gh[pousr]_[A-Za-z0-9]{20,}",
     r"github_pat_[A-Za-z0-9_]{20,}",
-    r"AKIA[0-9A-Z]{12,}",
+    // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
+    //
+    // Anchored to the exact published format — a 4-character prefix plus
+    // sixteen more, twenty in total — rather than an open `{12,}` tail.
+    // `ASIA` is also an English word, and an open tail redacted ordinary
+    // uppercase text: `ASIAPACIFICREGION` and `ASIAEAST1CLUSTER` were both
+    // destroyed. That is worse than it sounds here, because the strip runs
+    // BEFORE storage and is irreversible: the observation loses the text with
+    // no error and no way to recover it. The word boundaries keep a real key
+    // from being missed when it sits inside punctuation.
+    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
     // Naked Google / Gemini API keys.
     r"AIza[A-Za-z0-9_\-]{30,}",
+    // Google OAuth refresh tokens. Longer-lived than the AIza keys above:
+    // they mint fresh access tokens until explicitly revoked, so a leaked
+    // one outlives the session it came from.
+    r"1//[0-9A-Za-z_\-]{20,}",
+    // Meta / Facebook Graph API access tokens (ad accounts, pages,
+    // business management).
+    r"EAA[A-Za-z0-9]{20,}",
+    // Telegram bot tokens: <bot-id>:<secret>. Grants full control of the bot,
+    // including reading every message it can see. Two branches on purpose:
+    //  - `AA…` is the shape every issued token has taken, left open-ended so a
+    //    future length change cannot silently retire the rule.
+    //  - the second branch matches the shape Telegram's own docs publish
+    //    (`123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` — 6-digit id, no `AA`),
+    //    length-anchored because without the `AA` anchor a bare `\d+:[\w-]+`
+    //    also matches timestamps, ratios, `host:port` maps, SRT cues and
+    //    `<short-sha>:<hex>` pairs.
+    // Thanks to @tahazarif10 for spotting that the documented example fell
+    // outside the original `\d{8,10}:AA…` form.
+    r"\b\d{6,10}:(?:AA[A-Za-z0-9_\-]{30,}|[A-Za-z0-9_\-]{34,35})\b",
+    // GoHighLevel Private Integration Tokens. The `pit-` prefix is what the
+    // vendor documents (their MCP guide shows `Bearer pit-your-token`); the
+    // tail is NOT documented anywhere, and every token observed in the wild
+    // carries a UUID. Anchoring on the UUID shape rather than a permissive
+    // tail is deliberate: `pit-` is also an English fragment, so
+    // `pit-[A-Za-z0-9\-]{20,}` would redact "pit-stop-strategy-analysis".
+    // These tokens do not expire until manually revoked.
+    r"pit-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
     // Slack tokens (bot/user/admin/app-level/refresh).
     r"xox[abprs]-[A-Za-z0-9\-]{10,}",
     r"xapp-[A-Za-z0-9\-]{10,}",
@@ -65,17 +111,39 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
     // URL-embedded credentials: scheme://user:pass@host.
     r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^:/\s]+:[^@\s]+@[^\s]+",
-    // Pasted HTTP snippets (curl / httpie / fetch): the credential rides in
-    // `-u user:pass`, a Basic header, a sensitive header name, a JSON body
-    // field, or a query-string parameter.
+    // Auth-bearing HTTP headers carrying an opaque value: AWS SigV4's
+    // `X-Amz-Security-Token`, `X-Api-Key`, GitLab's `Private-Token`, Azure's
+    // `Ocp-Apim-Subscription-Key`. Neither of the rules above reaches these:
+    // the `bearer\s+` rule needs the literal scheme keyword, and the generic
+    // env-var rule below needs an `UPPER_SNAKE_TOKEN=` shape that a
+    // kebab-case header name never matches. Tool output echoing a curl
+    // invocation is the usual way they reach capture.
+    //
+    // A `key` or `token` suffix alone does not imply a secret.
+    // `Idempotency-Key`, `Continuation-Token` and storage partition keys use
+    // it for values that carry no credential and stay useful when reading
+    // captured output, so that suffix must be qualified by an auth word.
+    // Unambiguous words (`password`, `secret`, `authorization`) stand alone.
+    //
+    // The value floor keeps short literals such as CORS
+    // `Access-Control-Allow-Credentials: true` intact. It is not what
+    // protects an already-redacted value: `[REDACTED]` starts with `[`,
+    // which the value character class excludes outright.
+    r#"(?i)\b[A-Za-z0-9-]*(?:authentication|authorization|credentials?|password|passwd|apikey|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))\s*:\s*[A-Za-z0-9._~+/=-]{8,}"#,
+    // ze-codigos fork: pasted HTTP snippets (curl / httpie / fetch) carrying
+    // credentials in shapes the rules above do not reach. The sensitive
+    // header-name rule of ours that used to live here was superseded by the
+    // upstream header rule above (better false-positive discipline); what
+    // remains are the four shapes it does not cover.
+    //
     // curl `-u`/`--user` inline credentials.
     r#"(?i)(?:^|\s)--?u(?:ser)?[ =]+["']?[^\s:"']+:[^\s"']+"#,
-    // HTTP Basic auth header value (base64 blob after "Basic").
+    // HTTP Basic auth header value (base64 blob after "Basic"): the bearer
+    // rule needs the literal scheme keyword, and the header rule's value
+    // class stops at the space between "Basic" and the blob.
     r#"(?i)\bbasic\s+[A-Za-z0-9+/=]{16,}"#,
-    // Sensitive header names with their value (hyphenated shapes the
-    // generic env-var catch-all below cannot reach).
-    r#"(?i)\b(?:x-api-key|api-key|apikey|x-auth-token|x-access-token|x-goog-api-key|x-amz-security-token|private-token|cf-access-token|client[-_]secret|access[-_]token|refresh[-_]token)\b["']?\s*[:=]\s*["']?\S{6,}"#,
-    // JSON body secret fields: {"password": "…"}, {"senha": "…"}, etc.
+    // JSON body secret fields: {"password": "…"}, {"senha": "…"}, etc. — the
+    // quoted value never matches the header rule's bare-value class.
     r#"(?i)"(?:password|passwd|senha|secret|api_?key|token|access_token|refresh_token|client_secret|private_key|authorization)"\s*:\s*"[^"]{4,}""#,
     // Query-string credentials: ?api_key=… / &token=… / ?signature=…
     r#"(?i)[?&](?:api_?key|apikey|token|access_token|refresh_token|secret|client_secret|password|passwd|senha|signature|sig|auth)=[^&\s"']+"#,
@@ -213,7 +281,8 @@ impl Sanitized<NewObservation> {
     #[must_use]
     pub fn new(mut obs: NewObservation, sanitizer: &Sanitizer) -> Self {
         obs.title = sanitizer.scrub(&obs.title);
-        obs.body = truncate_utf8_bytes(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
+        obs.body =
+            truncate_utf8_bytes_head_tail(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
         Self(obs)
     }
 }
@@ -243,6 +312,66 @@ pub fn truncate_utf8_bytes(input: &str, max: usize) -> String {
     output
 }
 
+/// Truncate text to at most `max` UTF-8 bytes, keeping **both** the head
+/// and the tail so the middle can be elided.
+///
+/// The plain [`truncate_utf8_bytes`] keeps only the head, which loses the
+/// tail of a long tool output (e.g. a 50 KB file read). When the LLM
+/// consolidator later reads the observation body it sees an incomplete
+/// picture and may produce less accurate summaries. This variant splits
+/// the budget: head gets `max/2`, tail gets `max/2`, and a truncation
+/// marker is inserted between them so the boundary is visible.
+///
+/// Never splits a code point. Falls back to [`truncate_utf8_bytes`] when
+/// the budget is too small to split meaningfully (under 64 bytes).
+#[must_use]
+pub fn truncate_utf8_bytes_head_tail(input: &str, max: usize) -> String {
+    if input.len() <= max {
+        return input.to_string();
+    }
+    // For small budgets the head-tail split produces tiny fragments with
+    // a marker that is longer than the content. Fall back to head-only.
+    if max < 64 {
+        return truncate_utf8_bytes(input, max);
+    }
+    // Reserve bytes for the truncation marker: "\n...[truncated N bytes]...\n"
+    // where N is at most ~10 digits. Use a fixed 48-byte reservation —
+    // generous enough for the marker plus newlines, small enough to leave
+    // meaningful head/tail budgets.
+    const MARKER_RESERVE: usize = 48;
+    let usable = max.saturating_sub(MARKER_RESERVE);
+    let half = usable / 2;
+
+    // Walk forward for the head.
+    let mut head_end = 0;
+    for (index, character) in input.char_indices() {
+        let next = index + character.len_utf8();
+        if next > half {
+            break;
+        }
+        head_end = next;
+    }
+
+    // Walk backward from the end for the tail.
+    let total = input.len();
+    let tail_start_target = total.saturating_sub(half);
+    let mut tail_start = total;
+    for (index, _) in input.char_indices().rev() {
+        if index <= tail_start_target {
+            tail_start = index;
+            break;
+        }
+        tail_start = index;
+    }
+
+    let omitted = tail_start.saturating_sub(head_end);
+    let mut output = String::with_capacity(max);
+    output.push_str(&input[..head_end]);
+    output.push_str(&format!("\n...[truncated {omitted} bytes]...\n"));
+    output.push_str(&input[tail_start..]);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,14 +397,184 @@ mod tests {
 
     #[test]
     fn scrubs_naked_google_api_key() {
-        // Fixture is the AIzaSy… shape with random hex padding, NOT a
-        // real key. A previous iteration of this file used a live
-        // value as the fixture; do not do that — automated scanners
-        // (GitGuardian, Google's own) will pick it up and you'll
-        // spend an hour rotating credentials.
-        let out = s().scrub("the key AIzaSy0123456789abcdefghijklmnopqrstuvwx is leaked");
+        // Fixture is the AIzaSy… shape, NOT a real key. A previous
+        // iteration of this file used a live value as the fixture; do not
+        // do that — automated scanners (GitGuardian, Google's own) will
+        // pick it up and you'll spend an hour rotating credentials.
+        //
+        // Kept to 36 characters on purpose. At 40 it also matched the shape
+        // of an AWS *secret* access key (40 chars of the base64 alphabet),
+        // and GitHub push protection blocked pushes of any branch carrying
+        // this file. Google's rule only needs `AIza` plus 30, so the shorter
+        // fixture still exercises it.
+        let out = s().scrub("the key AIzaSyFAKEfake0123456789abcdefghijkl is leaked");
         assert!(out.contains("[REDACTED]"));
         assert!(!out.contains("AIzaSy"));
+    }
+
+    // Every fixture below is a SHAPE, never a live value — same rule as the
+    // AIzaSy… test above, and the same `FAKE` convention used by the
+    // `ghp_FAKE…` fixture in ai-memory-wiki. Keep them obviously synthetic
+    // so credential scanners do not flag this repository.
+
+    #[test]
+    fn scrubs_all_github_token_prefixes() {
+        // ghp_ was already covered; gho_/ghu_/ghs_/ghr_ were not, and gho_
+        // is the prefix `gh auth login` writes to disk.
+        for tok in [
+            "ghp_FAKEfakeFAKEfakeFAKEfake012345678",
+            "gho_FAKEfakeFAKEfakeFAKEfake012345678",
+            "ghu_FAKEfakeFAKEfakeFAKEfake012345678",
+            "ghs_FAKEfakeFAKEfakeFAKEfake012345678",
+            "ghr_FAKEfakeFAKEfakeFAKEfake012345678",
+        ] {
+            let out = s().scrub(&format!("token={tok}"));
+            assert!(out.contains("[REDACTED]"), "not redacted: {tok}");
+            assert!(!out.contains("FAKEfake"), "leaked: {tok}");
+        }
+    }
+
+    /// The strip runs before storage and cannot be undone, so a pattern that
+    /// over-matches destroys captured content silently. Every other test here
+    /// asserts that a secret IS redacted; these assert that ordinary text is
+    /// NOT — the direction that was missing when `ASIA` shipped with an open
+    /// tail and started eating uppercase identifiers.
+    #[test]
+    fn leaves_ordinary_text_untouched() {
+        let s = s();
+        for text in [
+            // `ASIA` is an English word. These are the exact shapes an open
+            // `(?:AKIA|ASIA)[0-9A-Z]{12,}` tail destroyed.
+            "ASIAPACIFICREGION",
+            "rollout to ASIAEAST1CLUSTER tonight",
+            "ASIAPAC revenue summary",
+            // `pit-` is an English fragment; the UUID anchor is what keeps
+            // this readable rather than a permissive `pit-[A-Za-z0-9-]{20,}`.
+            "pit-stop-strategy-analysis for the race",
+            // Bare prefixes with nothing key-shaped after them.
+            "the AKIA meeting notes",
+            "EAA is the airport code",
+            // Colon-separated pairs that are not Telegram tokens.
+            "timestamp 1234567:30 remaining",
+            "map 127.0.0.1:8080 to the proxy",
+        ] {
+            assert_eq!(
+                s.scrub(text),
+                text,
+                "ordinary text must survive the strip verbatim: {text}"
+            );
+        }
+    }
+
+    /// A real key is still caught at its published length, and inside
+    /// punctuation, so anchoring the format did not open a hole.
+    #[test]
+    fn still_scrubs_aws_keys_at_their_published_length() {
+        let s = s();
+        for text in [
+            "AKIAFAKEFAKEFAKEFAKE",
+            "aws_access_key_id=ASIAFAKEFAKEFAKEFAKE",
+            "(AKIAFAKEFAKEFAKEFAKE)",
+            "\"ASIAFAKEFAKEFAKEFAKE\",",
+        ] {
+            let out = s.scrub(text);
+            assert!(out.contains("[REDACTED]"), "not redacted: {text}");
+            assert!(!out.contains("FAKEFAKE"), "leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn scrubs_aws_temporary_session_key_id() {
+        // ASIA… is an STS short-lived key id; AKIA… was already covered.
+        let out = s().scrub("aws_access_key_id ASIAFAKEFAKEFAKEFAKE");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("ASIAFAKE"));
+    }
+
+    #[test]
+    fn scrubs_stripe_restricted_key() {
+        let out = s().scrub("stripe=rk_live_FAKEfakeFAKE1234");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("FAKEfakeFAKE"));
+    }
+
+    #[test]
+    fn scrubs_meta_graph_access_token() {
+        let out = s().scrub("fb=EAAFAKEfakeFAKEfake0123456789");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("FAKEfake"));
+    }
+
+    #[test]
+    fn meta_pattern_does_not_eat_short_base64_runs() {
+        // Negative control. The OpenSSH fixture in
+        // `scrubs_pem_private_key_block` contains the substring "EAAAAA";
+        // the {20,} tail is what stops `EAA…` from matching every base64
+        // blob that happens to contain it.
+        let out = s().scrub("harmless b3BlbnNzaC1rZXktdjEAAAAA value");
+        assert!(!out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn scrubs_google_oauth_refresh_token() {
+        let out = s().scrub("refresh_token: 1//0gFAKEfakeFAKEfake0123456789");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("FAKEfake"));
+    }
+
+    #[test]
+    fn scrubs_telegram_bot_token() {
+        let out = s().scrub("TG 123456789:AAFAKEfakeFAKEfakeFAKEfake0123456789 done");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("FAKEfake"));
+        assert!(out.contains("done"), "should not swallow trailing context");
+    }
+
+    #[test]
+    fn scrubs_telegram_documented_example_shape() {
+        // Regression for #408: Telegram's own Bot API docs publish
+        // `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` — a 6-digit id and no
+        // `AA` prefix — which the original `\d{8,10}:AA…` form could not match.
+        // This is the vendor's placeholder, not a live token.
+        let out = s().scrub("token 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11 ok");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("ABC-DEF1234"));
+        assert!(out.contains("ok"), "should not swallow trailing context");
+    }
+
+    #[test]
+    fn telegram_pattern_does_not_eat_colon_separated_prose() {
+        // Negative control, and the reason the non-`AA` branch is
+        // length-anchored rather than open-ended: dropping the anchor entirely
+        // makes `\d+:[\w-]+` match all of these.
+        for benign in [
+            "built 2026:08 release notes",
+            "aspect ratio 16:9 widescreen",
+            "ports 8080:my-service-name-here",
+            "00:00:00,000 --> 00:00:04,120 caption",
+            "commit 12345678:deadbeefcafebabe0123456789abcdef",
+        ] {
+            let out = s().scrub(benign);
+            assert!(!out.contains("[REDACTED]"), "false positive on: {benign}");
+        }
+    }
+
+    #[test]
+    fn scrubs_gohighlevel_private_integration_token() {
+        // Uppercase hex on purpose: the vendor documents no case, so the
+        // pattern accepts both. DEADBEEF/CAFEBABE keeps the fixture
+        // unmistakably synthetic.
+        let out = s().scrub("ghl=pit-DEADBEEF-FACE-4B0B-BEEF-CAFEBABE1234");
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("DEADBEEF"));
+    }
+
+    #[test]
+    fn ghl_pattern_does_not_eat_hyphenated_english() {
+        // Negative control, and the reason the tail is UUID-anchored rather
+        // than permissive: `pit-` is an ordinary English fragment.
+        let out = s().scrub("planning the pit-stop-strategy-analysis for turn 4");
+        assert!(!out.contains("[REDACTED]"));
     }
 
     #[test]
@@ -322,8 +621,7 @@ mod tests {
             let out = s().scrub(txt);
             assert!(out.contains("[REDACTED]"), "not redacted: {txt}");
             assert!(
-                !out.contains("9f8e7d6c5b4a3928")
-                    && !out.contains("opaque-edge-token-value"),
+                !out.contains("9f8e7d6c5b4a3928") && !out.contains("opaque-edge-token-value"),
                 "secret survived: {out}"
             );
         }
@@ -397,12 +695,103 @@ mod tests {
         assert!(out3.contains("[REDACTED]"));
     }
 
+    /// The value character class excludes `[`, so a value already replaced
+    /// with `[REDACTED]` by an earlier pattern cannot be matched again and
+    /// lose its header name.
+    #[test]
+    fn auth_header_pattern_does_not_re_eat_an_earlier_redaction() {
+        let out = s().scrub("X-Api-Key: Bearer FAKEfakeFAKEfake0123456789");
+        assert_eq!(out, "X-Api-Key: [REDACTED]");
+    }
+
+    /// The header name is matched with a flat character class rather than
+    /// nested quantifiers, and `regex` is backtracking-free. This pins linear
+    /// behaviour on an adversarial hyphen run instead of asserting on a wall
+    /// clock, which would be flaky in CI.
+    #[test]
+    fn auth_header_pattern_handles_adversarial_hyphen_runs() {
+        let long_name = format!("X{}", "-a".repeat(4_000));
+        let secret = "F".repeat(40);
+
+        let matching = format!("{long_name}-auth-token: {secret}");
+        let out = s().scrub(&matching);
+        assert!(out.contains("[REDACTED]"), "adversarial match not redacted");
+        assert!(!out.contains(&secret), "leaked under adversarial input");
+
+        let non_matching = format!("{long_name}-harmless: {secret}");
+        assert_eq!(s().scrub(&non_matching), non_matching);
+    }
+
+    /// `-Key` and `-Token` suffixes are also used by non-secret headers:
+    /// idempotency keys, pagination cursors, storage partition keys. Those
+    /// carry no credential and stay useful when reading captured tool
+    /// output, so the rule requires an auth qualifier before the suffix.
+    #[test]
+    fn auth_header_pattern_leaves_non_secret_key_and_token_headers_alone() {
+        for text in [
+            "Idempotency-Key: 3f7a1c2e-9b4d-4f88-a1e2-7c6b5d4e3f21",
+            "Continuation-Token: 0000000000000000000000",
+            "Next-Page-Token: CiAKGjBpNDd2Nmp2Zml2cWtwYjBk",
+            "Partition-Key: user-000000000000001",
+            "Cache-Key: v2-catalog-000000000000",
+        ] {
+            assert_eq!(s().scrub(text), text, "over-redacted: {text}");
+        }
+    }
+
     #[test]
     fn scrubs_cloud_credential_paths() {
         let out = s().scrub("read /home/user/.aws/credentials");
         assert!(out.contains("[REDACTED]"));
         let out2 = s().scrub("set KUBECONFIG=/home/user/.kube/config");
         assert!(out2.contains("[REDACTED]"));
+    }
+
+    /// Opaque auth headers reach capture via tool output echoing curl. The
+    /// `bearer\s+` rule needs the literal keyword and the generic env rule
+    /// needs `UPPER_SNAKE_TOKEN=`, so a kebab-case header matched neither.
+    #[test]
+    fn scrubs_opaque_auth_headers_without_bearer_keyword() {
+        for header in [
+            // AWS SigV4 session credential: a real, widely-emitted header
+            // that carries a secret with no scheme keyword.
+            "X-Amz-Security-Token: FAKEfakeFAKEfake0123456789",
+            // GitLab.
+            "Private-Token: FAKEfakeFAKEfake0123456789",
+            "X-Api-Key: FAKEfakeFAKEfake0123456789",
+            "Api-Key: FAKEfakeFAKEfake0123456789",
+            "X-Auth-Token: FAKEfakeFAKEfake0123456789",
+            // Azure API Management, Google, RapidAPI: the auth qualifier is
+            // not always its own segment.
+            "Ocp-Apim-Subscription-Key: FAKEfakeFAKEfake0123456789",
+            "X-Goog-Api-Key: FAKEfakeFAKEfake0123456789",
+            "X-RapidAPI-Key: FAKEfakeFAKEfake0123456789",
+            // A vendor-specific auth header: bare hex, no scheme keyword.
+            "Acme-Authentication: FAKEfake0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+            // Header casing is not normalised by the emitting tool.
+            "x-api-key: FAKEfakeFAKEfake0123456789",
+        ] {
+            let out = s().scrub(header);
+            assert!(out.contains("[REDACTED]"), "not redacted: {header}");
+            assert!(!out.contains("FAKEfake"), "leaked: {header}");
+        }
+    }
+
+    /// The rule keys off an auth-ish word in the header *name*, so ordinary
+    /// hyphenated headers with long values must survive byte-identical.
+    #[test]
+    fn auth_header_pattern_does_not_eat_ordinary_headers() {
+        for text in [
+            "Content-Type: application/json;charset=utf-8",
+            "Accept-Language: en-US,en;q=0.9",
+            "User-Agent: ExampleApp/3.1 ExampleOS/27.0 build/24A431",
+            "Cache-Control: max-age=0, s-maxage=0, no-cache, no-store",
+            "X-Request-Context: 000000-1,29 t:example99",
+            "Content-Length: 4911",
+        ] {
+            let out = s().scrub(text);
+            assert_eq!(out, text, "over-redacted: {text}");
+        }
     }
 
     #[test]
@@ -443,8 +832,10 @@ mod tests {
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
         assert!(scrubbed.body.contains("[REDACTED]"));
-        assert!(!scrubbed.body.contains("TAIL_SENTINEL"));
-        assert!(scrubbed.body.ends_with('…'));
+        // Head-tail truncation preserves the tail sentinel so the LLM
+        // consolidator sees both the start and the end of the original body.
+        assert!(scrubbed.body.contains("TAIL_SENTINEL"));
+        assert!(scrubbed.body.contains("[truncated"));
     }
 
     #[test]
@@ -454,6 +845,40 @@ mod tests {
         assert_eq!(truncated.len(), 6);
         assert_eq!(truncate_utf8_bytes("unchanged", 9), "unchanged");
         assert!(truncate_utf8_bytes("large", 2).is_empty());
+    }
+
+    #[test]
+    fn head_tail_truncation_preserves_head_and_tail() {
+        let input = format!("HEAD{}TAIL", "x".repeat(200));
+        let truncated = truncate_utf8_bytes_head_tail(&input, 128);
+        assert!(truncated.starts_with("HEAD"));
+        assert!(truncated.ends_with("TAIL"));
+        assert!(truncated.contains("[truncated"));
+        assert!(truncated.len() <= 128);
+    }
+
+    #[test]
+    fn head_tail_truncation_short_input_unchanged() {
+        let input = "short body";
+        assert_eq!(truncate_utf8_bytes_head_tail(input, 128), "short body");
+    }
+
+    #[test]
+    fn head_tail_truncation_small_budget_falls_back_to_head_only() {
+        let input = "HEADxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxTAIL";
+        let truncated = truncate_utf8_bytes_head_tail(input, 32);
+        assert!(truncated.ends_with('…'));
+        assert!(!truncated.contains("TAIL"));
+    }
+
+    #[test]
+    fn head_tail_truncation_no_split_on_utf8_boundary() {
+        let input = format!("H{}T", "é".repeat(200));
+        let truncated = truncate_utf8_bytes_head_tail(&input, 128);
+        // Must not split a code point — the tail should start at a char
+        // boundary and the result must be valid UTF-8.
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        assert!(truncated.ends_with('T'));
     }
 
     #[test]

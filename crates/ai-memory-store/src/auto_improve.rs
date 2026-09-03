@@ -510,6 +510,55 @@ pub fn ensure_scheduler_state(
     Ok(())
 }
 
+/// Cross-session ("experience") pass cadence probe — 2.0 item 6.
+/// Counts completed sessions newer than the pass's last run (or the
+/// scope's initialization, so enabling the pass never re-digests
+/// history) and returns the count together with the anchor instant.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statements fail.
+pub fn experience_pass_due(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> StoreResult<(u64, i64)> {
+    let anchor: Option<i64> = conn
+        .query_row(
+            "SELECT COALESCE(last_experience_run_at, initialized_at)              FROM auto_improve_scheduler_state              WHERE workspace_id = ?1 AND project_id = ?2",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(anchor) = anchor else {
+        // No scheduler state yet (scope initialised after startup);
+        // nothing is due until the state row exists.
+        return Ok((0, 0));
+    };
+    let newer: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sessions          WHERE workspace_id = ?1 AND project_id = ?2            AND ended_at IS NOT NULL AND ended_at > ?3",
+        params![workspace_id.as_bytes(), project_id.as_bytes(), anchor],
+        |row| row.get(0),
+    )?;
+    Ok((u64::try_from(newer).unwrap_or(0), anchor))
+}
+
+/// Record that the cross-session pass ran for a scope now.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statements fail.
+pub fn mark_experience_pass_run(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> StoreResult<()> {
+    let now = Timestamp::now().as_microsecond();
+    conn.execute(
+        "UPDATE auto_improve_scheduler_state          SET last_experience_run_at = ?3, updated_at = ?3          WHERE workspace_id = ?1 AND project_id = ?2",
+        params![workspace_id.as_bytes(), project_id.as_bytes(), now],
+    )?;
+    Ok(())
+}
+
 /// Atomically claim one ended session for background review. Returns `true`
 /// only for the first claimer: the insert requires the session to be past
 /// the scope's watermark and not already covered by a run, so concurrent

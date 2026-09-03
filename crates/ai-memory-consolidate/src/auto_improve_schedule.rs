@@ -43,6 +43,9 @@ pub struct ScheduledAutoImproveSettings {
     /// Maximum sessions reviewed per scope per tick
     /// (`[auto_improve.scheduler] max_sessions_per_tick`).
     pub max_sessions_per_tick: usize,
+    /// Cross-session ("experience") pass settings; `None` = disabled
+    /// (`[auto_improve.experience]`, docs/experience.md).
+    pub experience: Option<crate::ExperienceConfig>,
 }
 
 /// Seed the per-scope scheduler watermark for every known scope at
@@ -104,6 +107,8 @@ pub struct ScheduledAutoImproveTickOutcome {
     pub skipped: usize,
     /// Per-scope/per-session failures, logged and counted, not fatal.
     pub errors: usize,
+    /// Cross-session ("experience") passes that ran this tick.
+    pub experience_runs: usize,
 }
 
 struct ScheduledAutoImproveContext<'a> {
@@ -172,11 +177,6 @@ pub async fn run_auto_improve_scheduler_tick(
                 continue;
             }
         };
-        if candidates.is_empty() {
-            continue;
-        }
-
-        outcome.scopes_with_candidates += 1;
         let ctx = ScheduledAutoImproveContext {
             reader,
             writer,
@@ -186,6 +186,79 @@ pub async fn run_auto_improve_scheduler_tick(
             project_id: scope.project_id,
             settings,
         };
+
+        // Cross-session ("experience") pass — cadence-gated per scope,
+        // independent of whether this tick has per-session candidates.
+        if let Some(experience) = &settings.experience {
+            match reader
+                .experience_pass_due(scope.workspace_id, scope.project_id)
+                .await
+            {
+                Ok((newer, _)) if newer >= experience.min_new_sessions => {
+                    match run_scheduled_experience(&ctx, experience).await {
+                        Ok(None) => {
+                            tracing::debug!(
+                                workspace = %scope.workspace_name,
+                                project = %scope.project_name,
+                                "experience pass skipped (too few session pages); \
+                                 cadence anchor kept"
+                            );
+                        }
+                        Ok(Some(run)) => {
+                            outcome.experience_runs += 1;
+                            outcome.skipped += run.skipped.len();
+                            if let Err(e) = writer
+                                .mark_experience_pass_run(scope.workspace_id, scope.project_id)
+                                .await
+                            {
+                                outcome.errors += 1;
+                                tracing::warn!(
+                                    workspace = %scope.workspace_name,
+                                    project = %scope.project_name,
+                                    error = %e,
+                                    "experience pass mark failed"
+                                );
+                            }
+                            info!(
+                                workspace = %scope.workspace_name,
+                                project = %scope.project_name,
+                                new_sessions = newer,
+                                run_id = %run.run_id,
+                                proposals = run.proposals,
+                                approved = run.approved,
+                                pending = run.pending,
+                                "experience pass completed"
+                            );
+                        }
+                        Err(e) => {
+                            outcome.errors += 1;
+                            tracing::warn!(
+                                workspace = %scope.workspace_name,
+                                project = %scope.project_name,
+                                error = %e,
+                                "experience pass failed"
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    outcome.errors += 1;
+                    tracing::warn!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        error = %e,
+                        "experience cadence probe failed"
+                    );
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            continue;
+        }
+
+        outcome.scopes_with_candidates += 1;
         for candidate in candidates {
             let claimed = match ctx
                 .writer
@@ -281,8 +354,49 @@ async fn run_scheduled_auto_improve(
         cfg.clone(),
     )
     .await?;
+    stage_and_apply(ctx, Some(session_id), &report, "scheduler").await
+}
+
+/// Run one cross-session ("experience") review and stage it through the
+/// identical proposal path. `docs/experience.md`.
+async fn run_scheduled_experience(
+    ctx: &ScheduledAutoImproveContext<'_>,
+    experience: &crate::ExperienceConfig,
+) -> Result<Option<ScheduledAutoImproveOutcome>> {
+    let cfg = ctx.settings.review.clone();
+    let report = crate::run_experience_review(
+        ctx.reader,
+        &**ctx.llm,
+        ctx.workspace_id,
+        ctx.project_id,
+        cfg,
+        experience,
+    )
+    .await?;
+    // A preflight skip (enough ENDED sessions but too few summary
+    // pages — consolidation lag, purges) must not stage an empty run or
+    // burn the cadence window (post-audit finding): report it as
+    // not-run so the anchor stays put and the next tick retries.
+    if report.provider == "none" {
+        return Ok(None);
+    }
+    stage_and_apply(ctx, None, &report, "experience-scheduler")
+        .await
+        .map(Some)
+}
+
+/// Stage a report's proposals and (unless approval is required) apply
+/// them — the shared tail of both the per-session and the experience
+/// scheduler paths, so their behaviour cannot drift.
+async fn stage_and_apply(
+    ctx: &ScheduledAutoImproveContext<'_>,
+    session_id: Option<SessionId>,
+    report: &AutoImproveReport,
+    trigger: &str,
+) -> Result<ScheduledAutoImproveOutcome> {
+    let cfg = ctx.settings.review.clone();
     let proposals =
-        scheduled_auto_improve_new_proposals(ctx.reader, ctx.workspace_id, ctx.project_id, &report)
+        scheduled_auto_improve_new_proposals(ctx.reader, ctx.workspace_id, ctx.project_id, report)
             .await?;
     let staged = ctx
         .writer
@@ -290,7 +404,7 @@ async fn run_scheduled_auto_improve(
             StageAutoImproveRun {
                 workspace_id: ctx.workspace_id,
                 project_id: ctx.project_id,
-                session_id: Some(session_id),
+                session_id,
                 provider: Some(report.provider.clone()),
                 model: Some(report.model.clone()),
                 summary: Some(report.summary.clone()),
@@ -299,7 +413,7 @@ async fn run_scheduled_auto_improve(
                 rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
                     .unwrap_or_else(|_| serde_json::json!([])),
                 config_json: serde_json::json!({
-                    "trigger": "scheduler",
+                    "trigger": trigger,
                     "min_observations": cfg.min_observations,
                     "min_session_duration_secs": cfg.min_session_duration_secs,
                     "min_confidence": cfg.min_confidence,
@@ -555,6 +669,7 @@ mod tests {
             require_approval: false,
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
+            experience: None,
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
         let outcome =
@@ -579,6 +694,253 @@ mod tests {
                 "first-interval session should have been reviewed or claimed"
             );
         }
+    }
+
+    /// Cross-session fake: proposes one procedure citing two sessions.
+    struct ExperienceLlm;
+
+    impl LlmProvider for ExperienceLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-experience"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "fake-experience".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "summary": "a workflow repeats across sessions",
+                    "proposals": [{
+                        "operation": "create_or_update",
+                        "path": "procedures/cross-session-release.md",
+                        "title": "Cross-Session Release Workflow",
+                        "kind": "procedure",
+                        "confidence": 0.9,
+                        "rationale": "Two sessions independently ran the same release steps.",
+                        "evidence": [{"page": "sessions/a.md", "quote": "tag main then deploy"}],
+                        "body_markdown": "# Cross-Session Release Workflow\n\nTag main, then deploy."
+                    }],
+                    "rejected_candidates": []
+                }))
+            })
+        }
+    }
+
+    /// End to end through the scheduler: the experience pass runs only
+    /// when its cadence says enough NEW sessions completed, stages its
+    /// proposal through the identical pending path, and the cadence
+    /// anchor advances so the next tick is a no-op (docs/experience.md).
+    #[tokio::test]
+    async fn experience_pass_is_cadence_gated_and_stages_pending() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+
+        // Three completed sessions AFTER init, each with a summary page.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        for _ in 0..3 {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(ai_memory_core::NewSession {
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id: project,
+                    agent_kind: ai_memory_core::AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(session_id, None).await.unwrap();
+            wiki.write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id: ws,
+                project_id: project,
+                path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+                frontmatter: serde_json::json!({"title": "session"}),
+                body: "tag main then deploy; restart stack".into(),
+                tier: ai_memory_core::Tier::Episodic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ActorContext::anonymous(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig::default(),
+            require_approval: true,
+            min_session_age_secs: 0,
+            // Per-session path effectively off: the fake sessions have no
+            // observations, so preflight rejects them anyway.
+            max_sessions_per_tick: 10,
+            experience: Some(crate::ExperienceConfig {
+                sessions: 10,
+                min_new_sessions: 3,
+                ..crate::ExperienceConfig::default()
+            }),
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceLlm);
+        let outcome =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(outcome.experience_runs, 1, "{outcome:?}");
+        assert_eq!(outcome.errors, 0, "{outcome:?}");
+
+        // The proposal is staged pending (require_approval), through the
+        // same table the per-session path uses.
+        let pending = store
+            .reader
+            .list_auto_improve_proposals(
+                ws,
+                project,
+                Some(ai_memory_store::AutoImproveProposalStatus::Pending),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(
+            pending[0].target_path.as_str(),
+            "procedures/cross-session-release.md"
+        );
+
+        // Cadence anchored: an immediate second tick runs nothing.
+        let outcome2 =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(outcome2.experience_runs, 0, "{outcome2:?}");
+
+        // Post-audit regression: approving the proposal must land an
+        // OKF-conformant FILE (type + generated), like every other write
+        // path — the approve emit used to skip disk conformance, which
+        // blocked export-okf and phantom-superseded on the next reindex
+        // after a binary upgrade.
+        wiki.approve_auto_improve_proposal(
+            ws,
+            project,
+            pending[0].id,
+            ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let approved = std::fs::read_to_string(
+            tmp.path()
+                .join("wiki")
+                .join(ws.to_string())
+                .join(project.to_string())
+                .join("procedures/cross-session-release.md"),
+        )
+        .unwrap();
+        assert!(approved.contains("type: Procedure"), "{approved}");
+        assert!(approved.contains("generated:"), "{approved}");
+    }
+
+    /// Below the cadence floor nothing runs at all — no LLM call, no
+    /// staging (the PanicLlm proves the LLM is never touched).
+    #[tokio::test]
+    async fn experience_pass_stays_quiet_below_the_cadence_floor() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: project,
+                agent_kind: ai_memory_core::AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig::default(),
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: Some(crate::ExperienceConfig {
+                sessions: 10,
+                min_new_sessions: 3,
+                ..crate::ExperienceConfig::default()
+            }),
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let outcome =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
     }
 
     /// Proposes exactly one page, so a pre-existing pending proposal for that
@@ -777,6 +1139,7 @@ mod tests {
             require_approval: true,
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
+            experience: None,
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);
         let ctx = ScheduledAutoImproveContext {

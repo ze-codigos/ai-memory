@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep_with_breadth,
+    AutoImproveReviewConfig, Consolidator, ObservationRetention, projection::cap_text_with_marker,
+    run_auto_improve_review, run_lint, run_sweep_with_options,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -295,7 +295,9 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
-  pages (idempotent, supports dry-run).\n\
+  pages. Three passes: expired pages are hard-deleted even when \
+  pinned, cold episodic pages decay to tombstones (pinned exempt), \
+  old tombstones are purged (idempotent, supports dry-run).\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
@@ -318,7 +320,10 @@ search EVERY project in EVERY workspace at once when you don't know \
 where the knowledge lives — each hit then carries its workspace + \
 project name. `global=true` cannot be combined with \
 `scopes`/`project`/`workspace`. Don't conclude 'we never recorded \
-it' after one project misses. Note also that `memory_query` returns \
+it' after one project misses. For \"what did we know about X back \
+then\" questions, pass `as_of` (ISO-8601 instant) — the query becomes \
+an entity-timeline lookup returning the page versions valid at that \
+moment, including ones superseded since. Note also that `memory_query` returns \
 SNIPPETS, not full page bodies — an empty or short snippet does NOT \
 mean the page is empty (a large page can match outside the snippet \
 window); to read the whole page use `memory_read_page` (by `path`, \
@@ -379,6 +384,9 @@ pub struct AiMemoryServer {
     decay_params: DecayParams,
     /// Optional distinct-reader reinforcement coefficient.
     decay_breadth_weight: f64,
+    /// Opt-in bound on how long raw observations outlive their consolidation.
+    /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
+    observation_retention: ObservationRetention,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
@@ -405,6 +413,15 @@ pub struct AiMemoryServer {
     /// keeps manual runs at least as strict as the operator's configured
     /// Phase 1/2 budgets instead of falling back to compiled defaults.
     auto_improve_review_config: AutoImproveReviewConfig,
+    /// Operator-configured floor for the tool-schema dialect served on every
+    /// `tools/list`, even without a `?flavor=` marker. Generic MCP clients
+    /// (OpenCode, Cursor) never send the marker yet forward schemas verbatim
+    /// to a strict upstream, so operators behind one raise this via
+    /// `AI_MEMORY_STRIP_ROOT_COMBINATORS=true` (issue #412) or
+    /// `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`. A request's marker can only
+    /// raise it further, never lower it. Runtime validation is unchanged in
+    /// every dialect.
+    schema_dialect: SchemaDialect,
     /// Cooldown clock for the M8 access-bump reinforcement: the last
     /// instant each page's access counter was bumped. A page returned by
     /// many searches in quick succession is bumped at most once per
@@ -493,6 +510,15 @@ struct QueryArgs {
     /// Default false.
     #[serde(default)]
     explain: Option<bool>,
+    /// Time-travel: an ISO-8601 instant (e.g. `2026-06-01T00:00:00Z`).
+    /// When set, the query becomes an ENTITY-TIMELINE lookup: it returns
+    /// the page versions whose entity-link validity windows contained
+    /// that instant — what the store knew about the named entities then,
+    /// including versions superseded since (docs/temporal.md). FTS /
+    /// vector / graph streams are skipped in this mode; cannot be
+    /// combined with `global` or `scopes`. Omit for a normal search.
+    #[serde(default)]
+    as_of: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -842,7 +868,7 @@ struct SweepArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct LintArgs {
-    /// If true, don't write wiki/_lint/<date>.md. Default false.
+    /// If true, don't write wiki/_lint/report.md. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
     /// If true, skip the LLM contradiction pass (rule-based only).
@@ -1052,22 +1078,18 @@ struct ExploreArgs {
     workspace: Option<String>,
 }
 
-// The `anyOf` encodes the "you MUST pass exactly one of path/query"
-// contract in the machine-readable schema (issue #155): each branch
-// demands the key's PRESENCE via `required` AND a non-null `type`, because
-// clients that null-fill defaulted args (OpenCode) would satisfy a bare
-// `required` with `path: null` and still hit the runtime error. Encoding
-// it here lets schema-respecting clients refuse the invalid call before
-// it ever reaches the server.
-//
-// Moonshot ("moonshot flavored json schema") rejects this root-level
-// `anyOf`; Kimi Code sessions get a patched schema instead
-// (`moonshot_safe_tool_list`). Every other client keeps this exact shape.
+// The "you MUST pass exactly one of path/query" contract lives in the
+// field descriptions and the runtime validation, NOT in a root-level
+// `anyOf` (#577). The machine-readable encoding (#155) let
+// schema-respecting clients refuse a null-filled call pre-flight — but
+// the Anthropic Messages API rejects root-level `anyOf`/`oneOf`/`allOf`
+// outright, so ANY provider-agnostic client routing tools through it
+// (OpenCode with an Anthropic key, and every other Messages-API
+// consumer) had its WHOLE session 400 before a single tool ran. One
+// wasted round-trip for a null-filling client is a far smaller cost
+// than dead sessions on the most common upstream; the per-flavor strip
+// machinery (#412) stays for any future dialect that needs it.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[schemars(extend("anyOf" = [
-    {"required": ["path"], "properties": {"path": {"type": "string"}}},
-    {"required": ["query"], "properties": {"query": {"type": "string"}}},
-]))]
 struct ReadPageArgs {
     /// FTS5 query to find the page (searches and returns the top hit's full
     /// body). You MUST pass exactly one of `query` or `path` — never neither,
@@ -1247,6 +1269,7 @@ impl AiMemoryServer {
             wiki: None,
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
+            observation_retention: ObservationRetention::default(),
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
@@ -1254,6 +1277,7 @@ impl AiMemoryServer {
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
+            schema_dialect: SchemaDialect::default(),
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxy_identity: false,
             per_user_slots: false,
@@ -1278,6 +1302,33 @@ impl AiMemoryServer {
     pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
         self.per_user_slots = enabled;
         self
+    }
+
+    /// Opt in to stripping root-level combinators from MCP tool input schemas
+    /// on every `tools/list`, independent of the `?flavor=` marker (issue
+    /// #412). See [`Self::schema_dialect`].
+    #[must_use]
+    pub fn with_strip_root_combinators(mut self, enabled: bool) -> Self {
+        self.raise_schema_dialect(enabled, SchemaDialect::RootCombinators);
+        self
+    }
+
+    /// Opt in to serving Gemini/Vertex-safe tool input schemas on every
+    /// `tools/list`, independent of the `?flavor=` marker. Implies
+    /// [`Self::with_strip_root_combinators`]; see [`Self::schema_dialect`].
+    #[must_use]
+    pub fn with_gemini_safe_schemas(mut self, enabled: bool) -> Self {
+        self.raise_schema_dialect(enabled, SchemaDialect::GeminiSafe);
+        self
+    }
+
+    /// Raise the configured dialect floor, never lower it: the two opt-ins are
+    /// independent switches over one ordered dialect, so `false` must leave a
+    /// stricter setting from the other switch alone.
+    fn raise_schema_dialect(&mut self, enabled: bool, dialect: SchemaDialect) {
+        if enabled {
+            self.schema_dialect = self.schema_dialect.max(dialect);
+        }
     }
 
     /// Configure whether auto-improvement requires manual pending-writes approval.
@@ -1731,6 +1782,14 @@ impl AiMemoryServer {
         self
     }
 
+    /// Set the opt-in observation prune bound used by `memory_forget_sweep`.
+    /// Unset, the sweep never deletes a raw observation.
+    #[must_use]
+    pub fn with_observation_retention(mut self, retention: ObservationRetention) -> Self {
+        self.observation_retention = retention;
+        self
+    }
+
     /// Attach the wiki handle. Without this, `memory_forget_sweep`
     /// and `memory_lint` cannot write their report pages.
     #[must_use]
@@ -1853,6 +1912,46 @@ impl AiMemoryServer {
                 "scopes cannot be combined with workspace/project",
                 None,
             ));
+        }
+
+        // Time-travel entity lookup (docs/temporal.md): entity stream
+        // only, against the ingestion-time validity windows.
+        if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
+            if args.global.unwrap_or(false) || !args.scopes.is_empty() {
+                return Err(McpError::internal_error(
+                    "as_of cannot be combined with global or scopes",
+                    None,
+                ));
+            }
+            let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
+                McpError::internal_error(format!("as_of must be an ISO-8601 instant: {e}"), None)
+            })?;
+            let (ws, proj) = self
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
+                .await?;
+            let hits = self
+                .reader
+                .entity_hits_for_project_at(
+                    ws,
+                    proj,
+                    &args.query,
+                    limit,
+                    None,
+                    Some(instant.as_microsecond()),
+                )
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return ok_json(&MemoryQueryResponse {
+                hits: hits.into_iter().map(|h| QueryHit::from(h.hit)).collect(),
+                raw_hits: Vec::new(),
+                global_hits: Vec::new(),
+                global_scope_hits: Vec::new(),
+                streams_active: explain.then(|| vec!["entity"]),
+            });
         }
 
         let query = args.query.clone();
@@ -2336,12 +2435,26 @@ impl AiMemoryServer {
     }
 
     /// Run the M8 forget sweep over episodic pages.
-    #[tool(description = "Run the retention sweep: walk is_latest=1 \
-        episodic pages, score them with the agentmemory-style retention \
-        formula (salience * exp(-lambda * age) + sigma * log(1 + accesses) \
-        * exp(-mu * days_since_access)), and evict those below the cold \
-        threshold through the wiki layer. Semantic / procedural / pinned pages are exempt. \
-        Pass dry_run=true to preview.")]
+    #[tool(description = "Run the retention sweep. FOUR passes, and they \
+        differ on what they will delete. (1) TTL: pages whose frontmatter \
+        expires_at is in the past are hard-deleted (file + rows) REGARDLESS \
+        OF TIER OR PIN — an explicit expiry overrides a pin, so a pinned \
+        page CAN be deleted by this pass. (2) Decay: is_latest=1 episodic \
+        pages are scored with the agentmemory-style retention formula \
+        (salience * exp(-lambda * age) + sigma * log(1 + accesses) * \
+        exp(-mu * days_since_access)) and those below the cold threshold are \
+        evicted to a tombstone; only this pass exempts semantic / procedural \
+        / pinned pages. (3) Hard-delete: tombstones older than \
+        hard_delete_after_days and their supersession ancestry are removed \
+        permanently. (4) Observation prune: raw observations older than \
+        decay.observation_retention_days are deleted permanently, in bounded \
+        batches, but ONLY for sessions already consolidated into a summary \
+        page that is still live — an unconsolidated session, or one whose \
+        page pass 2 or 3 just removed, keeps every row. This pass is DISABLED \
+        by default (observation_retention_days = 0) and deletes nothing until \
+        an operator opts in; when off, observations_pruned is 0. The report's \
+        expired / hard_deleted / observations_pruned counts come from passes \
+        1, 3 and 4. Pass dry_run=true to preview.")]
     async fn memory_forget_sweep(
         &self,
         Parameters(args): Parameters<SweepArgs>,
@@ -2359,7 +2472,7 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
-        let report = run_sweep_with_breadth(
+        let report = run_sweep_with_options(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -2367,6 +2480,7 @@ impl AiMemoryServer {
             proj,
             &self.decay_params,
             self.decay_breadth_weight,
+            self.observation_retention,
             args.dry_run.unwrap_or(false),
         )
         .await
@@ -2378,7 +2492,7 @@ impl AiMemoryServer {
     #[tool(description = "Audit the wiki for stale episodic pages, \
         duplicate titles, broken cross-references, and (if an LLM \
         provider is configured) contradictions across semantic pages. \
-        Findings land in wiki/_lint/<date>.md unless dry_run=true.")]
+        Findings land in wiki/_lint/report.md unless dry_run=true.")]
     async fn memory_lint(
         &self,
         Parameters(args): Parameters<LintArgs>,
@@ -2404,8 +2518,11 @@ impl AiMemoryServer {
             self.llm.as_ref(),
             ws,
             proj,
-            args.dry_run.unwrap_or(false),
-            !args.no_llm.unwrap_or(false),
+            ai_memory_consolidate::LintOptions {
+                dry_run: args.dry_run.unwrap_or(false),
+                use_llm: !args.no_llm.unwrap_or(false),
+                decay_lambda: self.decay_params.lambda,
+            },
         )
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -3475,7 +3592,7 @@ impl AiMemoryServer {
                 let claimed = self
                     .writer
                     .accept_handoff(ai_memory_core::HandoffAcceptance {
-                        handoff_id: h.id,
+                        handoff_id: h.scope.id,
                         workspace_id: ws,
                         project_id: proj,
                         accepting_agent: AgentKind::Other,
@@ -3540,11 +3657,11 @@ impl AiMemoryServer {
                     None,
                 )
             })?;
-        if handoff.state != HandoffState::Open {
+        if handoff.lifecycle.state != HandoffState::Open {
             return ok_json(&serde_json::json!({
                 "handoff_id": handoff_id.to_string(),
                 "cancelled": false,
-                "state": handoff.state.as_str(),
+                "state": handoff.lifecycle.state.as_str(),
             }));
         }
         // Cancelling is scoped the same way as accepting: you can discard your
@@ -3854,19 +3971,43 @@ impl ServerHandler for AiMemoryServer {
         // rmcp injects `http::request::Parts` into request extensions in
         // both stateless and stateful modes, so the flavor marker is
         // available even without peer clientInfo.
-        let restricted_schema = context
-            .extensions
-            .get::<http::request::Parts>()
-            .and_then(|parts| parts.uri.query())
-            .is_some_and(has_restricted_schema_flavor);
-        if restricted_schema {
-            Ok(ListToolsResult::with_all_items(
-                restricted_schema_tool_list(tools),
-            ))
-        } else {
+        // Operator opt-in (issue #412): generic clients such as OpenCode and
+        // Cursor never send the `?flavor=` marker, yet forward tool schemas
+        // verbatim to strict upstreams (Moonshot, Bedrock, Vertex) that 400 on
+        // shapes their dialect rejects. The configured dialect is the floor; a
+        // request's marker can raise it for one client.
+        let dialect = self.schema_dialect.max(
+            context
+                .extensions
+                .get::<http::request::Parts>()
+                .and_then(|parts| parts.uri.query())
+                .and_then(restricted_schema_flavor)
+                .unwrap_or_default(),
+        );
+        if dialect == SchemaDialect::Upstream {
             Ok(ListToolsResult::with_all_items(tools))
+        } else {
+            Ok(ListToolsResult::with_all_items(
+                restricted_schema_tool_list(tools, dialect),
+            ))
         }
     }
+}
+
+/// Tool input-schema dialect served for one `tools/list`, ordered by
+/// strictness: each variant applies every rewrite of the one before it, plus
+/// its own. That ordering is what lets the operator's configured floor and a
+/// request's `?flavor=` marker combine with a plain `max`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum SchemaDialect {
+    /// The schemas `schemars` generated, verbatim.
+    #[default]
+    Upstream,
+    /// Root-level `anyOf`/`oneOf`/`allOf` stripped (Moonshot, Bedrock).
+    RootCombinators,
+    /// Also collapses the nullable unions `Option<T>` produces into Google's
+    /// single-`type` plus `nullable` form (Gemini / Vertex).
+    GeminiSafe,
 }
 
 /// Bedrock and Moonshot reject root-level
@@ -3874,20 +4015,26 @@ impl ServerHandler for AiMemoryServer {
 /// `tools/list` time. Kimi's legacy `?flavor=moonshot` and Kiro's
 /// `?flavor=bedrock` both get schemas with those root keys stripped;
 /// nested combinators stay, and runtime validation remains unchanged.
-fn restricted_schema_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
+/// [`SchemaDialect::GeminiSafe`] strips the same root keys and additionally
+/// rewrites every subschema through [`gemini_safe_schema`].
+fn restricted_schema_tool_list(tools: Vec<Tool>, dialect: SchemaDialect) -> Vec<Tool> {
     const ROOT_COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
+    let gemini_safe = dialect >= SchemaDialect::GeminiSafe;
     tools
         .into_iter()
         .map(|mut tool| {
-            if !ROOT_COMBINATORS
+            let has_root_combinator = ROOT_COMBINATORS
                 .iter()
-                .any(|key| tool.input_schema.contains_key(*key))
-            {
+                .any(|key| tool.input_schema.contains_key(*key));
+            if !has_root_combinator && !gemini_safe {
                 return tool;
             }
             let mut schema = (*tool.input_schema).clone();
             for key in ROOT_COMBINATORS {
                 schema.shift_remove(key);
+            }
+            if gemini_safe {
+                gemini_safe_schema(&mut schema);
             }
             tool.input_schema = Arc::new(schema);
             tool
@@ -3895,10 +4042,139 @@ fn restricted_schema_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
         .collect()
 }
 
-fn has_restricted_schema_flavor(query: &str) -> bool {
+/// Rewrite one subschema — and everything below it — into the subset Google's
+/// `Schema` (Vertex/Gemini `functionDeclaration.parameters`) accepts.
+///
+/// `schemars` renders every `Option<T>` field as a union type, e.g.
+/// `{"description": …, "type": ["integer", "null"], "format": "uint"}`. Google's
+/// `Schema` takes a single `type`, so a converter that forwards our schema
+/// verbatim turns the union into `any_of` and leaves `description` beside it —
+/// which Vertex rejects outright ("specified other fields alongside any_of.
+/// When using any_of, it must be the only field set"), failing the whole
+/// session at `tools/list`. Gemini CLI never hits this because it performs the
+/// same collapse client-side; OpenCode and other pass-through clients do.
+///
+/// Two rewrites, both keyed on what `schemars` actually emits, applied
+/// bottom-up so a merged branch is already normalized:
+/// [`collapse_nullable_type`] and [`flatten_sibling_combinator`]. Everything
+/// else is left alone — Gemini CLI ships `$ref`, `$defs`, `title`, `const`, and
+/// `format: "uint"` to Vertex untouched, so those are not part of the problem.
+/// This mirrors [`ai_memory_llm`]'s outbound `normalize_nullable_types`, which
+/// solves the same mismatch for structured-output schemas.
+///
+/// Known limit, deliberate: a `$defs` entry can still carry a combinator with a
+/// sibling `description` — `FeedbackKind` renders as a `oneOf` of `const`
+/// branches — because a union of several real branches has no single-subschema
+/// equivalent, and collapsing it to `enum` would drop the per-value docs a
+/// working client receives today.
+fn gemini_safe_schema(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    for nested in schema.values_mut() {
+        gemini_safe_value(nested);
+    }
+    collapse_nullable_type(schema);
+    flatten_sibling_combinator(schema);
+}
+
+/// Recurse into whatever can hold a subschema: object values and array items
+/// (`properties`, `items`, `anyOf` branches, `$defs`, …). Scalars are terminal.
+fn gemini_safe_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(gemini_safe_value),
+        serde_json::Value::Object(map) => gemini_safe_schema(map),
+        _ => {}
+    }
+}
+
+/// `type: [<t>, "null"]` becomes `type: <t>` plus `nullable: true`, and
+/// `type: ["null"]` drops the type and keeps `nullable: true`.
+///
+/// A genuine multi-type union has no single-`type` equivalent, so it is left
+/// for the client rather than silently narrowing the advertised contract;
+/// `schemars` only emits the two-element form, for `Option<T>`.
+fn collapse_nullable_type(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(types) = schema.get("type").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if !types.iter().any(|entry| entry.as_str() == Some("null")) {
+        return;
+    }
+    let mut non_null: Vec<serde_json::Value> = types
+        .iter()
+        .filter(|entry| entry.as_str() != Some("null"))
+        .cloned()
+        .collect();
+    if non_null.len() > 1 {
+        return;
+    }
+    match non_null.pop() {
+        Some(single) => schema.insert("type".into(), single),
+        None => schema.shift_remove("type"),
+    };
+    schema.insert("nullable".into(), serde_json::Value::Bool(true));
+}
+
+/// Google allows nothing beside `any_of`, so reconcile a combinator that
+/// carries siblings: drop the `{"type": "null"}` branch `schemars` adds for
+/// `Option<T>` and merge the lone survivor into the parent, where the parent's
+/// own keys win so the field's doc comment survives.
+///
+/// Only that shape collapses cleanly. A combinator that is already the only key
+/// is what Google wants, and a union of several real branches cannot be
+/// expressed as one Google subschema at all — both are left untouched.
+fn flatten_sibling_combinator(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    const COMBINATORS: [&str; 2] = ["anyOf", "oneOf"];
+
+    fn is_null_branch(branch: &serde_json::Value) -> bool {
+        branch.as_object().is_some_and(|branch| {
+            branch.len() == 1
+                && branch.get("type").and_then(serde_json::Value::as_str) == Some("null")
+        })
+    }
+
+    if schema.len() == 1 {
+        return;
+    }
+    let Some(key) = COMBINATORS
+        .into_iter()
+        .find(|key| schema.contains_key(*key))
+    else {
+        return;
+    };
+    let Some(branches) = schema.get(key).and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let kept: Vec<serde_json::Value> = branches
+        .iter()
+        .filter(|branch| !is_null_branch(branch))
+        .cloned()
+        .collect();
+    let nullable = kept.len() < branches.len();
+    let [serde_json::Value::Object(survivor)] = kept.as_slice() else {
+        return;
+    };
+    let survivor = survivor.clone();
+    schema.shift_remove(key);
+    if nullable {
+        schema.insert("nullable".into(), serde_json::Value::Bool(true));
+    }
+    for (field, value) in survivor {
+        schema.entry(field).or_insert(value);
+    }
+    // The merged branch can itself carry a union type (`Option<Option<T>>`).
+    collapse_nullable_type(schema);
+}
+
+/// The dialect a request's `?flavor=` marker asks for, if any. Several markers
+/// resolve to the strictest one rather than to whichever came first.
+fn restricted_schema_flavor(query: &str) -> Option<SchemaDialect> {
     query
         .split('&')
-        .any(|pair| matches!(pair, "flavor=moonshot" | "flavor=bedrock"))
+        .filter_map(|pair| match pair {
+            "flavor=moonshot" | "flavor=bedrock" => Some(SchemaDialect::RootCombinators),
+            "flavor=gemini" | "flavor=vertex" => Some(SchemaDialect::GeminiSafe),
+            _ => None,
+        })
+        .max()
 }
 
 /// A page's access counter is bumped at most once per this window. Repeated
@@ -4674,6 +4950,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: Some(true),
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4704,6 +4981,7 @@ mod tests {
                         global: Some(true),
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -5743,6 +6021,89 @@ mod tests {
         });
     }
 
+    /// `memory_forget_sweep` is admin-gated and destructive, and the surface
+    /// an agent reads is the only place it can learn what the tool will
+    /// delete. Both surfaces must name all four passes and must not claim a
+    /// blanket pin exemption.
+    ///
+    /// The description previously said "Semantic / procedural / pinned pages
+    /// are exempt" full stop, which is true of the decay pass and false of
+    /// the TTL pass: `sweep.rs` pushes any candidate whose `expires_at` has
+    /// passed into `expired` and `continue`s three lines *before* the only
+    /// pin check. An agent asked "is it safe to run, I have pinned pages?"
+    /// had no way to answer anything but yes (#485). The behaviour is
+    /// deliberate — an explicit expiry is a more specific instruction than a
+    /// pin, pinned by `lifecycle.rs` — so the surface is what had to change.
+    #[tokio::test]
+    async fn forget_sweep_surfaces_name_every_pass_and_scope_the_pin_exemption() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let sweep = tools
+            .iter()
+            .find(|t| t.name == "memory_forget_sweep")
+            .expect("memory_forget_sweep must be registered");
+        let desc = sweep
+            .description
+            .as_deref()
+            .expect("memory_forget_sweep must carry a description");
+
+        // The TTL pass must be named, and named as pin-overriding. This is
+        // the deletion-safety claim that was wrong.
+        assert!(
+            desc.contains("expires_at"),
+            "description must name the TTL pass trigger; got: {desc}"
+        );
+        assert!(
+            desc.contains("REGARDLESS OF TIER OR PIN"),
+            "description must state that TTL overrides a pin; got: {desc}"
+        );
+        // The decay pass keeps its exemption, but scoped to itself.
+        assert!(
+            desc.contains("only this pass exempts"),
+            "the pin exemption must be scoped to the decay pass; got: {desc}"
+        );
+        // The third pass, so `hard_deleted` in the report is interpretable.
+        assert!(
+            desc.contains("hard_delete_after_days"),
+            "description must name the hard-delete pass; got: {desc}"
+        );
+        // The fourth pass deletes raw capture, not pages, and can remove
+        // millions of rows on a real install. An agent that cannot read it
+        // here cannot know the tool touches observations at all — which is the
+        // exact regression this test was written to stop.
+        assert!(
+            desc.contains("observation_retention_days"),
+            "description must name the observation prune pass; got: {desc}"
+        );
+        assert!(
+            desc.contains("consolidated") && desc.contains("still live"),
+            "description must state that only consolidated sessions with a live \
+             page are pruned; got: {desc}"
+        );
+        assert!(
+            desc.contains("DISABLED"),
+            "description must state that observation pruning is off by default; \
+             got: {desc}"
+        );
+        assert!(
+            !desc.contains("THREE passes"),
+            "the three-pass wording must not come back now there are four; got: {desc}"
+        );
+        // A bare unqualified exemption sentence is exactly the regression
+        // this guards, so reject the old wording verbatim.
+        assert!(
+            !desc.contains("Semantic / procedural / pinned pages are exempt."),
+            "the unscoped pin-exemption claim must not come back; got: {desc}"
+        );
+
+        // MEMORY_INSTRUCTIONS is read before an agent ever inspects
+        // `tools/list`, so it carries the same obligation.
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("hard-deleted even when"),
+            "MEMORY_INSTRUCTIONS must warn that expired pages delete despite a pin"
+        );
+    }
+
     /// All three prompt surfaces must steer agents toward the H1-in-body
     /// convention instead of passing the `title` argument. The `title`
     /// argument is a known source of `JSON parsing` errors when the LLM
@@ -6043,6 +6404,102 @@ mod tests {
         );
     }
 
+    /// `as_of` turns memory_query into an entity-timeline lookup
+    /// (docs/temporal.md): a superseded version answers for the instant
+    /// it was valid, the current version answers for now, and the mode
+    /// refuses to combine with global/scopes.
+    #[tokio::test]
+    async fn memory_query_as_of_travels_the_entity_timeline() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let mut v1 = ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: ai_memory_core::PagePath::new("notes/db.md").unwrap(),
+            title: "DB".into(),
+            body: "we use postgres".into(),
+            tier: ai_memory_core::Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: vec!["postgres".into()],
+        };
+        store.writer.upsert_page(v1.clone()).await.unwrap();
+        let between = jiff::Timestamp::now().to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        v1.body = "we migrated".into();
+        v1.entities = vec!["sqlite".into()];
+        store.writer.upsert_page(v1).await.unwrap();
+
+        let args = |as_of: Option<String>, global: Option<bool>| QueryArgs {
+            query: "postgres".into(),
+            limit: Some(5),
+            project: Some("scratch".into()),
+            scopes: Vec::new(),
+            workspace: Some("default".into()),
+            global,
+            include_expired: None,
+            explain: Some(true),
+            as_of,
+        };
+
+        // Historical instant → the superseded version answers.
+        let result = server
+            .memory_query(
+                Parameters(args(Some(between), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .unwrap()
+            .text
+            .clone();
+        assert!(text.contains("notes/db.md"), "{text}");
+        assert!(text.contains("\"entity\""), "entity-only mode: {text}");
+
+        // Same query without as_of → no postgres hit anymore... the FTS
+        // stream may still match old text? No: default searches latest
+        // pages only, whose body says "we migrated".
+        let now_result = server
+            .memory_query(
+                Parameters(args(None, None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let now_text = now_result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .unwrap()
+            .text
+            .clone();
+        assert!(!now_text.contains("notes/db.md"), "{now_text}");
+
+        // Refusal: as_of + global is ambiguous.
+        let err = server
+            .memory_query(
+                Parameters(args(Some("2026-06-01T00:00:00Z".into()), Some(true))),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(err.is_err(), "as_of+global must be refused");
+
+        // Garbage instant is a clear error, not a silent default.
+        let bad = server
+            .memory_query(
+                Parameters(args(Some("not-a-time".into()), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(bad.is_err());
+    }
+
     #[tokio::test]
     async fn memory_query_returns_hits_via_tool_method() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -6057,6 +6514,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6081,6 +6539,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6171,6 +6630,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: Some(true),
+                        as_of: None,
                     }),
                     OptionalParts(test_parts_default()),
                 )
@@ -6256,6 +6716,7 @@ mod tests {
             global: None,
             include_expired: None,
             explain: None,
+            as_of: None,
         };
 
         let result = server
@@ -6332,6 +6793,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6459,6 +6921,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6537,6 +7000,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 test_optional_parts(),
             )
@@ -6631,6 +7095,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -6696,6 +7161,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -6737,6 +7203,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 test_optional_parts(),
             )
@@ -6810,6 +7277,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         explain: None,
+                        as_of: None,
                     }),
                     test_optional_parts(),
                 )
@@ -6874,6 +7342,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6893,23 +7362,49 @@ mod tests {
     // non-null type — a bare `required` is satisfied by OpenCode-style
     // `path: null` filling. Pins against a schemars upgrade silently
     // dropping the `extend` attribute.
+    /// #577's class fence: NO registered tool may carry a root-level
+    /// combinator — one bad tool 400s the entire session for every
+    /// Messages-API-routed client.
+    #[tokio::test]
+    async fn no_tool_schema_carries_root_combinators() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        for tool in server.tool_router.list_all() {
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            for key in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    schema.get(key).is_none(),
+                    "tool `{}` carries root-level `{key}`; Anthropic-routed \
+                     clients reject the whole session over it",
+                    tool.name
+                );
+            }
+        }
+    }
+
     #[test]
-    fn read_page_schema_encodes_one_of_path_or_query() {
+    fn read_page_schema_carries_no_root_combinators() {
+        // #577: the Anthropic Messages API rejects root-level
+        // anyOf/oneOf/allOf on input_schema — a tool carrying one kills
+        // the WHOLE session for every Messages-API-routed client before
+        // any tool runs. The exactly-one contract lives in the field
+        // descriptions and runtime validation instead. This pins every
+        // tool schema, not just memory_read_page, so the class cannot
+        // come back through another tool.
         let schema = serde_json::to_value(schemars::schema_for!(ReadPageArgs)).unwrap();
-        let any_of = schema
-            .get("anyOf")
-            .and_then(|v| v.as_array())
-            .unwrap_or_else(|| panic!("schema must carry the anyOf constraint: {schema}"));
-        for key in ["path", "query"] {
-            let branch = any_of
-                .iter()
-                .find(|b| b["required"] == serde_json::json!([key]))
-                .unwrap_or_else(|| panic!("missing anyOf branch requiring `{key}`: {schema}"));
-            assert_eq!(
-                branch["properties"][key]["type"],
-                serde_json::json!("string"),
-                "`{key}` branch must demand a non-null string so null-filling \
-                 clients cannot satisfy it"
+        for key in ["anyOf", "oneOf", "allOf"] {
+            assert!(
+                schema.get(key).is_none(),
+                "root-level `{key}` breaks Anthropic-routed clients: {schema}"
+            );
+        }
+        // The contract itself is still declared to the model.
+        for field in ["path", "query"] {
+            let desc = schema["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                desc.contains("exactly one"),
+                "`{field}` description must state the exactly-one contract"
             );
         }
     }
@@ -6935,7 +7430,7 @@ mod tests {
             .unwrap();
         let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
 
-        let patched = restricted_schema_tool_list(vec![tool]);
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::RootCombinators);
         let out = &patched[0].input_schema;
 
         for key in ["anyOf", "oneOf", "allOf"] {
@@ -6965,7 +7460,7 @@ mod tests {
         let tool = Tool::new("memory_status", "Status counts", schema);
         let before = serde_json::to_value(&tool).unwrap();
 
-        let patched = restricted_schema_tool_list(vec![tool]);
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::RootCombinators);
         let after = serde_json::to_value(&patched[0]).unwrap();
 
         assert_eq!(before, after, "flat tools must pass through unchanged");
@@ -6973,14 +7468,273 @@ mod tests {
 
     #[test]
     fn restricted_schema_flavor_matches_complete_query_pairs_only() {
-        assert!(has_restricted_schema_flavor("flavor=moonshot"));
-        assert!(has_restricted_schema_flavor(
-            "client=kiro&flavor=bedrock&debug=false"
-        ));
-        assert!(!has_restricted_schema_flavor("flavor=unknown"));
-        assert!(!has_restricted_schema_flavor(
-            "note=flavor=bedrock&client=kiro"
-        ));
+        assert_eq!(
+            restricted_schema_flavor("flavor=moonshot"),
+            Some(SchemaDialect::RootCombinators)
+        );
+        assert_eq!(
+            restricted_schema_flavor("client=kiro&flavor=bedrock&debug=false"),
+            Some(SchemaDialect::RootCombinators)
+        );
+        assert_eq!(
+            restricted_schema_flavor("flavor=gemini"),
+            Some(SchemaDialect::GeminiSafe)
+        );
+        assert_eq!(
+            restricted_schema_flavor("flavor=vertex&client=opencode"),
+            Some(SchemaDialect::GeminiSafe)
+        );
+        // Several markers resolve to the strictest, whatever their order.
+        assert_eq!(
+            restricted_schema_flavor("flavor=gemini&flavor=moonshot"),
+            Some(SchemaDialect::GeminiSafe)
+        );
+        assert_eq!(restricted_schema_flavor("flavor=unknown"), None);
+        assert_eq!(
+            restricted_schema_flavor("note=flavor=bedrock&client=kiro"),
+            None
+        );
+    }
+
+    fn gemini_safe(schema: serde_json::Value) -> serde_json::Value {
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(schema).unwrap();
+        gemini_safe_schema(&mut map);
+        serde_json::Value::Object(map)
+    }
+
+    // The reported Vertex 400: `schemars` renders every `Option<T>` argument as
+    // a union type, which a pass-through client turns into `any_of` with
+    // `description` still beside it.
+    #[test]
+    fn gemini_safe_schema_collapses_nullable_unions() {
+        let out = gemini_safe(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "max_proposals": {
+                    "description": "Override the maximum validated proposal count.",
+                    "type": ["integer", "null"],
+                    "format": "uint",
+                    "minimum": 0
+                },
+                "kinds": {
+                    "type": ["array", "null"],
+                    "items": { "type": ["string", "null"] }
+                },
+                "nothing": { "type": ["null"] }
+            }
+        }));
+        let properties = &out["properties"];
+
+        assert_eq!(
+            properties["max_proposals"],
+            serde_json::json!({
+                "description": "Override the maximum validated proposal count.",
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0,
+                "nullable": true
+            }),
+            "the union must collapse; every other keyword must survive"
+        );
+        assert_eq!(properties["kinds"]["type"], serde_json::json!("array"));
+        assert_eq!(
+            properties["kinds"]["items"],
+            serde_json::json!({ "type": "string", "nullable": true }),
+            "nested subschemas must be rewritten too"
+        );
+        assert_eq!(
+            properties["nothing"],
+            serde_json::json!({ "nullable": true }),
+            "a null-only union has no type to keep"
+        );
+    }
+
+    // `Option<T>` over a `$ref`ed inner type: schemars wraps it in `anyOf` and
+    // leaves the doc comment as a sibling, which is the exact shape Vertex names
+    // in its error.
+    #[test]
+    fn gemini_safe_schema_flattens_combinator_carrying_siblings() {
+        let out = gemini_safe(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "description": "Scope to read.",
+                    "anyOf": [
+                        { "$ref": "#/$defs/MemoryScopeArg" },
+                        { "type": "null" }
+                    ]
+                }
+            }
+        }));
+
+        assert_eq!(
+            out["properties"]["scope"],
+            serde_json::json!({
+                "description": "Scope to read.",
+                "nullable": true,
+                "$ref": "#/$defs/MemoryScopeArg"
+            }),
+            "the lone real branch must merge into the parent, doc comment intact"
+        );
+    }
+
+    // The parent's own keys win, so a merge can never overwrite the field's
+    // description with the branch's.
+    #[test]
+    fn gemini_safe_schema_merge_keeps_the_parent_description() {
+        let out = gemini_safe(serde_json::json!({
+            "description": "Field docs.",
+            "anyOf": [
+                { "type": "string", "description": "Branch docs." },
+                { "type": "null" }
+            ]
+        }));
+
+        assert_eq!(out["description"], serde_json::json!("Field docs."));
+        assert_eq!(out["type"], serde_json::json!("string"));
+        assert_eq!(out["nullable"], serde_json::json!(true));
+    }
+
+    // Both shapes the rewrite deliberately declines to touch: narrowing a real
+    // union would change the advertised contract, and a lone combinator is
+    // already what Google wants.
+    #[test]
+    fn gemini_safe_schema_leaves_shapes_it_cannot_express_alone() {
+        let real_union = serde_json::json!({ "type": ["string", "integer", "null"] });
+        assert_eq!(gemini_safe(real_union.clone()), real_union);
+
+        let lone_combinator = serde_json::json!({
+            "anyOf": [{ "required": ["path"] }, { "required": ["query"] }]
+        });
+        assert_eq!(gemini_safe(lone_combinator.clone()), lone_combinator);
+
+        let several_real_branches = serde_json::json!({
+            "description": "Either shape.",
+            "anyOf": [{ "type": "string" }, { "type": "integer" }, { "type": "null" }]
+        });
+        assert_eq!(
+            gemini_safe(several_real_branches.clone()),
+            several_real_branches
+        );
+    }
+
+    // The Gemini dialect is a superset: root combinators still go, and every
+    // subschema is rewritten on top.
+    #[test]
+    fn restricted_schema_tool_list_gemini_safe_also_strips_root_combinators() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": ["string", "null"] } },
+                "anyOf": [{ "required": ["path"] }, { "required": ["query"] }]
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
+
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::GeminiSafe);
+        let out = &patched[0].input_schema;
+
+        assert!(
+            !out.contains_key("anyOf"),
+            "root combinator must be stripped"
+        );
+        assert_eq!(
+            out["properties"]["query"],
+            serde_json::json!({ "type": "string", "nullable": true })
+        );
+    }
+
+    // Dialect isolation: the shipped Moonshot/Bedrock behavior must not change.
+    #[test]
+    fn restricted_schema_tool_list_root_combinators_keeps_nullable_unions() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": ["string", "null"] } }
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
+        let before = serde_json::to_value(&tool).unwrap();
+
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::RootCombinators);
+
+        assert_eq!(
+            serde_json::to_value(&patched[0]).unwrap(),
+            before,
+            "the root-combinator dialect must leave union types alone"
+        );
+    }
+
+    // The two opt-ins are independent switches over one ordered dialect, so
+    // passing `false` to the weaker one must not undo the stronger one.
+    #[tokio::test]
+    async fn schema_dialect_opt_ins_only_raise_the_floor() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        assert_eq!(server.schema_dialect, SchemaDialect::Upstream);
+
+        let gemini = server
+            .clone()
+            .with_gemini_safe_schemas(true)
+            .with_strip_root_combinators(false);
+        assert_eq!(gemini.schema_dialect, SchemaDialect::GeminiSafe);
+
+        let combinators = server
+            .with_strip_root_combinators(true)
+            .with_gemini_safe_schemas(false);
+        assert_eq!(combinators.schema_dialect, SchemaDialect::RootCombinators);
+    }
+
+    // The guard that actually pins "our tool surface is Vertex-safe": a future
+    // optional argument on any tool cannot silently reintroduce a union type or
+    // a combinator with siblings.
+    #[tokio::test]
+    async fn every_tool_schema_is_gemini_safe() {
+        fn assert_safe(tool: &str, pointer: &str, schema: &serde_json::Value) {
+            match schema {
+                serde_json::Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        assert_safe(tool, &format!("{pointer}/{index}"), item);
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    assert!(
+                        !map.get("type").is_some_and(serde_json::Value::is_array),
+                        "{tool}{pointer}: Google's Schema takes a single `type`, got {:?}",
+                        map.get("type")
+                    );
+                    for key in ["anyOf", "oneOf"] {
+                        assert!(
+                            !(map.contains_key(key) && map.len() > 1),
+                            "{tool}{pointer}: `{key}` must be the only field, got keys {:?}",
+                            map.keys().collect::<Vec<_>>()
+                        );
+                    }
+                    for (key, value) in map {
+                        assert_safe(tool, &format!("{pointer}/{key}"), value);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools =
+            restricted_schema_tool_list(server.tool_router.list_all(), SchemaDialect::GeminiSafe);
+        assert!(!tools.is_empty(), "tools must be registered");
+        for tool in &tools {
+            let mut schema = serde_json::to_value(&tool.input_schema).unwrap();
+            // `$defs` is out of scope for this dialect (see
+            // [`gemini_safe_schema`]): `FeedbackKind` renders as a `oneOf` of
+            // `const` branches with a sibling `description`, and Gemini CLI
+            // forwards `$defs`/`$ref` to Vertex untouched without trouble. What
+            // this guard pins is the argument schemas, where every `Option`
+            // field lives.
+            if let Some(schema) = schema.as_object_mut() {
+                schema.shift_remove("$defs");
+            }
+            assert_safe(&tool.name, "", &schema);
+        }
     }
 
     // Issue #155: the neither-arg error must teach a looping model what a
@@ -7626,6 +8380,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7732,6 +8487,7 @@ mod tests {
                     global: Some(true),
                     include_expired: None,
                     explain: Some(true),
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7778,6 +8534,7 @@ mod tests {
                     global: Some(true),
                     include_expired: Some(true),
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7856,6 +8613,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7887,6 +8645,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7922,6 +8681,7 @@ mod tests {
                     global: Some(true),
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8310,18 +9070,17 @@ mod tests {
             .get_or_create_project(ws, "scratch", None)
             .await
             .unwrap();
-        let token = ai_memory_store::generate_token().unwrap();
-        let pepper = ai_memory_store::TokenPepper::new("test-pepper-author");
-        let token_hash = ai_memory_store::hash_token(&token, &pepper);
         let user_id = store
             .writer
-            .create_user(
+            .create_human_user(
                 NewUser {
                     username: "alice".into(),
                     name: Some("Alice Smith".into()),
                     email: Some("alice@example.com".into()),
                 },
-                token_hash,
+                ai_memory_core::UserRole::User,
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -8412,10 +9171,7 @@ mod tests {
         user.validate().unwrap();
         store
             .writer
-            .create_user(
-                user,
-                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
-            )
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
             .await
             .unwrap();
 
@@ -8512,10 +9268,7 @@ mod tests {
         user.validate().unwrap();
         store
             .writer
-            .create_user(
-                user,
-                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
-            )
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
             .await
             .unwrap();
 
@@ -9181,6 +9934,86 @@ mod tests {
         assert!(again_text.contains("\"handoff\": null"));
     }
 
+    /// `Handoff` is grouped internally into `HandoffScope`/`HandoffOrigin`/
+    /// `HandoffContent`/`HandoffLifecycle` sub-structs, each `#[serde(flatten)]`ed
+    /// so the wire JSON stays flat. This locks that in: the response must keep
+    /// exactly the pre-grouping key set at `handoff`, with no nested objects.
+    #[tokio::test]
+    async fn memory_handoff_accept_response_json_stays_flat() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "wire-shape probe".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: Some("/tmp/aim-wire".into()),
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let accept = server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: Some("/tmp/aim-wire".into()),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let accept_text = accept
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&accept_text).unwrap();
+        let handoff = value
+            .get("handoff")
+            .and_then(serde_json::Value::as_object)
+            .expect("handoff must be a flat JSON object");
+
+        let mut keys: Vec<&str> = handoff.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "id",
+            "workspace_id",
+            "project_id",
+            "from_session_id",
+            "from_agent",
+            "to_agent",
+            "cwd",
+            "summary",
+            "open_questions",
+            "next_steps",
+            "files_touched",
+            "state",
+            "created_at",
+            "accepted_by",
+            "accepted_at",
+            "accepted_by_session",
+            "owner_user",
+            "accepted_by_user",
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "handoff sub-struct grouping must not change the flat MCP wire shape"
+        );
+        assert!(
+            handoff.values().all(|v| !v.is_object()),
+            "no field may have become a nested object"
+        );
+    }
+
     #[tokio::test]
     async fn handoff_begin_caps_manual_text_after_scrub() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -9470,7 +10303,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.state, HandoffState::Expired);
+        assert_eq!(stored.lifecycle.state, HandoffState::Expired);
     }
 
     #[tokio::test]
@@ -9546,6 +10379,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .lifecycle
                 .state,
             HandoffState::Open,
         );
@@ -10290,6 +11124,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10323,6 +11158,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     explain: None,
+                    as_of: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

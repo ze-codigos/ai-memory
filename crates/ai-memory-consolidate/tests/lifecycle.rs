@@ -424,8 +424,11 @@ async fn m8_retention_lifecycle_end_to_end() {
         None,
         ws,
         proj,
-        /* dry_run */ true,
-        /* use_llm */ true,
+        ai_memory_consolidate::LintOptions {
+            dry_run: true,
+            use_llm: true,
+            decay_lambda: ai_memory_store::DecayParams::default().lambda,
+        },
     )
     .await
     .expect("lint dry-run");
