@@ -249,7 +249,28 @@ impl ServerEndpoint {
     }
 
     /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
+    ///
+    /// ze-codigos: also stamps `AI_MEMORY_HTTP_EXTRA_HEADERS` here, so EVERY
+    /// helper that funnels through `authenticate` (`get_json`, `post_json`,
+    /// `patch_json`, `post_empty`, ... and therefore `run`, `bootstrap`,
+    /// `status`, `embed`) reaches a server behind an edge-auth proxy.
+    /// Previously only `hook_capture` applied them, which left `ai-memory run`
+    /// unable to open a managed workstream through Cloudflare Access: the
+    /// proxy answered 302 + text/html and the CLI died decoding JSON.
+    /// `hook_capture` builds its request without `authenticate`, so headers
+    /// are never stamped twice.
     pub(crate) fn authenticate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        self.authenticate_with(|k| std::env::var(k).ok(), req)
+    }
+
+    /// Testable core of [`Self::authenticate`]: resolve the extra-header env
+    /// via `lookup` instead of the process environment.
+    pub(crate) fn authenticate_with(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        let req = apply_extra_headers_with(lookup, req);
         match &self.auth_token {
             Some(t) => req.bearer_auth(t),
             None => req,
@@ -601,6 +622,31 @@ mod tests {
         );
         // Reserved names never reach the wire through this channel.
         assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn authenticate_stamps_extra_headers_so_every_helper_reaches_an_edge_proxy() {
+        // Regressao: so o hook_capture aplicava os extra headers, entao
+        // `ai-memory run` batia no Cloudflare Access (302 + text/html) ao abrir
+        // o workstream e morria decodificando JSON. Todos os helpers HTTP
+        // passam por `authenticate`, entao e aqui que o header tem de entrar.
+        let client = reqwest::Client::new();
+        let endpoint = ServerEndpoint::from_pair(None, Some("tok".to_string()));
+        let req = endpoint
+            .authenticate_with(
+                |_| Some("cf-access-token: jwt-3".to_string()),
+                client.post("http://localhost/workstream/runs"),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers()
+                .get("cf-access-token")
+                .and_then(|v| v.to_str().ok()),
+            Some("jwt-3")
+        );
+        // o bearer continua sendo aplicado
+        assert!(req.headers().get("authorization").is_some());
     }
 
     #[test]
