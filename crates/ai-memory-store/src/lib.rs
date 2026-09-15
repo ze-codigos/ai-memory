@@ -4686,7 +4686,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            "expired"
+            // Not 'expired': a deliberate cancel has to stay distinguishable
+            // from a lease nobody renewed, because `finish_run` now accepts a
+            // late import on the latter and must keep refusing it on this.
+            "cancelled"
         );
         store.writer.prepare_workstream_run(prepare).await.unwrap();
     }
@@ -5196,7 +5199,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(cancelled, StoreError::InvalidState(ref msg) if msg.contains("expired")),
+            matches!(cancelled, StoreError::InvalidState(ref msg) if msg.contains("cancelled")),
             "cancelled runs report their state: {cancelled}"
         );
 
@@ -5206,6 +5209,225 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(unknown, StoreError::NotFound(_)));
+    }
+
+    /// A finish that names the native session it belongs to. `complete_finish`
+    /// leaves `native_session_id` as `None`, which the lapsed-lease path below
+    /// deliberately rejects: without an id there is nothing to match against
+    /// the one the `link` recorded.
+    fn finish_with_session(
+        run_id: ManagedRunId,
+        native: &str,
+        events: Vec<NewWorkstreamEvent>,
+        complete: bool,
+    ) -> FinishWorkstreamRun {
+        FinishWorkstreamRun {
+            run_id,
+            native_session_id: Some(native.into()),
+            source_cursor: None,
+            events,
+            complete,
+            segment_path: None,
+            exit_code: Some(0),
+        }
+    }
+
+    /// Drive a run to `expired` the way production does: let its lease lapse
+    /// and have the next `prepare` sweep it. Nothing else marks a run expired
+    /// on a timer, so forcing the state directly would test a state the
+    /// scheduler never actually produces.
+    async fn expire_lease_via_sweep(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        run_id: ManagedRunId,
+        owner: &str,
+    ) {
+        set_managed_run_lease(store.db_path(), run_id, 1);
+        store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, owner))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn finish_run_accepts_lapsed_lease_when_native_session_matches() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-finish-lapsed").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+        expire_lease_via_sweep(&store, ws, proj, run.run_id, "test:2").await;
+
+        // An adopted session has no parent process to heartbeat, so it always
+        // reaches finish with a lapsed lease. The lease guards exclusivity
+        // while the run is alive; it does not invalidate a late transcript.
+        let imported = store
+            .writer
+            .finish_workstream_run(finish_with_session(
+                run.run_id,
+                "native-1",
+                vec![managed_event("ev-1", AgentKind::Codex, "native-1", "first")],
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(imported.imported_events, 1);
+    }
+
+    #[tokio::test]
+    async fn finish_run_incremental_on_lapsed_lease_keeps_the_run_open() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-finish-incremental").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+        expire_lease_via_sweep(&store, ws, proj, run.run_id, "test:2").await;
+
+        // Reconciliation imports incrementally so it never closes a run whose
+        // session might still be alive; only a real SessionEnd sends
+        // `complete: true`.
+        store
+            .writer
+            .finish_workstream_run(finish_with_session(
+                run.run_id,
+                "native-1",
+                vec![managed_event("ev-1", AgentKind::Codex, "native-1", "first")],
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            store
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "finished",
+            "an incremental import must leave the run importable"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_run_rejects_lapsed_lease_when_native_session_differs() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-finish-other-session").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+        expire_lease_via_sweep(&store, ws, proj, run.run_id, "test:2").await;
+
+        let error = store
+            .writer
+            .finish_workstream_run(finish_with_session(
+                run.run_id,
+                "native-OUTRA",
+                vec![managed_event("ev-1", AgentKind::Codex, "native-OUTRA", "x")],
+                true,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn finish_run_rejects_lapsed_lease_when_the_run_was_never_linked() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-finish-unlinked").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        expire_lease_via_sweep(&store, ws, proj, run.run_id, "test:2").await;
+
+        // Without a link the run has no recorded identity, so a caller could
+        // name any session and be believed. The lapsed-lease path is the one
+        // place we cannot fall back to trusting the caller.
+        let error = store
+            .writer
+            .finish_workstream_run(finish_with_session(
+                run.run_id,
+                "native-1",
+                vec![managed_event("ev-1", AgentKind::Codex, "native-1", "x")],
+                true,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn finish_run_rejects_a_cancelled_run_even_when_the_session_matches() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-finish-cancelled").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+        // `run` links the native session BEFORE spawning and cancels on any
+        // later failure, so "linked and then cancelled" is reachable in
+        // production. Cancel means "release the lease without importing any
+        // events" — a lapsed lease must not be confused with it.
+        assert!(store.writer.cancel_managed_run(run.run_id).await.unwrap());
+
+        let error = store
+            .writer
+            .finish_workstream_run(finish_with_session(
+                run.run_id,
+                "native-1",
+                vec![managed_event("ev-1", AgentKind::Codex, "native-1", "x")],
+                true,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::InvalidState(ref msg) if msg.contains("cancelled")),
+            "a cancelled run reports that it was cancelled: {error}"
+        );
     }
 
     #[tokio::test]

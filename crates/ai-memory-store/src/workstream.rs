@@ -488,10 +488,17 @@ pub(crate) fn heartbeat(conn: &mut Connection, run_id: ManagedRunId) -> StoreRes
 }
 
 /// Release an active managed-run lease without importing any events.
+///
+/// Distinct from `expired`: a lapsed lease only means nobody renewed it, and
+/// a late transcript for that run is still legitimate (an adopted session has
+/// no parent process to heartbeat, so it always finishes with a lapsed lease).
+/// `cancelled` is a deliberate discard, and `finish_run` must keep refusing it
+/// even when the caller can prove which native session it owns. Sharing one
+/// state made those two indistinguishable.
 pub(crate) fn cancel_run(conn: &mut Connection, run_id: ManagedRunId) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
     let changed = conn.execute(
-        "UPDATE managed_runs SET state = 'expired', ended_at = ?1, lease_expires_at = ?1 \
+        "UPDATE managed_runs SET state = 'cancelled', ended_at = ?1, lease_expires_at = ?1 \
          WHERE id = ?2 AND state = 'active'",
         params![now, run_id.as_bytes()],
     )?;
@@ -683,7 +690,29 @@ pub(crate) fn finish_run(
             latest_sequence: latest_before,
         });
     }
-    if state != "active" {
+    // A lapsed lease is not a reason to refuse a transcript. The lease exists
+    // to keep two live sessions off one workstream; it says nothing about
+    // whether an import that arrives afterwards is legitimate. Sessions
+    // adopted by a hook have no parent process to heartbeat, so they ALWAYS
+    // arrive here expired — as does anything reconciled after a crash.
+    //
+    // This does not loosen identity. The per-event guards below (agent and
+    // native_session_id) are what keep one session's events out of another's
+    // ledger, and they stay intact. This path is in fact stricter than the
+    // `active` one: there the caller's `native_session_id` overrides whatever
+    // the link recorded, while here it must equal it. A run that was never
+    // linked has no recorded identity to check, so it cannot take this path.
+    if state == "expired" {
+        match (input.native_session_id.as_deref(), linked_session.as_deref()) {
+            (Some(claimed), Some(linked)) if claimed == linked => {}
+            _ => {
+                return Err(StoreError::InvalidState(format!(
+                    "managed run {} is expired and its native session id does not match the linked one",
+                    input.run_id
+                )));
+            }
+        }
+    } else if state != "active" {
         return Err(StoreError::InvalidState(format!(
             "managed run {} is {state}",
             input.run_id
