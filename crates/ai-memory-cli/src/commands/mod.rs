@@ -59,6 +59,7 @@ pub mod resume;
 pub mod run;
 pub mod search;
 pub mod serve;
+pub mod session_name;
 pub mod setup_agent;
 pub mod show;
 pub mod status;
