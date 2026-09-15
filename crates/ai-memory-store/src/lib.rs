@@ -4134,6 +4134,136 @@ mod tests {
         assert!(paths.contains(&"y.md"));
     }
 
+    /// What the durable acervo is *about*, for the session-start brief: an
+    /// agent that never learns a topic exists never thinks to search for it.
+    #[tokio::test]
+    async fn topics_for_project_ranks_durable_tags_and_skips_import_marks() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "topics", None)
+            .await
+            .unwrap();
+
+        let tagged = |path: &str, tags: serde_json::Value| {
+            let mut page = sample_page(ws, proj, path, "body");
+            page.frontmatter_json = serde_json::json!({ "tags": tags });
+            page
+        };
+        for page in [
+            tagged("concepts/a.md", serde_json::json!(["carrus", "mobility"])),
+            tagged(
+                "gotchas/b.md",
+                serde_json::json!(["carrus", "import-wiki-2026"]),
+            ),
+            tagged("decisions/c.md", serde_json::json!(["carrus"])),
+            tagged("procedures/d.md", serde_json::json!(["mobility"])),
+            // Session narratives are not the acervo's subject matter.
+            tagged(
+                "sessions/e.md",
+                serde_json::json!(["nexus", "nexus", "nexus"]),
+            ),
+            // A page with no tags at all must not break the query.
+            sample_page(ws, proj, "concepts/untagged.md", "body"),
+        ] {
+            store.writer.upsert_page(page).await.unwrap();
+        }
+
+        let topics = store.reader.topics_for_project(ws, proj, 10).await.unwrap();
+        assert_eq!(
+            topics,
+            vec!["carrus".to_string(), "mobility".to_string()],
+            "ranked by how many durable pages carry them, import marks and \
+             session tags excluded",
+        );
+
+        let capped = store.reader.topics_for_project(ws, proj, 1).await.unwrap();
+        assert_eq!(capped, vec!["carrus".to_string()], "limit is honoured");
+    }
+
+    /// The consolidator's link inventory: only pages that are worth being a
+    /// wikilink target. Session narratives, slots, notes and untyped facts are
+    /// excluded — a session linking another session is noise, and the prompt
+    /// budget is better spent on durable knowledge.
+    #[tokio::test]
+    async fn link_target_pages_lists_only_durable_kinds_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "link-targets", None)
+            .await
+            .unwrap();
+
+        // Written oldest-first, so the last one is the most recently updated.
+        const DURABLE: [&str; 5] = [
+            "concepts/mobility.md",
+            "decisions/0001-pix.md",
+            "gotchas/venv-symlink.md",
+            "procedures/runbook-sso.md",
+            "_rules/cancelamento-azul.md",
+        ];
+        const EXCLUDED: [&str; 4] = [
+            "sessions/abc.md",
+            "_slots/focus.md",
+            "notes/scratch.md",
+            "log-2026-09.md",
+        ];
+        for path in DURABLE.iter().chain(EXCLUDED.iter()) {
+            store
+                .writer
+                .upsert_page(sample_page(ws, proj, path, "body"))
+                .await
+                .unwrap();
+        }
+
+        let targets = store.reader.link_target_pages(ws, proj, 50).await.unwrap();
+        let paths: Vec<&str> = targets.iter().map(|p| p.path.as_str()).collect();
+        for path in DURABLE {
+            assert!(
+                paths.contains(&path),
+                "durable page {path} must be a target"
+            );
+        }
+        for path in EXCLUDED {
+            assert!(
+                !paths.contains(&path),
+                "{path} is not a durable link target"
+            );
+        }
+        assert_eq!(paths.len(), DURABLE.len());
+
+        // Newest first: re-upserting bumps updated_at, so the page that was
+        // written first must now lead the list.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, DURABLE[0], "body v2"))
+            .await
+            .unwrap();
+        let bumped = store.reader.link_target_pages(ws, proj, 50).await.unwrap();
+        assert_eq!(
+            bumped.first().map(|p| p.path.as_str()),
+            Some(DURABLE[0]),
+            "most recently updated page leads the inventory"
+        );
+
+        // The cap keeps the newest, which is what the prompt budget wants.
+        let capped = store.reader.link_target_pages(ws, proj, 2).await.unwrap();
+        assert_eq!(capped.len(), 2, "limit is honoured");
+        assert_eq!(capped[0].path, DURABLE[0]);
+    }
+
     #[tokio::test]
     async fn reader_page_kinds_follow_canonical_paths_across_surfaces() {
         const CASES: [(&str, &str); 9] = [

@@ -76,6 +76,16 @@ fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
     )
 }
 
+/// Hard ceiling on the brief's topic list. The brief is injected into EVERY
+/// opted-in session start, so this stays small on purpose.
+const MAX_PROJECT_TOPICS: usize = 40;
+
+/// Hard ceiling on the consolidator's link inventory. The list rides in the
+/// prompt's optional-context slice, which already trims to the token budget;
+/// this stops a pathologically large wiki from building a huge string only to
+/// have it thrown away.
+const MAX_LINK_TARGET_PAGES: usize = 500;
+
 /// Leading body characters scanned when a page carries no frontmatter
 /// `summary`. Wide enough to step past the `# Title` line and a structural
 /// heading or two before the first real prose.
@@ -6019,6 +6029,126 @@ impl ReaderPool {
             let mut out = Vec::new();
             for r in rows {
                 let (path, title, kind, tier, updated_us) = r?;
+                let updated_at = jiff::Timestamp::from_microsecond(updated_us)
+                    .map(|ts| ts.to_string())
+                    .unwrap_or_default();
+                out.push(PageSummary {
+                    path,
+                    title,
+                    kind,
+                    tier,
+                    updated_at,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// The subjects this project's durable pages cover, most-carried first.
+    ///
+    /// Feeds the session-start brief: an agent that never learns a topic
+    /// exists never thinks to search for it, and this is small enough to
+    /// inject on every session where a page index would not be. Tags on
+    /// session narratives are ignored — a topic earns its place by having
+    /// durable knowledge behind it — and `import-*` provenance marks are
+    /// dropped because they describe where a page came from, not what it
+    /// is about.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn topics_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<String>> {
+        #[allow(clippy::cast_possible_wrap)]
+        let limit = limit.clamp(1, MAX_PROJECT_TOPICS) as i64;
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            // COALESCE keeps `json_each` off a NULL when a page has no tags.
+            let sql = format!(
+                "SELECT tag.value AS topic, COUNT(*) AS n \
+                 FROM pages pg, \
+                      json_each(COALESCE(json_extract(pg.frontmatter_json, '$.tags'), '[]')) AS tag \
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1{not_expired} \
+                   AND {kind_expr} IN ('concept', 'decision', 'gotcha', 'procedure', 'rule') \
+                   AND tag.value NOT LIKE 'import-%' \
+                 GROUP BY topic \
+                 ORDER BY n DESC, topic ASC \
+                 LIMIT ?3",
+                not_expired = not_expired("pg", "?4"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    limit,
+                    now_us()
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Pages worth offering the consolidator as `[[wikilink]]` targets:
+    /// the durable kinds only, newest first.
+    ///
+    /// Sessions, slots, notes and untyped facts are deliberately absent.
+    /// A session narrative linking another session narrative is noise, and
+    /// the inventory rides in a bounded slice of the consolidation prompt —
+    /// the budget belongs to knowledge that outlives the run that wrote it.
+    /// Ordering by recency means a cap that bites drops the stalest pages.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn link_target_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<PageSummary>> {
+        #[allow(clippy::cast_possible_wrap)]
+        let limit = limit.clamp(1, MAX_LINK_TARGET_PAGES) as i64;
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("path", "frontmatter_json");
+            let sql = format!(
+                "SELECT path, title, {kind_expr} AS kind, tier, updated_at \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
+                   AND {kind_expr} IN ('concept', 'decision', 'gotcha', 'procedure', 'rule') \
+                 ORDER BY updated_at DESC, path ASC \
+                 LIMIT ?3",
+                not_expired = not_expired("pages", "?4"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    limit,
+                    now_us()
+                ],
+                |row| {
+                    let path: String = row.get(0)?;
+                    let title: String = row.get(1)?;
+                    let kind: String = row.get(2)?;
+                    let tier: String = row.get(3)?;
+                    let updated_us: i64 = row.get(4)?;
+                    Ok((path, title, kind, tier, updated_us))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (path, title, kind, tier, updated_us) = row?;
                 let updated_at = jiff::Timestamp::from_microsecond(updated_us)
                     .map(|ts| ts.to_string())
                     .unwrap_or_default();

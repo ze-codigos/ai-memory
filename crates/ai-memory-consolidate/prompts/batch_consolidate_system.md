@@ -67,25 +67,29 @@ Do:
 
 The wiki is a graph: pages reference each other with Obsidian-style
 wikilinks, and pages without links grow as disconnected islands.
-When a page you write relates to another page — one you are
-emitting in this same reply, or an existing page named in the
-input — reference it inline with a wikilink:
+When a page you write relates to another page, reference it inline
+with a wikilink — `[[decisions/0003-no-vector-db]]`.
 
-- `[[page-path]]` — a page in the same project. The target is the
-  page *path* relative to the project root
-  (e.g. `[[decisions/0003-no-vector-db]]`), not the display title.
-- `[[project:page-path]]` — a page in a sibling project. Use it
-  when the work clearly concerns another project that is named in
-  the input — e.g. a fix in this project whose root cause lives in
-  the sibling project `billing` links `[[billing:audio-pipeline]]`.
-  Never invent project names.
-- `[[_global:page-path]]` — a cross-cutting principle, convention,
-  or trap that applies to every project.
+**A link target must come from one of exactly two places:**
 
-A link whose target does not exist yet is acceptable — it is
-recorded as a pending link and resolves automatically when the
-page appears. 2-5 well-chosen links per page beat exhaustive
-linking; zero links should be rare.
+1. The **"Existing pages in this project"** list in the input below.
+   Copy the path from that list character for character, minus the
+   `.md`. That list is the wiki's durable pages; if it is absent or
+   empty, this project has none yet.
+2. The **path of another page in this same reply** — a session page
+   pointing at the gotcha you are writing beside it is the most
+   valuable edge there is, and that gotcha does not exist yet.
+
+**Anything else is discarded.** A target you inferred from a name
+that scrolled past in the observations, a source file
+(`[[nexus:service.py]]`), a slug you assembled from the topic, a
+sibling project — all of these are unwrapped to plain text before
+the page is stored. You gain nothing by guessing: an invented link
+is not a pending link that resolves later, it is deleted syntax.
+
+Prefer 2-5 well-chosen links per page over exhaustive linking. Zero
+links is the right answer when nothing in the list is genuinely
+related — link because the pages connect, not to fill a quota.
 
 ## OUTPUT LANGUAGE
 
