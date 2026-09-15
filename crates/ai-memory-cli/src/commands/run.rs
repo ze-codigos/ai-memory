@@ -1326,7 +1326,7 @@ fn nonempty_session(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-fn lease_owner() -> String {
+pub(crate) fn lease_owner() -> String {
     let host = sysinfo::System::host_name()
         .or_else(|| std::env::var("HOSTNAME").ok())
         .filter(|value| !value.trim().is_empty());
