@@ -675,7 +675,30 @@ async fn finish_run(
             Err(failure) => store_error_response(failure),
         };
     }
-    if status.state != "active" {
+    // A lapsed lease is not a closed run. Sessions adopted by a lifecycle hook
+    // have no parent process to renew the lease, so they ALWAYS arrive here
+    // expired — as does anything reconciled after a crash. The lease keeps two
+    // live sessions off one workstream; it says nothing about whether an
+    // import that arrives afterwards is legitimate.
+    //
+    // The identity check is what keeps this safe, and it is stricter than the
+    // active path below: there the caller's id merely fills in for a missing
+    // one, while here it must equal what the `link` recorded. A run that was
+    // never linked has nothing to prove ownership with and stays refused. The
+    // store re-checks this independently — this gate exists because it runs
+    // first, not because it is the only one.
+    //
+    // `cancelled` is deliberately NOT included: that state means someone threw
+    // the run away on purpose.
+    let lapsed_lease_import = status.state == "expired"
+        && matches!(
+            (
+                request.native_session_id.as_deref(),
+                status.native_session_id.as_deref(),
+            ),
+            (Some(claimed), Some(linked)) if claimed == linked
+        );
+    if status.state != "active" && !lapsed_lease_import {
         return error(StatusCode::CONFLICT, "managed run is not active");
     }
     let native_session_id = request
@@ -1564,6 +1587,167 @@ mod tests {
         let response: ai_memory_core::ManagedRunContextResponse =
             serde_json::from_slice(&body).unwrap();
         assert!(response.context.is_none());
+    }
+
+    /// The endpoint, not the store. The store grew its own lapsed-lease import
+    /// first and its tests passed while this handler still answered 409 to
+    /// every expired run — the gap only showed up against a live server, which
+    /// is exactly the seam a store-level test cannot see.
+    #[tokio::test]
+    async fn finish_endpoint_accepts_a_lapsed_lease_whose_session_matches() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let prepared = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .link_managed_run_session(prepared.run_id, AgentKind::Codex, "native-1")
+            .await
+            .unwrap();
+        expire_run_lease(&store, prepared.run_id, workspace_id, project_id).await;
+
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            AxumPath(prepared.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                checkpoint: Default::default(),
+                losses: Vec::new(),
+                exit_code: Some(0),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn finish_endpoint_refuses_a_lapsed_lease_from_another_session() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let prepared = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .link_managed_run_session(prepared.run_id, AgentKind::Codex, "native-1")
+            .await
+            .unwrap();
+        expire_run_lease(&store, prepared.run_id, workspace_id, project_id).await;
+
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            AxumPath(prepared.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-OUTRA".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                checkpoint: Default::default(),
+                losses: Vec::new(),
+                exit_code: Some(0),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn finish_endpoint_still_refuses_a_cancelled_run() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let prepared = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .link_managed_run_session(prepared.run_id, AgentKind::Codex, "native-1")
+            .await
+            .unwrap();
+        // Cancel is a deliberate discard; a matching session id must not
+        // resurrect it the way a merely lapsed lease is resurrected.
+        store
+            .writer
+            .cancel_managed_run(prepared.run_id)
+            .await
+            .unwrap();
+
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            AxumPath(prepared.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                checkpoint: Default::default(),
+                losses: Vec::new(),
+                exit_code: Some(0),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// Drive a run to `expired` the way production does: let the lease lapse
+    /// and have the next `prepare` sweep it.
+    async fn expire_run_lease(
+        store: &Store,
+
+        run_id: ai_memory_core::ManagedRunId,
+        workspace_id: ai_memory_core::WorkspaceId,
+        project_id: ai_memory_core::ProjectId,
+    ) {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+            rusqlite::params![run_id.as_bytes()],
+        )
+        .unwrap();
+        drop(conn);
+        store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "sweeper",
+            ))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
