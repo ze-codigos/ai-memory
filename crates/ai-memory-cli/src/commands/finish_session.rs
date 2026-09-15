@@ -52,18 +52,20 @@ pub(crate) fn plan_for(run: &AdoptedRun, now: i64, max_age_secs: i64) -> Action 
 
 /// Whether retrying could ever succeed.
 ///
-/// Only the server's own verdicts are permanent: a run it cannot find, one it
-/// already closed, or one whose identity does not match. Everything else —
-/// connection refused, timeout, 5xx — is the case the retained state exists
-/// for, because a server that is briefly down at SessionEnd must not cost the
-/// ledger.
+/// Deliberately narrow. Only two verdicts are permanent: a run the server
+/// cannot find at all, and one whose native session is not the one we claim.
+/// Neither can change by asking again.
+///
+/// A 409 `managed run is not active` is NOT on that list, and the reason is
+/// concrete: a server that predates the lapsed-lease import answers exactly
+/// that to every adopted session older than its 90-second lease. Treating it
+/// as permanent threw the ledger away instead of waiting for the server to
+/// catch up — measured against the live dev server, not hypothesised. Keeping
+/// the state costs a retry per boundary until the 48-hour cap collects it;
+/// dropping it costs the transcript, permanently.
 pub(crate) fn is_permanent(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}").to_lowercase();
-    text.contains("404")
-        || text.contains("409")
-        || text.contains("is finished")
-        || text.contains("is cancelled")
-        || text.contains("does not match")
+    text.contains("404") || text.contains("does not match")
 }
 
 pub(crate) async fn finalize_adopted_runs(data_dir: &Path) -> Vec<Outcome> {
@@ -197,12 +199,23 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_closed_run_is_permanent() {
+    fn a_missing_run_or_a_foreign_session_is_permanent() {
         assert!(is_permanent(&anyhow::anyhow!(
             "server returned 404 Not Found"
         )));
         assert!(is_permanent(&anyhow::anyhow!(
             "managed run X is expired and its native session id does not match the linked one"
+        )));
+    }
+
+    #[test]
+    fn a_run_that_is_not_active_is_kept_not_dropped() {
+        // The exact body a server without the lapsed-lease import returns for
+        // every adopted session older than its 90s lease. Observed against the
+        // live dev server: classifying it as permanent discarded the ledger
+        // instead of waiting for the server to be updated.
+        assert!(!is_permanent(&anyhow::anyhow!(
+            "server returned 409 Conflict: {{\"error\":\"managed run is not active\"}}"
         )));
     }
 
