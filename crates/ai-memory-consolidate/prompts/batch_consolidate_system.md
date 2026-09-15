@@ -80,12 +80,12 @@ with a wikilink — `[[decisions/0003-no-vector-db]]`.
    pointing at the gotcha you are writing beside it is the most
    valuable edge there is, and that gotcha does not exist yet.
 
-**Anything else is discarded.** A target you inferred from a name
+**A target in this project that is neither is discarded.** A name
 that scrolled past in the observations, a source file
-(`[[nexus:service.py]]`), a slug you assembled from the topic, a
-sibling project — all of these are unwrapped to plain text before
-the page is stored. You gain nothing by guessing: an invented link
-is not a pending link that resolves later, it is deleted syntax.
+(`[[service.py]]`), a slug you assembled from the topic — all of
+these are unwrapped to plain text before the page is stored. You
+gain nothing by guessing: an invented link is not a pending link
+that resolves later, it is deleted syntax.
 
 Prefer 2-5 well-chosen links per page over exhaustive linking. Zero
 links is the right answer when nothing in the list is genuinely
