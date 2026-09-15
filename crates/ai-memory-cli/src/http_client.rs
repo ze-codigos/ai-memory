@@ -173,15 +173,19 @@ impl ServerEndpoint {
         )
     }
 
-    /// Build from an explicit URL + token pair (useful for tests that
-    /// cannot safely mutate the process environment).
+    /// Build from an explicit URL + token pair, for callers that have both
+    /// already and no `Config` to resolve them from.
+    ///
+    /// The lifecycle hook is the real case: `main` dispatches it before
+    /// `Config::load` runs, so it carries its own `--server-url` and resolves
+    /// its own bearer. The detached drainer inherits the same situation.
+    /// Tests use it too, since it reads no environment.
     ///
     /// `url` defaults to `http://127.0.0.1:49374` when `None` or empty;
     /// trailing slashes are stripped. `token` is treated as absent when
-    /// `None` or empty. No environment is read — the env base-path fallback
-    /// is `None`; use [`from_pair_with_base`] to exercise that path.
+    /// `None` or empty. The env base-path fallback is `None`; use
+    /// [`from_pair_with_base`] to exercise that path.
     #[must_use]
-    #[cfg(test)]
     pub(crate) fn from_pair(url: Option<String>, token: Option<String>) -> Self {
         let url_configured = url.as_deref().is_some_and(|s| !s.is_empty());
         Self::build(url, token, url_configured, None)
