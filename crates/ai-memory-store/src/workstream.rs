@@ -703,7 +703,10 @@ pub(crate) fn finish_run(
     // the link recorded, while here it must equal it. A run that was never
     // linked has no recorded identity to check, so it cannot take this path.
     if state == "expired" {
-        match (input.native_session_id.as_deref(), linked_session.as_deref()) {
+        match (
+            input.native_session_id.as_deref(),
+            linked_session.as_deref(),
+        ) {
             (Some(claimed), Some(linked)) if claimed == linked => {}
             _ => {
                 return Err(StoreError::InvalidState(format!(

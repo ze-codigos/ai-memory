@@ -160,7 +160,10 @@ mod tests {
     fn an_ended_session_closes() {
         let mut run = sample_run("nat-1");
         run.ended = true;
-        assert_eq!(plan_for(&run, run.adopted_at + 60, MAX_AGE_SECS), Action::Close);
+        assert_eq!(
+            plan_for(&run, run.adopted_at + 60, MAX_AGE_SECS),
+            Action::Close
+        );
     }
 
     #[test]

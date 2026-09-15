@@ -27,13 +27,13 @@ use crate::cli::HookArgs;
 
 use sha2::{Digest as _, Sha256};
 
+use super::adopt_session;
+use super::adopted_state;
 use super::hook_capture::{
     build_client, canonical_context, capture_policy, extract_cwd, get_handoff, marker_query_suffix,
     marker_query_suffix_without_briefing, marker_requests_briefing, resolve_cwd_with_fallbacks,
     url_encode,
 };
-use super::adopt_session;
-use super::adopted_state;
 use super::hook_drain_process;
 use super::hook_spool;
 use super::path_util::strip_windows_verbatim_prefix;
@@ -481,12 +481,10 @@ fn rename_nudge(current_name: &str) -> String {
 /// every prompt trains both the developer and the model to ignore the one that
 /// eventually matters.
 fn adoption_warned_marker(data_dir: &Path, native_session_id: &str) -> PathBuf {
-    data_dir
-        .join("hook-state")
-        .join(format!(
-            "adopt-warned-{:x}",
-            Sha256::digest(native_session_id.as_bytes())
-        ))
+    data_dir.join("hook-state").join(format!(
+        "adopt-warned-{:x}",
+        Sha256::digest(native_session_id.as_bytes())
+    ))
 }
 
 /// Whether this session still owes the user an adoption warning. Marks it as
@@ -922,8 +920,9 @@ where
             .await;
             let failure = match adoption {
                 Ok(Ok(state)) => {
-                    prompt_context =
-                        state.provisional.then(|| rename_nudge(&state.workstream_name));
+                    prompt_context = state
+                        .provisional
+                        .then(|| rename_nudge(&state.workstream_name));
                     None
                 }
                 Ok(Err(error)) => Some(format!("{error:#}")),
@@ -938,8 +937,8 @@ where
                 }
             }
         } else if let Some(state) = adopted_state::load(&dd, native) {
-            prompt_context =
-                wants_rename_nudge(state.provisional, None).then(|| rename_nudge(&state.workstream_name));
+            prompt_context = wants_rename_nudge(state.provisional, None)
+                .then(|| rename_nudge(&state.workstream_name));
         } else {
             prompt_context = workstream_env
                 .as_deref()

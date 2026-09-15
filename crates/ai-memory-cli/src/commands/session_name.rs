@@ -227,7 +227,10 @@ mod tests {
     fn desktop_title_strips_slashes_and_control_chars() {
         let tmp = tempfile::tempdir().unwrap();
         app_session(tmp.path(), "local_abc", "{\"title\":\"a/b\\tc\"}");
-        assert_eq!(desktop_title("local_abc", tmp.path()).as_deref(), Some("a b c"));
+        assert_eq!(
+            desktop_title("local_abc", tmp.path()).as_deref(),
+            Some("a b c")
+        );
     }
 
     #[test]

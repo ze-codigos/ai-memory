@@ -112,19 +112,24 @@ pub(crate) async fn adopt(input: AdoptInput<'_>) -> Result<AdoptedRun> {
         lease_owner: crate::commands::run::lease_owner(),
     };
 
-    let prepared: PrepareManagedRunResponse =
-        match post_json(&endpoint, "/workstream/runs", &request(resolved.name.clone())).await {
-            Ok(prepared) => prepared,
-            // A duplicate name is the one failure worth a second attempt; any
-            // other error would only repeat. One retry, then give up.
-            Err(_) => post_json(
-                &endpoint,
-                "/workstream/runs",
-                &request(with_suffix(&resolved.name, input.native_session_id)),
-            )
-            .await
-            .context("opening a workstream for the adopted session")?,
-        };
+    let prepared: PrepareManagedRunResponse = match post_json(
+        &endpoint,
+        "/workstream/runs",
+        &request(resolved.name.clone()),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        // A duplicate name is the one failure worth a second attempt; any
+        // other error would only repeat. One retry, then give up.
+        Err(_) => post_json(
+            &endpoint,
+            "/workstream/runs",
+            &request(with_suffix(&resolved.name, input.native_session_id)),
+        )
+        .await
+        .context("opening a workstream for the adopted session")?,
+    };
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
 
     // Without this the run keeps a NULL native_session_id, and the lapsed-lease
