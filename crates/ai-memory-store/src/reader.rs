@@ -6071,9 +6071,12 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT tag.value AS topic, COUNT(*) AS n \
                  FROM pages pg, \
-                      json_each(COALESCE(json_extract(pg.frontmatter_json, '$.tags'), '[]')) AS tag \
+                      json_each(CASE WHEN json_type(pg.frontmatter_json, '$.tags') = 'array' \
+                                     THEN json_extract(pg.frontmatter_json, '$.tags') \
+                                     ELSE '[]' END) AS tag \
                  WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1{not_expired} \
                    AND {kind_expr} IN ('concept', 'decision', 'gotcha', 'procedure', 'rule') \
+                   AND tag.type = 'text' \
                    AND tag.value NOT LIKE 'import-%' \
                  GROUP BY topic \
                  ORDER BY n DESC, topic ASC \
@@ -6093,6 +6096,43 @@ impl ReaderPool {
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Every live page path in this project, for answering "does this page
+    /// exist".
+    ///
+    /// Deliberately separate from [`Self::link_target_pages`]. That one
+    /// decides what the consolidation prompt *shows*, and is narrowed by
+    /// kind, by a cap and by the prompt budget; this one decides what a
+    /// wikilink is allowed to *point at*. Conflating them meant a page the
+    /// prompt merely omitted had its inbound links deleted as if it did not
+    /// exist.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn project_page_paths(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<std::collections::BTreeSet<String>> {
+        self.with_conn(move |conn| {
+            let sql = format!(
+                "SELECT path FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired}",
+                not_expired = not_expired("pages", "?3"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), now_us()],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut out = std::collections::BTreeSet::new();
+            for row in rows {
+                out.insert(row?);
             }
             Ok(out)
         })
@@ -6124,7 +6164,12 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, tier, updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
-                   AND {kind_expr} IN ('concept', 'decision', 'gotcha', 'procedure', 'rule') \
+                   AND (path LIKE 'concepts/%' OR path LIKE 'decisions/%' \
+                        OR path LIKE 'gotchas/%' OR path LIKE 'procedures/%' \
+                        OR path LIKE '\\_rules/%' ESCAPE '\\' \
+                        OR {kind_expr} IN ('decision', 'gotcha', 'procedure', 'rule')) \
+                   AND path NOT LIKE 'sessions/%' \
+                   AND path NOT LIKE '\\_slots/%' ESCAPE '\\' \
                  ORDER BY updated_at DESC, path ASC \
                  LIMIT ?3",
                 not_expired = not_expired("pages", "?4"),

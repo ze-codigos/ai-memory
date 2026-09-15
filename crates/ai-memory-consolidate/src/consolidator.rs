@@ -498,6 +498,9 @@ impl Consolidator {
         // for wikilinks the model has no way to aim, and it fills the gap with
         // names it saw scroll past in the observations.
         let link_targets = self.link_targets(ws, proj).await?;
+        // What the model may point at, which is a wider set than what the
+        // prompt has room to show it.
+        let existing_paths = self.reader.project_page_paths(ws, proj).await?;
         let request = build_batch_request_with_slots(
             session_id,
             &observations,
@@ -516,7 +519,7 @@ impl Consolidator {
 
         // Backstop: the prompt asks for links from the inventory, this makes
         // it true. A model that invents a target gets the words, not an edge.
-        let dropped = sanitize_batch_links(&mut batch.updates, &link_targets);
+        let dropped = sanitize_batch_links(&mut batch.updates, &existing_paths);
         if dropped > 0 {
             warn!(
                 session = %session_id,
@@ -847,24 +850,32 @@ fn render_link_targets(targets: &[LinkTargetPage], max_chars: usize) -> String {
 /// Drop every `[[wikilink]]` the batch emits that does not resolve, in place.
 /// Returns how many were unwrapped, for the log line.
 ///
-/// A link survives when its target is a page in `targets` (the inventory the
-/// prompt showed the model) or another page in this same batch — a session
-/// page pointing at the gotcha written beside it is the most valuable edge
-/// there is, and that gotcha does not exist yet.
+/// A link survives when its target is a page that exists in this project, or
+/// another page in this same batch — a session page pointing at the gotcha
+/// written beside it is the most valuable edge there is, and that gotcha does
+/// not exist yet.
+///
+/// `existing_paths` is every live page, NOT the inventory the prompt showed.
+/// The two answer different questions, and conflating them is a live bug:
+/// the inventory is narrowed by kind, by a cap and by the prompt budget, so
+/// using it here deleted links to pages that plainly exist. The clearest case
+/// is `concepts/`, which the consolidator stamps `kind: fact` because
+/// [`PageKind`] has no `Concept` variant.
 ///
 /// Rule updates are matched on their REROUTED `_rules/<slug>.md` path, not
 /// the path the model proposed, because that is where the page actually
-/// lands. Cross-scope links (`[[project:page]]`) never survive: the
-/// inventory covers this project, so there is nothing to check them against.
+/// lands. Cross-scope links (`[[project:page]]`, `[[_global:page]]`) are left
+/// alone: a per-project page set cannot judge them, `_global` is a reserved
+/// scope rather than a typo, and deleting what we cannot verify would drop a
+/// documented capability. Those keep upstream's pending-link behaviour.
 fn sanitize_batch_links(
     updates: &mut [ConsolidatedPageUpdate],
-    targets: &[LinkTargetPage],
+    existing_paths: &std::collections::BTreeSet<String>,
 ) -> usize {
-    let known: std::collections::HashSet<String> = targets
-        .iter()
-        .map(|t| t.path.clone())
-        .chain(updates.iter().map(final_path_for))
-        .collect();
+    let known: std::collections::HashSet<&str> =
+        existing_paths.iter().map(String::as_str).collect();
+    // The batch's own pages do not exist yet, so they are checked separately.
+    let batch_paths: Vec<String> = updates.iter().map(final_path_for).collect();
     let mut removed = 0usize;
     for upd in updates.iter_mut() {
         let Ok(path) = PagePath::new(final_path_for(upd)) else {
@@ -872,7 +883,11 @@ fn sanitize_batch_links(
         };
         let (body, dropped) =
             ai_memory_wiki::retain_wikilinks(&upd.body_markdown, &path, |ws, proj, target| {
-                ws.is_none() && proj.is_none() && known.contains(target)
+                // Cross-scope: not ours to verify, so not ours to delete.
+                if ws.is_some() || proj.is_some() {
+                    return true;
+                }
+                known.contains(target) || batch_paths.iter().any(|p| p == target)
             });
         if dropped > 0 {
             upd.body_markdown = body;
@@ -1077,7 +1092,14 @@ fn build_batch_request_with_slots(
     // page — but the inventory keeps a floor. Without one, a project with fat
     // slots silently loses every link target and the model goes back to
     // inventing paths, which is the failure the inventory exists to prevent.
-    let targets_floor = remaining / 3;
+    // Reserved only when there is something to render: an empty inventory
+    // that still cost the slots a third of the budget would truncate the very
+    // pages the slots exist to protect, for nothing.
+    let targets_floor = if link_targets.is_empty() {
+        0
+    } else {
+        remaining / 3
+    };
     let slots_block = render_slot_snapshots(slots, remaining.saturating_sub(targets_floor));
     let targets_block = render_link_targets(
         link_targets,
@@ -1666,8 +1688,8 @@ mod tests {
         );
         assert!(
             !prompt.contains("[[project:page-path]]"),
-            "cross-project targets are unwrapped at the write boundary, so \
-             advertising them only produces links that get deleted",
+            "the batch path has no cross-project inventory to aim at, so it \
+             does not advertise the form",
         );
         assert!(
             !prompt.contains("recorded as a pending link"),
@@ -3163,6 +3185,110 @@ mod tests {
         .unwrap()
     }
 
+    /// The bug this fix exists for: `PageKind` has no `Concept` variant, so
+    /// `build_update` stamps `kind: fact` on every `concepts/` page the
+    /// consolidator writes. While the sanitizer used the prompt inventory as
+    /// its allowlist, those pages read as non-existent and their inbound
+    /// links were deleted — the precise failure the inventory was added to
+    /// prevent. The allowlist is now "does the page exist", nothing else.
+    #[test]
+    fn sanitize_batch_links_keeps_links_to_pages_the_inventory_omits() {
+        // The page exists but would never appear in a budget-bound,
+        // kind-filtered, capped inventory.
+        let existing = page_set(["concepts/busca-multi.md"]);
+        let mut updates = vec![update_with_body(
+            "sessions/abc.md",
+            PageKind::Fact,
+            "Sessao",
+            "Detalhe em [[concepts/busca-multi]].",
+        )];
+
+        let removed = sanitize_batch_links(&mut updates, &existing);
+
+        assert_eq!(removed, 0, "nothing to unwrap");
+        assert!(
+            updates[0]
+                .body_markdown
+                .contains("[[concepts/busca-multi]]"),
+            "a page absent from the prompt is still a real page: {}",
+            updates[0].body_markdown
+        );
+    }
+
+    /// Cross-scope targets cannot be checked against a per-project page set,
+    /// and `_global` is a reserved first-class scope, not a typo. Deleting
+    /// what we cannot verify would remove a documented capability; upstream
+    /// records these as pending links and so do we.
+    #[test]
+    fn sanitize_batch_links_leaves_cross_scope_targets_alone() {
+        let existing = page_set(["concepts/mobility.md"]);
+        let mut updates = vec![update_with_body(
+            "sessions/abc.md",
+            PageKind::Fact,
+            "Sessao",
+            "Ver [[_global:conventions]] e [[billing:audio-pipeline]], mas nao [[inventado]].",
+        )];
+
+        let removed = sanitize_batch_links(&mut updates, &existing);
+
+        assert!(
+            updates[0].body_markdown.contains("[[_global:conventions]]"),
+            "the reserved global scope survives: {}",
+            updates[0].body_markdown
+        );
+        assert!(
+            updates[0]
+                .body_markdown
+                .contains("[[billing:audio-pipeline]]"),
+            "a sibling project is not ours to judge: {}",
+            updates[0].body_markdown
+        );
+        assert!(
+            !updates[0].body_markdown.contains("[[inventado]]"),
+            "a same-project invention is still unwrapped: {}",
+            updates[0].body_markdown
+        );
+        assert_eq!(removed, 1);
+    }
+
+    /// An empty inventory must not cost the slots a third of the budget for
+    /// a block that renders as the empty string.
+    #[test]
+    fn empty_inventory_reserves_no_budget_from_slots() {
+        let slots: Vec<SlotSnapshot> = (0..6)
+            .map(|i| SlotSnapshot {
+                path: format!("_slots/s{i}.md"),
+                title: format!("slot {i}"),
+                slot_kind: SlotKind::Invariant,
+                body: "y".repeat(1_100),
+            })
+            .collect();
+        let budgets = PromptBudgets::from_limits(12_000, 1_000);
+
+        let without =
+            build_batch_request_with_slots(SessionId::new(), &[], &slots, &[], None, budgets);
+        let with_targets = build_batch_request_with_slots(
+            SessionId::new(),
+            &[],
+            &slots,
+            &[link_target("concepts/a.md", "A")],
+            None,
+            budgets,
+        );
+
+        let slot_chars = |req: &ChatRequest| req.messages[0].content.matches("slot_kind=").count();
+        assert!(
+            slot_chars(&without) >= slot_chars(&with_targets),
+            "no inventory must never mean fewer slots than with one",
+        );
+        assert!(
+            !without.messages[0]
+                .content
+                .contains("Existing pages in this project"),
+            "and no empty scaffold",
+        );
+    }
+
     /// Without the inventory the model has nothing to link to and invents
     /// slugs — the failure this block exists to stop.
     #[test]
@@ -3238,11 +3364,15 @@ mod tests {
         );
     }
 
+    fn page_set<const N: usize>(paths: [&str; N]) -> std::collections::BTreeSet<String> {
+        paths.iter().map(|p| (*p).to_string()).collect()
+    }
+
     /// The write boundary is the backstop: whatever the model emits, only
     /// links that resolve survive into the stored body.
     #[test]
-    fn sanitize_batch_links_keeps_inventory_and_siblings_only() {
-        let targets = [link_target("concepts/mobility.md", "Provedor Mobility")];
+    fn sanitize_batch_links_keeps_existing_pages_and_siblings_only() {
+        let existing = page_set(["concepts/mobility.md"]);
         let mut updates = vec![
             update_with_body(
                 "sessions/abc.md",
@@ -3264,11 +3394,11 @@ mod tests {
             ),
         ];
 
-        let removed = sanitize_batch_links(&mut updates, &targets);
+        let removed = sanitize_batch_links(&mut updates, &existing);
 
         assert!(
             updates[0].body_markdown.contains("[[concepts/mobility]]"),
-            "an inventory page stays linked: {}",
+            "an existing page stays linked: {}",
             updates[0].body_markdown
         );
         assert!(

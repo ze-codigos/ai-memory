@@ -4134,6 +4134,162 @@ mod tests {
         assert!(paths.contains(&"y.md"));
     }
 
+    /// The sanitizer's allowlist answers "does this page exist", which is a
+    /// different question from "should the prompt show it". Keeping them apart
+    /// is what stops a page the inventory omits — by kind, by cap, or by
+    /// budget — from having its inbound links deleted.
+    #[tokio::test]
+    async fn project_page_paths_lists_every_live_page_whatever_its_kind() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "allowlist", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "elsewhere", None)
+            .await
+            .unwrap();
+
+        for path in [
+            "concepts/a.md",
+            "sessions/b.md",
+            "_slots/c.md",
+            "log-2026-09.md",
+        ] {
+            store
+                .writer
+                .upsert_page(sample_page(ws, proj, path, "body"))
+                .await
+                .unwrap();
+        }
+        // Superseding must not double-count.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "concepts/a.md", "body v2"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, other, "concepts/foreign.md", "body"))
+            .await
+            .unwrap();
+
+        let paths = store.reader.project_page_paths(ws, proj).await.unwrap();
+        assert_eq!(
+            paths,
+            [
+                "_slots/c.md".to_string(),
+                "concepts/a.md".to_string(),
+                "log-2026-09.md".to_string(),
+                "sessions/b.md".to_string(),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+            "every live page in THIS project, once each, regardless of kind",
+        );
+    }
+
+    /// The consolidator has no `Concept` variant, so it stamps `kind: fact`
+    /// on every `concepts/` page it writes. Selecting on kind alone hid those
+    /// pages from the inventory — and before the allowlist split, got their
+    /// inbound links deleted.
+    #[tokio::test]
+    async fn link_target_pages_include_durable_paths_whose_frontmatter_says_fact() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "kinds", None)
+            .await
+            .unwrap();
+
+        let with_kind = |path: &str, kind: &str| {
+            let mut page = sample_page(ws, proj, path, "body");
+            page.frontmatter_json = serde_json::json!({ "kind": kind });
+            page
+        };
+        for page in [
+            with_kind("concepts/busca-multi.md", "fact"),
+            with_kind("procedures/runbook.md", "fact"),
+            // A session page the model happened to tag as a gotcha is still
+            // a narrative, and still not a link target.
+            with_kind("sessions/abc.md", "gotcha"),
+            with_kind("_slots/focus.md", "fact"),
+        ] {
+            store.writer.upsert_page(page).await.unwrap();
+        }
+
+        let targets = store.reader.link_target_pages(ws, proj, 50).await.unwrap();
+        let paths: Vec<&str> = targets.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            paths.contains(&"concepts/busca-multi.md"),
+            "a concepts/ page stamped `fact` is still a concept: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"procedures/runbook.md"),
+            "same for procedures/: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"sessions/abc.md"),
+            "a session stays out however it is tagged: {paths:?}"
+        );
+        assert!(!paths.contains(&"_slots/focus.md"), "slots stay out");
+    }
+
+    /// Frontmatter reaches the column unvalidated — the wiki is git-synced and
+    /// hand-editable, and a YAML `- 2026` parses as a number. One bad page
+    /// must not blank the topic line for the whole project.
+    #[tokio::test]
+    async fn topics_for_project_survives_malformed_tags() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "bad-tags", None)
+            .await
+            .unwrap();
+
+        let fm = |path: &str, tags: serde_json::Value| {
+            let mut page = sample_page(ws, proj, path, "body");
+            page.frontmatter_json = serde_json::json!({ "tags": tags });
+            page
+        };
+        for page in [
+            fm("concepts/ok.md", serde_json::json!(["carrus"])),
+            fm("gotchas/scalar.md", serde_json::json!("not-a-list")),
+            fm("decisions/numeric.md", serde_json::json!([2026, "carrus"])),
+            fm("procedures/object.md", serde_json::json!({"a": 1})),
+        ] {
+            store.writer.upsert_page(page).await.unwrap();
+        }
+
+        let topics = store.reader.topics_for_project(ws, proj, 10).await.unwrap();
+        assert_eq!(
+            topics,
+            vec!["carrus".to_string()],
+            "string tags survive, malformed shapes are skipped instead of \
+             poisoning the query",
+        );
+    }
+
     /// What the durable acervo is *about*, for the session-start brief: an
     /// agent that never learns a topic exists never thinks to search for it.
     #[tokio::test]

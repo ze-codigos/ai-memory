@@ -1509,6 +1509,11 @@ async fn render_requested_session_brief(
         .reader
         .topics_for_project(workspace_id, project_id, BRIEF_TOPICS_LIMIT)
         .await
+        .inspect_err(|error| {
+            // Degrade to a brief without topics rather than no brief at all,
+            // but say so: silently losing the line leaves nothing to chase.
+            tracing::warn!(%error, "topics unavailable; brief rendered without them");
+        })
         .unwrap_or_default();
     Ok(render_session_brief(&core, &recent, &topics, budget))
 }

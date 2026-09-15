@@ -16,10 +16,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project's durable pages (concept / decision / gotcha / procedure /
   rule, newest first, whole entries only when the budget bites) and
   names it as the only valid source of a target. At the write boundary
-  a link pointing anywhere else — including a sibling project — is
+  a link pointing at a same-project page that does not exist is
   unwrapped to plain text, keeping the words and dropping the false
   edge. Links to another page in the same batch still count, so a
-  session page can point at the gotcha written beside it.
+  session page can point at the gotcha written beside it, and
+  cross-scope links (`[[project:page]]`, `[[_global:page]]`) keep
+  their existing pending-link behaviour — a per-project page set
+  cannot judge them.
+- The link sanitizer checks "does this page exist", not "is this page
+  in the prompt inventory". Those are different sets: the inventory is
+  narrowed by kind, by a cap and by the prompt budget, so using it as
+  the allowlist deleted links to pages that plainly exist. The clearest
+  case was `concepts/` — `PageKind` has no `Concept` variant, so every
+  concept page consolidation writes is stamped `kind: fact`.
+- The inventory now selects on durable *paths* as well as kind, so a
+  `concepts/` or `procedures/` page stamped `kind: fact` is still
+  offered as a link target.
+- A malformed `tags` value (a scalar, or a YAML list item that parses
+  as a number) no longer errors the whole project's topic query. The
+  failure was silent: the brief simply lost its topic line, with
+  nothing logged. Non-array and non-string tags are now skipped in SQL,
+  and a genuine failure is logged.
+- An empty inventory no longer reserves a third of the optional prompt
+  budget away from the slot snapshots.
 
 ### Added
 - The session-start brief names the subjects a project's durable pages
