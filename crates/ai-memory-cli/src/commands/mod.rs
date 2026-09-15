@@ -25,6 +25,7 @@ pub mod delete_page;
 pub mod embed;
 pub mod export_okf;
 pub mod finalize_session;
+pub mod finish_session;
 pub mod forget_sweep;
 pub mod generate_auth_token;
 pub mod handoffs;

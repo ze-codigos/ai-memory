@@ -524,6 +524,9 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
             transcript,
             checkpoint,
             Some(exit_code),
+            // The launcher only reaches here after its child exited, so this
+            // import always closes the run.
+            true,
         )
         .await
     );
@@ -1144,7 +1147,7 @@ fn session_age(updated_at: SystemTime, now: SystemTime) -> String {
     super::humanize_age_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
-async fn export_after_flush(
+pub(crate) async fn export_after_flush(
     harness: ManagedHarness,
     home: &std::path::Path,
     cwd: &std::path::Path,
@@ -1185,17 +1188,26 @@ async fn export_after_flush(
     }
 }
 
-async fn import_batches(
+/// Send a transcript to the server in batches.
+///
+/// `close` says whether this import ends the run. The launcher always closes:
+/// it only ever imports after its child exited. Reconciliation of an adopted
+/// session does not — it cannot tell a dead session from an idle one, so it
+/// imports incrementally and leaves the run open for the real SessionEnd. An
+/// incremental pass also does not advance the durable source cursor, so the
+/// next one re-reads from the start and relies on event-id dedup.
+pub(crate) async fn import_batches(
     endpoint: &ServerEndpoint,
     run_path: &str,
     transcript: ExportedTranscript,
     checkpoint: ai_memory_core::WorkstreamCheckpoint,
     exit_code: Option<i32>,
+    close: bool,
 ) -> Result<usize> {
     let mut imported = 0;
     let mut batches = event_batches(transcript.events).into_iter().peekable();
     while let Some(batch) = batches.next() {
-        let complete = batches.peek().is_none();
+        let complete = close && batches.peek().is_none();
         let request = FinishManagedRunRequest {
             native_session_id: nonempty_session(&transcript.native_session_id),
             source_cursor: complete.then(|| transcript.source_cursor.clone()).flatten(),

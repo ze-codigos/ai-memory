@@ -323,6 +323,10 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         }
         Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
     }
+    // Adopted sessions: close the ones that ended, import the rest
+    // incrementally. After the spool on purpose — observations first, ledger
+    // second — and it reuses the bearer the drain above already warmed.
+    let _ = crate::commands::finish_session::finalize_adopted_runs(&dd).await;
     Ok(())
 }
 
