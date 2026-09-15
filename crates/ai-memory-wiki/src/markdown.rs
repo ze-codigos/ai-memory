@@ -291,6 +291,89 @@ fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKe
     }
 }
 
+/// Rewrite `body`, unwrapping every `[[wikilink]]` whose resolved target the
+/// `keep` predicate rejects. Returns the rewritten body and how many links
+/// were unwrapped.
+///
+/// "Unwrap" means the link syntax goes and the words stay: a rejected
+/// `[[foo|the foo page]]` becomes `the foo page`, and a rejected `[[foo]]`
+/// becomes `foo`. Nothing is deleted from the prose — only the claim that
+/// those words point at a page.
+///
+/// `keep` receives the target exactly as [`extract_links`] would record it:
+/// the optional workspace and project of a cross-scope link, plus the
+/// normalised wiki-root-relative path. A target that fails to normalise at
+/// all (a `.py` file, a bare `#anchor`, a URL) never reaches `keep` and is
+/// always unwrapped — the writer would drop it anyway, so leaving the
+/// brackets in the body only renders a dead link.
+///
+/// Fenced code blocks are copied through untouched, matching
+/// [`extract_links`]: a `[[…]]` inside a fence is sample text, not a link.
+#[must_use]
+pub fn retain_wikilinks<F>(body: &str, page_path: &PagePath, keep: F) -> (String, usize)
+where
+    F: Fn(Option<&str>, Option<&str>, &str) -> bool,
+{
+    let mut out = String::with_capacity(body.len());
+    let mut removed = 0usize;
+    let mut in_fence = false;
+
+    // `split_inclusive` keeps each line's terminator, so a body with or
+    // without a trailing newline round-trips unchanged when nothing matches.
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence || !line.contains("[[") {
+            out.push_str(line);
+            continue;
+        }
+        retain_wikilinks_in_line(line, page_path, &keep, &mut out, &mut removed);
+    }
+    (out, removed)
+}
+
+fn retain_wikilinks_in_line<F>(
+    line: &str,
+    page_path: &PagePath,
+    keep: &F,
+    out: &mut String,
+    removed: &mut usize,
+) where
+    F: Fn(Option<&str>, Option<&str>, &str) -> bool,
+{
+    let mut rest = line;
+    while let Some(start) = rest.find("[[") {
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let raw = &after_start[..end];
+        // Same peeling order as `extract_wikilinks`, so the path handed to
+        // `keep` is byte-identical to the one the writer would store.
+        let (target, label) = raw
+            .split_once('|')
+            .map_or((raw, None), |(target, label)| (target, Some(label)));
+        let (workspace, project, path_part) = split_scope(target.trim());
+        let kept = normalize_link_target(&path_part, page_path, true)
+            .is_some_and(|path| keep(workspace.as_deref(), project.as_deref(), &path));
+        if kept {
+            out.push_str("[[");
+            out.push_str(raw);
+            out.push_str("]]");
+        } else {
+            out.push_str(label.unwrap_or(target).trim());
+            *removed += 1;
+        }
+        rest = &after_start[end + 2..];
+    }
+    out.push_str(rest);
+}
+
 fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<LinkKey>) {
     let mut start_at = 0;
     while let Some(rel_start) = line[start_at..].find('[') {
@@ -493,6 +576,58 @@ mod tests {
             links
                 .iter()
                 .any(|l| l.relation == Some(ai_memory_core::Relation::Fixes))
+        );
+    }
+
+    #[test]
+    fn retain_wikilinks_unwraps_rejected_targets_and_keeps_known_ones() {
+        let page = PagePath::new("sessions/s.md").unwrap();
+        let known = ["concepts/mobility.md", "gotchas/venv.md"];
+        let body = "Ver [[concepts/mobility]] e tambem [[carrus-inventado]].\n\
+                    Com label: [[gotchas/venv|o gotcha do venv]].\n\
+                    Arquivo: [[nexus:application/postsale_service.py]].\n\
+                    ```\n\
+                    [[dentro/da/fence]]\n\
+                    ```\n";
+        let (out, removed) = retain_wikilinks(body, &page, |ws, proj, path| {
+            ws.is_none() && proj.is_none() && known.contains(&path)
+        });
+
+        assert!(
+            out.contains("[[concepts/mobility]]"),
+            "a known target keeps its link syntax: {out}"
+        );
+        assert!(
+            out.contains("[[gotchas/venv|o gotcha do venv]]"),
+            "a labelled known target survives untouched: {out}"
+        );
+        assert!(
+            !out.contains("[[carrus-inventado]]"),
+            "an invented slug loses its link syntax: {out}"
+        );
+        assert!(
+            out.contains("carrus-inventado"),
+            "unwrapping keeps the prose, it does not delete the words: {out}"
+        );
+        assert!(
+            !out.contains("[[nexus:application/postsale_service.py]]"),
+            "a source file is not a page and is unwrapped: {out}"
+        );
+        assert!(
+            out.contains("[[dentro/da/fence]]"),
+            "fenced code is never rewritten: {out}"
+        );
+        assert_eq!(removed, 2, "two links unwrapped");
+        assert!(out.ends_with('\n'), "the trailing newline survives");
+    }
+
+    #[test]
+    fn retain_wikilinks_unwrapped_body_records_no_link() {
+        let page = PagePath::new("sessions/s.md").unwrap();
+        let (out, _) = retain_wikilinks("Ver [[inventado]].", &page, |_, _, _| false);
+        assert!(
+            extract_links(&out, &page).is_empty(),
+            "the writer must find nothing left to record: {out}"
         );
     }
 

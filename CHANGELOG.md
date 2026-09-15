@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Batch consolidation now emits `[[wikilinks]]` that actually resolve.
+  The prompt asked for links but never showed the model which pages
+  exist, so it invented targets from names that scrolled past in the
+  observation log — one wiki reached 303 pages with a single resolving
+  link and 293 orphans. The prompt now carries an inventory of the
+  project's durable pages (concept / decision / gotcha / procedure /
+  rule, newest first, whole entries only when the budget bites) and
+  names it as the only valid source of a target. At the write boundary
+  a link pointing anywhere else — including a sibling project — is
+  unwrapped to plain text, keeping the words and dropping the false
+  edge. Links to another page in the same batch still count, so a
+  session page can point at the gotcha written beside it.
+
+### Added
+- The session-start brief names the subjects a project's durable pages
+  cover, so an agent learns a topic exists before it has to guess a
+  search for it. Drawn from page tags with `import-*` provenance marks
+  excluded; roughly 100 tokens, capped at 30 topics.
+
 ## [2.0.2] - 2026-09-03
 
 ### Fixed
