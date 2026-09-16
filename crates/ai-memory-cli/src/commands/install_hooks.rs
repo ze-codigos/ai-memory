@@ -105,6 +105,70 @@ pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// True when `~/.cursor/hooks.json` already registers a native ai-memory hook
+/// declared `--agent cursor`.
+///
+/// The Cursor CLI also runs the commands in Claude Code's settings, so on a
+/// host with both installs every Cursor event reaches `ai-memory hook` twice:
+/// once as `--agent cursor` and once as `--agent claude-code` carrying
+/// `cursor_version`. The hook uses this to drop the second copy (#721).
+/// Unreadable or malformed files count as "not installed" so the Claude Code
+/// path keeps capturing Cursor sessions on hosts without Cursor's own hooks.
+pub(crate) fn cursor_native_hooks_installed() -> bool {
+    cursor_hooks_path().is_ok_and(|path| cursor_native_hooks_installed_in(&path))
+}
+
+const MAX_CURSOR_HOOKS_BYTES: u64 = 1024 * 1024;
+
+pub(crate) fn cursor_native_hooks_installed_in(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut raw = String::new();
+    if file
+        .take(MAX_CURSOR_HOOKS_BYTES)
+        .read_to_string(&mut raw)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(serde_json::Value::as_array)
+                .flatten()
+                .any(|entry| is_ai_memory_hook_entry(entry) && declares_cursor_agent(entry))
+        })
+}
+
+fn declares_cursor_agent(entry: &serde_json::Value) -> bool {
+    if let Some(args) = entry.get("args").and_then(serde_json::Value::as_array) {
+        return args
+            .windows(2)
+            .any(|pair| pair[0] == "--agent" && pair[1] == "cursor");
+    }
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| {
+            let tokens: Vec<&str> = command
+                .split_whitespace()
+                .map(|t| t.trim_matches(['"', '\'']))
+                .collect();
+            tokens
+                .windows(2)
+                .any(|pair| pair[0] == "--agent" && pair[1] == "cursor")
+                || tokens.contains(&"--agent=cursor")
+                || command.contains("agent=cursor")
+        })
+}
+
 /// `~/.gemini/settings.json`.
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -348,13 +412,30 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     let persisted = if args.apply
         && let Some(token) = auth_token_owned.as_deref()
     {
-        crate::config::store_hook_auth_token(&config.data_dir, token).with_context(|| {
-            format!(
-                "storing the hook auth token under {}",
-                config.data_dir.display()
-            )
-        })?;
-        true
+        // A failure here must NOT abort the whole install (#743-audit F5). The
+        // common case is a docker-wrapper run where `data_dir` is `/data`, a
+        // named volume the container user cannot write — and which the HOST
+        // hooks would not read from anyway (they look under the host's
+        // `~/.local/share/ai-memory`). Aborting left the operator with no hooks
+        // and no capture. Fall back to embedding the credential the pre-#552 way
+        // (into the rendered hook config/env) so the hooks still authenticate,
+        // and warn loudly about the reduced protection and how to get the secure
+        // path back.
+        match crate::config::store_hook_auth_token(&config.data_dir, token) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "[ai-memory] warning: could not persist the hook auth token under {} ({e}); \
+                     embedding it in the rendered hook config instead so capture still works. \
+                     The token is then readable in that file / process argv. To keep it out \
+                     (recommended), install with a writable host data dir — e.g. \
+                     `AI_MEMORY_DATA_DIR=$HOME/.local/share/ai-memory` for the docker wrapper — \
+                     or a native `ai-memory` binary.",
+                    config.data_dir.display()
+                );
+                false
+            }
+        }
     } else {
         false
     };
@@ -379,7 +460,11 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     }
     let generated = matches!(
         args.agent,
-        AgentChoice::OpenCode | AgentChoice::Omp | AgentChoice::Pi | AgentChoice::Openclaw
+        AgentChoice::OpenCode
+            | AgentChoice::OpenCode2
+            | AgentChoice::Omp
+            | AgentChoice::Pi
+            | AgentChoice::Openclaw
     );
     if generated || local_hook_policy_v1_supported() {
         eprintln!(
@@ -419,12 +504,15 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         println!("capture mode: {capture_mode}");
         if capture_mode == "allowlist" {
             println!("  repositories without a .ai-memory.toml marker emit no lifecycle events");
-            // The gate lives inside the native hook binary, immediately before
-            // the spool write. A script install POSTs to the server directly
-            // and never runs it, so the mode is stored but unenforced. Saying
-            // nothing would leave an operator trusting a protection this
-            // install does not have — the exact failure #446 is about.
-            if !local_hook_policy_v1_supported() {
+            // The gate runs inside the native hook binary (immediately before
+            // the spool write) and, since #661, inside the generated
+            // TypeScript integrations' shared `capturePolicy` (before any
+            // POST). The only install left that reaches the server with no
+            // gate at all is the raw script fallback: it POSTs directly and
+            // never runs either enforcement point. Saying nothing would leave
+            // an operator trusting a protection this install does not have —
+            // the exact failure #446 is about.
+            if !generated && !local_hook_policy_v1_supported() {
                 println!(
                     "  WARNING: this install uses script hooks, which POST directly and \
                      cannot enforce the mode. Allowlist is stored but NOT in force here."
@@ -441,9 +529,14 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         // per-agent plumbing.
         args.project_strategy = install_project_strategy(&args);
         return match args.agent {
-            AgentChoice::OpenCode => apply_to_opencode_plugin(&server_url, auth, &args),
-            AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args),
-            AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args),
+            AgentChoice::OpenCode => {
+                apply_to_opencode_plugin(&server_url, auth, &args, &capture_mode)
+            }
+            AgentChoice::OpenCode2 => {
+                apply_to_opencode2_plugin(&server_url, auth, &args, &capture_mode)
+            }
+            AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args, &capture_mode),
+            AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args, &capture_mode),
             AgentChoice::ClaudeCode => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -504,7 +597,9 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_devin_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
-            AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
+            AgentChoice::Openclaw => {
+                openclaw_plugin::apply(&server_url, auth, &args, &capture_mode)
+            }
             AgentChoice::KimiCode => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -534,12 +629,24 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    // Preview must bake the same `CAPTURE_MODE` the next `--apply` would
+    // persist (#661) — resolved read-only so a bare preview never writes.
+    let preview_capture_mode = resolve_capture_mode(&config.data_dir, args.capture_mode);
     match args.agent {
-        AgentChoice::OpenCode => render_opencode_plugin(&server_url, auth, strategy),
-        AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy),
-        AgentChoice::Omp => {
-            render_omp_extension(&server_url, auth, strategy, args.profile.as_deref())
+        AgentChoice::OpenCode => {
+            render_opencode_plugin(&server_url, auth, strategy, &preview_capture_mode)
         }
+        AgentChoice::OpenCode2 => {
+            render_opencode2_plugin(&server_url, auth, strategy, &preview_capture_mode)
+        }
+        AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy, &preview_capture_mode),
+        AgentChoice::Omp => render_omp_extension(
+            &server_url,
+            auth,
+            strategy,
+            args.profile.as_deref(),
+            &preview_capture_mode,
+        ),
         AgentChoice::ClaudeCode => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -633,7 +740,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Openclaw => {
-            openclaw_plugin::render(&server_url, auth, strategy);
+            openclaw_plugin::render(&server_url, auth, strategy, &preview_capture_mode);
             Ok(())
         }
         AgentChoice::KimiCode => {
@@ -684,6 +791,26 @@ fn install_project_strategy(args: &InstallHooksArgs) -> Option<ProjectStrategyAr
         .and_then(|existing| baked_project_strategy(args.agent, existing))
 }
 
+/// The capture failure mode (#446) currently in force: an explicit
+/// `--capture-mode` flag wins, otherwise the value stored under `data_dir`
+/// from an earlier `--apply`, otherwise the historical `denylist` default.
+/// Read-only — used by both [`persist_capture_mode`] and the print-only
+/// preview path so a preview's baked `CAPTURE_MODE` matches what the next
+/// `--apply` would actually persist (#661).
+fn resolve_capture_mode(data_dir: &Path, requested: Option<CaptureModeArg>) -> String {
+    let Some(requested) = requested else {
+        let path = data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE);
+        return match fs::read_to_string(&path) {
+            Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => "allowlist".to_string(),
+            _ => "denylist".to_string(),
+        };
+    };
+    match requested {
+        CaptureModeArg::Allowlist => "allowlist".to_string(),
+        CaptureModeArg::Denylist => "denylist".to_string(),
+    }
+}
+
 /// Settle and persist the capture failure mode (#446), returning the mode now
 /// in force.
 ///
@@ -692,26 +819,19 @@ fn install_project_strategy(args: &InstallHooksArgs) -> Option<ProjectStrategyAr
 /// auto-refresh inside `ai-memory upgrade` — can never quietly downgrade an
 /// existing opt-in back to capture-by-default.
 fn persist_capture_mode(data_dir: &Path, requested: Option<CaptureModeArg>) -> Result<String> {
-    let path = data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE);
-    let Some(requested) = requested else {
-        return Ok(match fs::read_to_string(&path) {
-            Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => "allowlist".to_string(),
-            _ => "denylist".to_string(),
-        });
-    };
-    let value = match requested {
-        CaptureModeArg::Allowlist => "allowlist",
-        CaptureModeArg::Denylist => "denylist",
-    };
-    fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
-    // Atomically, because every reader maps an unrecognised value onto
-    // `denylist`: a torn write would not corrupt the opt-in, it would silently
-    // revert it to capture-by-default (`CONTRIBUTING.md`, "Atomic file writes
-    // only").
-    ai_memory_wiki::write_atomic(&path, format!("{value}\n").as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(value.to_string())
+    let value = resolve_capture_mode(data_dir, requested);
+    if requested.is_some() {
+        let path = data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE);
+        fs::create_dir_all(data_dir)
+            .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+        // Atomically, because every reader maps an unrecognised value onto
+        // `denylist`: a torn write would not corrupt the opt-in, it would
+        // silently revert it to capture-by-default (`CONTRIBUTING.md`,
+        // "Atomic file writes only").
+        ai_memory_wiki::write_atomic(&path, format!("{value}\n").as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(value)
 }
 
 /// Whether the Claude Code install should include its prompt-capture hook.
@@ -767,6 +887,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Cursor => cursor_hooks_path().ok()?,
             AgentChoice::GeminiCli => gemini_settings_path().ok()?,
             AgentChoice::OpenCode => opencode_plugin_path().ok()?,
+            AgentChoice::OpenCode2 => opencode2_plugin_path().ok()?,
             AgentChoice::Pi => pi_extension_path().ok()?,
             AgentChoice::Omp => omp_extension_path(args.profile.as_deref()).ok()?,
             AgentChoice::Openclaw => openclaw_plugin::default_plugin_dir()
@@ -793,9 +914,14 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
 /// TypeScript files carry an explicit ownership header.
 fn baked_project_strategy(agent: AgentChoice, existing: &str) -> Option<ProjectStrategyArg> {
     match agent {
-        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw => {
+        AgentChoice::OpenCode
+        | AgentChoice::OpenCode2
+        | AgentChoice::Pi
+        | AgentChoice::Omp
+        | AgentChoice::Openclaw => {
             let marker = match agent {
                 AgentChoice::OpenCode => "--agent opencode --apply`.",
+                AgentChoice::OpenCode2 => "--agent opencode2 --apply`.",
                 AgentChoice::Pi => "--agent pi --apply`.",
                 AgentChoice::Omp => "--agent omp --apply`.",
                 AgentChoice::Openclaw => "--agent openclaw --apply`.",
@@ -1022,6 +1148,11 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["mcp", "ai-memory"],
             "url",
         )),
+        McpClient::OpenCode2 => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "servers", "ai-memory"],
+            "url",
+        )),
         McpClient::Cursor => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -1089,6 +1220,14 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["context_servers", "ai-memory"],
             "url",
         )),
+        // MCP-only client: no AgentChoice counterpart routes here. Muse
+        // Code's hook surface is documented, but its SessionStart output
+        // contract is not, so no lifecycle integration claims it yet.
+        McpClient::Muse => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp_servers", "ai-memory"],
+            "url",
+        )),
     }
 }
 
@@ -1131,6 +1270,7 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Cursor => Some(McpClient::Cursor),
         AgentChoice::GeminiCli => Some(McpClient::GeminiCli),
         AgentChoice::OpenCode => Some(McpClient::OpenCode),
+        AgentChoice::OpenCode2 => Some(McpClient::OpenCode2),
         AgentChoice::Omp => Some(McpClient::Omp),
         AgentChoice::Openclaw => Some(McpClient::Openclaw),
         AgentChoice::AntigravityCli => Some(McpClient::AntigravityCli),
@@ -1913,8 +2053,8 @@ fn merge_codex_hooks(
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
     // Build the Codex-flavoured payload. The JSON shape is identical
-    // to Claude Code's matcher + nested hooks form — only the event
-    // list differs (no `SessionEnd`, which Codex doesn't recognise).
+    // to Claude Code's matcher + nested hooks form — the event list
+    // differs only by the Claude-Code-only subagent events.
     let payload = build_profile_payload_for_agent(
         &super::render_shared::CODEX_PROFILE,
         staged,
@@ -1940,12 +2080,6 @@ fn merge_codex_payload(payload: serde_json::Value, config_path: &Path) -> Result
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
                 .context("`hooks` is present in hooks.json but not an object")?;
-            // Remove any stale `SessionEnd` entry left behind by an
-            // earlier version of install-hooks that mistakenly wrote
-            // the Claude-Code-only event into Codex's file. Codex
-            // ignores unknown events but the file looks cleaner
-            // without dead keys.
-            hooks.remove("SessionEnd");
             for (event, value) in &our_hooks {
                 overlay_event_hooks(hooks, event, value);
             }
@@ -2005,7 +2139,58 @@ fn apply_to_cursor_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    warn_unrecognized_ai_memory_hooks(&path);
     Ok(())
+}
+
+/// Warn about hook entries that mention ai-memory but are not recognised as
+/// ours, e.g. a wrapper shim that injects `cwd` before calling the binary.
+/// `install-hooks` keeps those beside the native entries it adds, so every
+/// event would then be captured twice (#721). Best effort: never fails apply.
+fn warn_unrecognized_ai_memory_hooks(path: &Path) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    for (event, command) in unrecognized_ai_memory_hook_entries(&root) {
+        eprintln!(
+            "# warning: {} `{event}` hook `{command}` mentions ai-memory but is not an \
+             ai-memory hook entry, so it was kept beside the native one and the event \
+             may be captured twice. Remove it if it wraps ai-memory.",
+            path.display()
+        );
+    }
+}
+
+fn unrecognized_ai_memory_hook_entries(root: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(hooks) = root.get("hooks").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (event, entries) in hooks {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        for entry in entries.iter().filter(|e| !is_ai_memory_hook_entry(e)) {
+            let handlers = entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .map_or_else(|| vec![entry], |inner| inner.iter().collect());
+            for handler in handlers {
+                let Some(command) = handler.get("command").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let lower = command.to_ascii_lowercase();
+                if lower.contains("ai-memory") || lower.contains("ai_memory") {
+                    found.push((event.clone(), command.to_string()));
+                }
+            }
+        }
+    }
+    found
 }
 
 fn merge_cursor_hooks(
@@ -2727,13 +2912,14 @@ fn apply_to_opencode_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
+    capture_mode: &str,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => opencode_plugin_path()?,
     };
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let body = build_opencode_plugin(server_url, auth_token, strategy);
+    let body = build_opencode_plugin(server_url, auth_token, strategy, capture_mode);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
     println!(
@@ -2759,6 +2945,7 @@ fn render_opencode_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> Result<()> {
     println!("// OpenCode plugin — write to ~/.config/opencode/plugins/ai-memory.ts");
     println!("// Or re-run with `--apply` to install it automatically.");
@@ -2766,10 +2953,334 @@ fn render_opencode_plugin(
     println!();
     println!(
         "{}",
-        build_opencode_plugin(server_url, auth_token, project_strategy)
+        build_opencode_plugin(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
+
+/// `~/.config/opencode/plugins/ai-memory-opencode2.ts` — the OpenCode 2.0
+/// beta plugin file. The beta shares v1's config dir and session store but
+/// not its plugin API, so this is a distinct file from `ai-memory.ts`
+/// (uninstall keys each file to its own banner + agent constant).
+pub(crate) fn opencode2_plugin_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.config/opencode")?
+        .join(".config")
+        .join("opencode")
+        .join("plugins")
+        .join("ai-memory-opencode2.ts"))
+}
+
+/// Generate an OpenCode 2.0 beta plugin at
+/// `~/.config/opencode/plugins/ai-memory-opencode2.ts`.
+///
+/// The beta's plugin API (`Plugin.define({ id, setup })` with
+/// `ctx.session.hook` / `ctx.tool.hook` / `ctx.event.subscribe`) is
+/// incompatible with v1's function plugin, so the beta gets its own file.
+/// Both files share the one auto-loaded dir while the beta is side-by-side;
+/// a host may warn about its sibling's file (API mismatch) — that warning
+/// is benign, and `uninstall` removes each file only on its own ownership
+/// markers.
+fn apply_to_opencode2_plugin(
+    server_url: &str,
+    auth_token: Option<&str>,
+    args: &InstallHooksArgs,
+    capture_mode: &str,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => opencode2_plugin_path()?,
+    };
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let body = build_opencode2_plugin(server_url, auth_token, strategy, capture_mode)?;
+
+    let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new plugin file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    if !matches!(outcome, ApplyOutcome::NoOp) {
+        println!();
+        println!("OpenCode 2 auto-loads plugins from ~/.config/opencode/plugins/ on next start.");
+        println!("If you're already inside an `opencode2` session, restart it for the");
+        println!("new plugin to take effect.");
+    }
+    Ok(())
+}
+
+fn render_opencode2_plugin(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+) -> Result<()> {
+    println!(
+        "// OpenCode 2.0 beta plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts"
+    );
+    println!("// Or re-run with `--apply` to install it automatically.");
+    println!("// Restart OpenCode 2 after changing plugins; config is loaded at startup.");
+    println!();
+    println!(
+        "{}",
+        build_opencode2_plugin(server_url, auth_token, project_strategy, capture_mode)?
+    );
+    Ok(())
+}
+
+/// Build the beta plugin from the v1 template. The capture prelude (hook
+/// queue + spooling, marker resolution, capture policy, session maps,
+/// `/hook` + `/handoff` helpers) is host-independent and reused verbatim;
+/// only the host binding is rewritten for the V2 API. Anchors are plain
+/// rendered-TS constants like the spool patch's: a template edit that moves
+/// them fails loudly here instead of shipping a half-v1 plugin.
+fn build_opencode2_plugin(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+) -> Result<String> {
+    let v1 = build_opencode_plugin(server_url, auth_token, project_strategy, capture_mode);
+    const BANNER_V1: &str =
+        "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.";
+    const BANNER_V2: &str =
+        "// Auto-generated by `ai-memory install-hooks --agent opencode2 --apply`.";
+    const AGENT_V1: &str = "const AGENT = \"open-code\";";
+    const AGENT_V2: &str = "const AGENT = \"opencode2\";";
+    // Start of the v1 host binding through end of file. Everything before
+    // this line (including the spooled delivery path) is shared.
+    const V1_BINDING_ANCHOR: &str =
+        "\nexport const AiMemoryHooks: Plugin = async ({ directory }) => {";
+    // `replacen` silently keeps the v1 text when its anchor moves, which
+    // would ship a half-v1 plugin — fail loudly instead, like the spool
+    // patch's anchors do.
+    let out = replace_opencode_anchor(&v1, BANNER_V1, BANNER_V2, "banner")?;
+    let out = replace_opencode_anchor(&out, AGENT_V1, AGENT_V2, "agent constant")?;
+    let Some(binding_at) = out.find(V1_BINDING_ANCHOR) else {
+        anyhow::bail!("opencode2 template drifted: v1 host binding anchor not found");
+    };
+    let mut rebuilt = out[..binding_at].to_string();
+    rebuilt.push_str(OPENCODE2_BINDING);
+    Ok(rebuilt)
+}
+
+fn replace_opencode_anchor(haystack: &str, from: &str, to: &str, what: &str) -> Result<String> {
+    if !haystack.contains(from) {
+        anyhow::bail!("opencode2 template drifted: v1 {what} anchor not found");
+    }
+    Ok(haystack.replacen(from, to, 1))
+}
+
+/// V2 host binding for the shared capture prelude: the beta's `{ id, setup }`
+/// plugin shape with its session/tool/event hooks (verified against
+/// `@opencode-ai/plugin@beta`, including a `tsc --noEmit` pass over the
+/// rendered file). Lifecycle arrives on `ctx.event.subscribe` whose
+/// envelopes carry `{ type, data, location }` (v1's `event.properties`
+/// is kept as a fallback because the beta schema is still changing).
+/// Handoff injection moved from v1's removed
+/// `experimental.chat.system.transform` to the `context` hook, which edits
+/// the outgoing model call without persisting into history — guarded to
+/// inject once per session because it fires on every continuation.
+const OPENCODE2_BINDING: &str = r#"
+// `Plugin.define` is an identity wrapper, so the binding exports the
+// `{ id, setup }` shape directly and keeps the shared `import type` line:
+// a runtime import of `@opencode-ai/plugin` does not resolve from the
+// global plugins dir and fails the load.
+const AiMemoryOpencode2: Plugin = {
+  id: "ai-memory-opencode2",
+  setup: async (ctx) => {
+    const ctxAny = ctx as any;
+    const directory = ctxAny?.location?.directory;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const evt of ctx.event.subscribe({ signal: controller.signal })) {
+          const event = evt as any;
+          const type = event?.type;
+          const data = event?.data ?? event?.properties ?? {};
+          const info = data?.info ?? {};
+          const loc = data?.location?.directory ?? data?.directory
+            ?? event?.location?.directory ?? directory;
+          if (type === "session.created") {
+            const id = data?.sessionID ?? data?.id ?? info?.id;
+            startSession(id, data?.location?.directory ?? loc, {
+              title: data?.title ?? info?.title,
+              projectID: data?.projectID ?? info?.projectID,
+            });
+          }
+          if (type === "session.idle") {
+            const id = data?.sessionID ?? data?.id;
+            startSession(id, cwdFor(id, loc));
+            postHook("stop", { sessionID: id, cwd: cwdFor(id, loc) });
+          }
+          if (type === "session.deleted") {
+            const id = data?.sessionID ?? data?.id ?? info?.id;
+            endSession(id, loc, data?.directory ?? info?.directory);
+          }
+          if (type === "session.compaction.started") {
+            const id = data?.sessionID ?? data?.id;
+            postPreCompact(id, loc);
+          }
+          if (type === "session.compacted") {
+            const id = data?.sessionID ?? data?.id;
+            postPreCompact(id, loc);
+          }
+        }
+      } catch (_e) {
+        // The stream ends on unload. Capture is best-effort and must never
+        // break the host.
+      }
+    })();
+    const promptRegistration = await ctx.session.hook("prompt", (event) => {
+      const e = event as any;
+      const id = e?.sessionID;
+      const prompt = e?.prompt ?? {};
+      const cwd = cwdFor(id, directory);
+      startSession(id, cwd, { agent: prompt?.agent, model: prompt?.model });
+      postHook("user-prompt", {
+        sessionID: id,
+        cwd,
+        agent: prompt?.agent,
+        model: prompt?.model,
+        messageID: e?.messageID,
+        prompt: typeof prompt?.text === "string" ? prompt.text : textFromParts(prompt?.parts),
+      });
+    });
+    const handoffInjected = new Set<string>();
+    const contextRegistration = await ctx.session.hook("context", async (event) => {
+      const e = event as any;
+      const id = e?.sessionID;
+      if (!id || handoffInjected.has(id)) return;
+      startSession(id, cwdFor(id, directory));
+      let pending = handoffFetches.get(id);
+      if (!pending) {
+        pending = fetchHandoff(cwdFor(id, directory), id);
+        handoffFetches.set(id, pending);
+      }
+      const handoff = await pending;
+      if (handoff) {
+        // SystemPart is `{ type: "text", text }` — the `type` discriminator
+        // is required: without it the host fails the model call with a
+        // schema validation error (observed live on beta-18999).
+        e.system.push({ type: "text", text: handoff });
+        handoffInjected.add(id);
+      }
+    });
+    const beforeRegistration = await ctx.tool.hook("execute.before", (event) => {
+      const e = event as any;
+      const id = e?.sessionID;
+      startSession(id, cwdFor(id, directory));
+      postHook("pre-tool-use", {
+        sessionID: id,
+        cwd: cwdFor(id, directory),
+        tool: e?.tool,
+        callID: e?.id,
+        args: e?.input,
+      });
+    });
+    const afterRegistration = await ctx.tool.hook("execute.after", (event) => {
+      const e = event as any;
+      const id = e?.sessionID;
+      startSession(id, cwdFor(id, directory));
+      // The beta reports failures on the same channel (`status: "error"`,
+      // no `result`); keep the message where v1 kept output so the
+      // failure reason survives consolidation.
+      const failed = e?.status === "error";
+      postHook("post-tool-use", {
+        sessionID: id,
+        cwd: cwdFor(id, directory),
+        tool: e?.tool,
+        callID: e?.id,
+        args: e?.input,
+        title: failed ? undefined : e?.result?.title,
+        output: failed
+          ? String(e?.error?.message ?? e?.error ?? "tool failed")
+          : e?.result?.output,
+        metadata: failed ? undefined : e?.result?.metadata,
+      });
+    });
+    return async () => {
+      controller.abort();
+      for (const registration of [
+        promptRegistration,
+        contextRegistration,
+        beforeRegistration,
+        afterRegistration,
+      ]) {
+        try {
+          await registration.dispose();
+        } catch (_e) {
+          // Unload is best-effort; a dead host has nothing to unregister.
+        }
+      }
+      for (const id of Array.from(startedSessions)) {
+        endSession(id, directory);
+      }
+      await drainHookQueueForDispose();
+    };
+  },
+};
+
+export default AiMemoryOpencode2;
+"#;
+/// `findSettingsMarker` mirrors the native `find_settings_marker` (`marker.rs`)
+/// and the shell `ai_memory_find_settings_marker` (`hooks/_lib.sh`), #668:
+/// the same ancestor walk and HOME/`.git` boundary as `findMarker`, but a
+/// marker that declares nothing beyond `[capture]` is transparent — the walk
+/// skips it and continues to the next ancestor. That keeps a nested
+/// capture-only marker (e.g. one that only sets `ignore_paths`) from
+/// shadowing an outer marker's `workspace`/`project`/etc, without changing
+/// `[capture]`/`ignore_paths` resolution itself (that stays on `findMarker`,
+/// the nearest marker, in the separate capture-policy template). The
+/// boundary walk is duplicated from `findMarker` rather than shared, on
+/// purpose: `findMarker` stays untouched, well-exercised, nearest-marker
+/// behavior for every other caller.
+pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(text: string): boolean {
+  for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures"]) {
+    if (tomlKey(text, key) !== undefined) return true;
+  }
+  for (const key of ["default_global", "inject_on_session_start", "max_chars"]) {
+    if (tomlFlag(text, key) !== undefined) return true;
+  }
+  return false;
+}
+
+function findSettingsMarker(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  let dir = resolve(cwd);
+  const home = homedir();
+  let boundary: string | undefined;
+  if (home && (dir === home || dir.startsWith(home.endsWith(sep) ? home : home + sep))) {
+    boundary = home;
+  } else if (home) {
+    let probe = dir;
+    while (probe && probe !== dirname(probe)) {
+      if (existsSync(join(probe, ".git"))) {
+        boundary = probe;
+        break;
+      }
+      probe = dirname(probe);
+    }
+    boundary ??= dir;
+  }
+  while (dir && dir !== dirname(dir)) {
+    const marker = join(dir, ".ai-memory.toml");
+    if (existsSync(marker)) {
+      try {
+        if (declaresSettings(readFileSync(marker, "utf8"))) return marker;
+      } catch (_e) {
+      }
+    }
+    if (boundary && dir === boundary) return undefined;
+    dir = dirname(dir);
+  }
+  return undefined;
+}"#;
 
 /// Emit the `applyMarkerParams` TypeScript function shared verbatim by the
 /// OpenCode plugin and the OMP extension.
@@ -2780,14 +3291,18 @@ fn render_opencode_plugin(
 /// that install-time default when no marker pins a `project_strategy` (#128).
 /// A marker's own `project` / `project_strategy` still take precedence (§3.3),
 /// and repo-root is resolved host-side via `repoRootProject`.
+///
+/// Scope/settings resolution walks past a capture-only marker to the nearest
+/// ancestor marker that declares a setting (#668) via `findSettingsMarker`,
+/// emitted alongside this function.
 fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     let Some(default) = default_strategy else {
         return format!(
-            "{TS_TOML_FLAG}\n{}",
+            "{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   const managedRun = process.env.AI_MEMORY_RUN_ID;
   if (managedRun) url.searchParams.set("managed_run", managedRun);
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (!marker || !cwd) return;
   url.searchParams.set("cwd", cwd);
   try {
@@ -2827,7 +3342,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
       const body = readFileSync(marker, "utf8");
@@ -2855,7 +3370,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{body}",
         ts_string_literal(default)
     )
 }
@@ -2917,6 +3432,7 @@ fn add_hook_spooling(source: String) -> Result<String> {
       }"#;
     const ENQUEUE_ANCHOR: &str = "function enqueueHook(";
     let runtime = crate::commands::render_shared::ts_spool_runtime();
+    let resolve_fn = crate::commands::render_shared::ts_resolve_token_fn();
     if !source.contains(FETCH_BLOCK) {
         anyhow::bail!(
             "TS integration template drifted: the hook delivery block the \
@@ -2927,7 +3443,11 @@ fn add_hook_spooling(source: String) -> Result<String> {
         anyhow::bail!("TS integration template drifted: enqueueHook anchor not unique");
     }
     let mut out = source.replacen(FETCH_BLOCK, FETCH_REPLACEMENT, 1);
-    out = out.replacen(ENQUEUE_ANCHOR, &format!("{runtime}{ENQUEUE_ANCHOR}"), 1);
+    out = out.replacen(
+        ENQUEUE_ANCHOR,
+        &format!("{resolve_fn}{runtime}{ENQUEUE_ANCHOR}"),
+        1,
+    );
     // Drain the offline spool alongside every queue flush, and extend the
     // imports the runtime needs.
     let drain_anchor =
@@ -2956,12 +3476,13 @@ fn build_opencode_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> String {
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
     let apply_marker_params = ts_apply_marker_params(project_strategy);
-    let capture_policy = ts_capture_policy_v1();
+    let capture_policy = ts_capture_policy_v1(capture_mode);
     let body = format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.
 // Edit by re-running the command, not by hand — install-hooks
@@ -2986,7 +3507,8 @@ function timeoutSignal(ms: number): AbortSignal | undefined {{
 }}
 
 function authHeaders(): Record<string, string> {{
-  return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
+  const token = resolveToken();
+  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
 }}
 
 const HOOK_QUEUE_MAX = 100;
@@ -3222,6 +3744,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
+    if (!response.ok) return undefined;
     const text = (await response.text()).trim();
     return text.length > 0 ? text : undefined;
   }} catch (_e) {{
@@ -3423,10 +3946,11 @@ fn apply_to_omp_extension(
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
+    capture_mode: &str,
 ) -> Result<()> {
     let path = resolve_omp_extension_path(args)?;
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let body = build_omp_extension(server_url, auth_token, strategy);
+    let body = build_omp_extension(server_url, auth_token, strategy, capture_mode);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
     println!(
@@ -3483,6 +4007,7 @@ fn render_omp_extension(
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
     profile: Option<&str>,
+    capture_mode: &str,
 ) -> Result<()> {
     println!(
         "// Oh My Pi / OMP extension — write to {}",
@@ -3493,7 +4018,7 @@ fn render_omp_extension(
     println!();
     println!(
         "{}",
-        build_omp_extension(server_url, auth_token, project_strategy)
+        build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -3515,10 +4040,11 @@ fn apply_to_pi_extension(
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
+    capture_mode: &str,
 ) -> Result<()> {
     let path = resolve_pi_extension_path(args)?;
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let body = build_pi_extension(server_url, auth_token, strategy);
+    let body = build_pi_extension(server_url, auth_token, strategy, capture_mode);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
     println!(
@@ -3547,6 +4073,7 @@ fn render_pi_extension(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> Result<()> {
     println!(
         "// Pi extension — write to {}",
@@ -3557,7 +4084,7 @@ fn render_pi_extension(
     println!();
     println!(
         "{}",
-        build_pi_extension(server_url, auth_token, project_strategy)
+        build_pi_extension(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -3573,8 +4100,9 @@ fn build_pi_extension(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> String {
-    let lifecycle = build_omp_extension(server_url, auth_token, project_strategy)
+    let lifecycle = build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
         .replace("install-hooks --agent omp --apply", "install-hooks --agent pi --apply")
         .replace("const AGENT = \"omp\";", "const AGENT = \"pi\";")
         .replace(
@@ -3687,12 +4215,13 @@ fn build_omp_extension(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> String {
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
     let apply_marker_params = ts_apply_marker_params(project_strategy);
-    let capture_policy = ts_capture_policy_v1();
+    let capture_policy = ts_capture_policy_v1(capture_mode);
     let body = format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent omp --apply`.
 // Edit by re-running the command, not by hand — install-hooks
@@ -3716,7 +4245,8 @@ function timeoutSignal(ms: number): AbortSignal | undefined {{
 }}
 
 function authHeaders(): Record<string, string> {{
-  return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
+  const token = resolveToken();
+  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
 }}
 
 const HOOK_QUEUE_MAX = 100;
@@ -3724,12 +4254,14 @@ const HOOK_FLUSH_INTERVAL_MS = 2000;
 const HOOK_FLUSH_THRESHOLD = 20;
 const HOOK_INTER_REQUEST_DELAY_MS = 50;
 const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
 const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
 
 type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
 const hookQueue: HookQueueItem[] = [];
 let hookFlushTimer: ReturnType<typeof setTimeout> | undefined;
 let hookDraining = false;
+let hookDrainPromise: Promise<void> | undefined;
 
 function sleep(ms: number): Promise<void> {{
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -3739,16 +4271,37 @@ function scheduleHookFlush(): void {{
   if (hookFlushTimer) return;
   hookFlushTimer = setTimeout(() => {{
     hookFlushTimer = undefined;
-    void drainHookQueue();
+    void requestHookDrain();
   }}, HOOK_FLUSH_INTERVAL_MS);
   hookFlushTimer.unref?.();
+}}
+
+function requestHookDrain(): Promise<void> {{
+  if (!hookDrainPromise) {{
+    hookDrainPromise = drainHookQueue().finally(() => {{
+      hookDrainPromise = undefined;
+      if (hookQueue.length > 0) void requestHookDrain();
+    }});
+  }}
+  return hookDrainPromise;
+}}
+
+function disposeDrainTimeout(): Promise<void> {{
+  return new Promise((resolve) => {{
+    const timer = setTimeout(resolve, HOOK_DISPOSE_DRAIN_BUDGET_MS);
+    timer.unref?.();
+  }});
+}}
+
+async function drainHookQueueForDispose(): Promise<void> {{
+  await Promise.race([requestHookDrain(), disposeDrainTimeout()]);
 }}
 
 function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void {{
   if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();
   hookQueue.push({{ event, url, payload }});
   if (HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD) {{
-    void drainHookQueue();
+    void requestHookDrain();
   }} else {{
     scheduleHookFlush();
   }}
@@ -3779,7 +4332,6 @@ async function drainHookQueue(): Promise<void> {{
     }}
   }} finally {{
     hookDraining = false;
-    if (hookQueue.length > 0) void drainHookQueue();
   }}
 }}
 
@@ -3936,6 +4488,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
+    if (!response.ok) return undefined;
     const text = (await response.text()).trim();
     return text.length > 0 ? text : undefined;
   }} catch (_e) {{
@@ -4011,9 +4564,10 @@ export default function AiMemoryExtension(api: any): void {{
     postHook("stop", sessionPayload(ctx));
   }});
 
-  api.on("session_shutdown", (_event: any, ctx: any) => {{
+  api.on("session_shutdown", async (_event: any, ctx: any) => {{
     startSession(ctx);
     postHook("session-end", sessionPayload(ctx));
+    await drainHookQueueForDispose();
   }});
 }}
 "#,
@@ -5234,6 +5788,17 @@ fn apply_to_pool(
 mod tests {
     use super::*;
 
+    /// The marker-presence admit gate the shared `ts_capture_policy_v1`
+    /// template bakes into `capturePolicy` (#661). Under allowlist a
+    /// repository with no `.ai-memory.toml` marker must emit nothing —
+    /// mirroring `repository_admits_capture` in
+    /// `ai-memory-hooks::capture_policy`, the gate hook.rs's native path
+    /// runs before any per-event disposition. Keyed on `findMarker(cwd)`
+    /// presence rather than `config.state`, so a marker with an empty
+    /// `[capture]` section — `state` is "inactive" either way — still admits
+    /// capture.
+    const CAPTURE_ADMIT_GATE_TS: &str = "const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === \"allowlist\" && !markerPresent) return { disposition: \"drop\", payload };";
+
     /// #446's binding requirement: "a protection that disappears on upgrade
     /// without saying so is worse than no protection". A bare `--apply` — what
     /// `ai-memory upgrade` runs — must leave an existing opt-in alone.
@@ -5817,6 +6382,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
     fn baked_project_strategy_reads_every_owned_generated_integration() {
         for (agent, name) in [
             (AgentChoice::OpenCode, "opencode"),
+            (AgentChoice::OpenCode2, "opencode2"),
             (AgentChoice::Pi, "pi"),
             (AgentChoice::Omp, "omp"),
             (AgentChoice::Openclaw, "openclaw"),
@@ -6061,8 +6627,9 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             &[CODEX_PROFILE.events],
         );
         assert!(codex.contains("stop"));
+        assert!(codex.contains("session-end"));
         assert!(
-            !codex.contains("session-end") && !codex.contains("subagent-start"),
+            !codex.contains("subagent-start") && !codex.contains("subagent-stop"),
             "Codex manual output must omit scripts outside Codex's hook vocabulary: {codex}"
         );
     }
@@ -7328,6 +7895,59 @@ model = "gpt-5"
         );
     }
 
+    /// F5 (docker-wrapper audit), the regression guard: when the bearer
+    /// *cannot* be persisted under the data dir, `--apply` must still install
+    /// working hooks by embedding the credential inline instead of aborting the
+    /// whole install with no hooks at all.
+    ///
+    /// The real case is the docker wrapper: `data_dir` is `/data`, a container
+    /// volume the host hooks never read from and that the container user often
+    /// cannot write. Before this fix a persist failure hard-aborted, leaving the
+    /// operator with neither the secure path nor any capture at all.
+    #[test]
+    fn apply_falls_back_to_inline_bearer_when_persisting_fails() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+
+        // Make ONLY the secret write fail — like a data dir the installer cannot
+        // write the token into — while leaving hook staging (which writes under
+        // `<data_dir>/hooks/`) fully working: pre-create the `<data_dir>/auth-token`
+        // path as a *directory*, so `write_secret`'s file open returns EISDIR.
+        std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
+
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("FALLBACK-BEARER-F5".to_string()),
+            config_file: Some(settings.clone()),
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        // The whole point of the fix: a persist failure must not abort the install.
+        run(&config, args).expect("apply must not abort when the bearer cannot be persisted");
+
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            rendered.contains("FALLBACK-BEARER-F5"),
+            "the bearer must be embedded inline so the hooks still authenticate: {rendered}"
+        );
+
+        // It genuinely took the fallback, not the secure path: nothing persisted.
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir),
+            None,
+            "the token must not have been persisted in the failure case"
+        );
+    }
+
     #[test]
     fn hook_source_candidates_include_native_package_dir() {
         let candidates = hook_source_candidates(
@@ -7461,15 +8081,15 @@ model = "gpt-5"
         for (name, source) in [
             (
                 "opencode",
-                build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None),
+                build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist"),
             ),
             (
                 "omp",
-                build_omp_extension("http://127.0.0.1:49374", Some("tok"), None),
+                build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist"),
             ),
             (
                 "pi",
-                build_pi_extension("http://127.0.0.1:49374", Some("tok"), None),
+                build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist"),
             ),
         ] {
             // The fire-and-forget delivery must be gone...
@@ -7558,7 +8178,7 @@ model = "gpt-5"
 
     #[test]
     fn opencode_plugin_uses_real_plugin_hooks() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert!(plugin.contains("event: async (input)"));
         assert!(plugin.contains(r#""chat.message": async"#));
@@ -7586,6 +8206,21 @@ model = "gpt-5"
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: applyMarkerParams resolves scope/settings via the
+        // settings-walk, not the nearest-marker findMarker, so a nested
+        // capture-only marker does not shadow an outer marker's scope.
+        assert!(plugin.contains("function findSettingsMarker"));
+        assert!(plugin.contains("function declaresSettings"));
+        assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(plugin.contains(
+            "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\"])"
+        ));
+        assert!(plugin.contains(
+            "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\"])"
+        ));
+        assert!(
+            plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(plugin.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
@@ -7612,7 +8247,7 @@ model = "gpt-5"
         assert!(plugin.contains("handoffFetches.delete(id);"));
         assert!(plugin.contains("preCompactLast.delete(id);"));
         assert!(plugin.contains("postHook(\"user-prompt\""));
-        assert!(plugin.contains("Bearer ${TOKEN}"));
+        assert!(plugin.contains("Bearer ${token}"));
         assert!(plugin.contains("tok"));
         assert!(
             !plugin.contains(r#""session.created": async"#),
@@ -7634,8 +8269,130 @@ model = "gpt-5"
     }
 
     #[test]
+    fn opencode2_plugin_binds_the_v2_api() {
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist")
+                .unwrap();
+
+        // Ownership markers the uninstall gate keys on.
+        assert!(plugin.contains("install-hooks --agent opencode2 --apply"));
+        assert!(plugin.contains("const AGENT = \"opencode2\";"));
+        // Type-only import: `Plugin.define` is identity, and a runtime
+        // import does not resolve from the global plugins dir (the beta
+        // refuses the load). The host only needs the `{ id, setup }` shape.
+        assert!(plugin.contains("import type { Plugin } from \"@opencode-ai/plugin\";"));
+        assert!(!plugin.contains("export default Plugin.define"));
+        assert!(!plugin.contains("Plugin.define({"));
+        assert!(plugin.contains("const AiMemoryOpencode2: Plugin = {"));
+        assert!(plugin.contains("export default AiMemoryOpencode2;"));
+        // Beta hooks, verified against `@opencode-ai/plugin@beta`.
+        assert!(plugin.contains("ctx.event.subscribe"));
+        assert!(plugin.contains("ctx.session.hook(\"prompt\""));
+        assert!(plugin.contains("ctx.session.hook(\"context\""));
+        assert!(plugin.contains("ctx.tool.hook(\"execute.before\""));
+        assert!(plugin.contains("ctx.tool.hook(\"execute.after\""));
+        // V2 lifecycle envelopes carry `{ type, data, location }`.
+        for event in [
+            "session.created",
+            "session.idle",
+            "session.deleted",
+            "session.compacted",
+        ] {
+            assert!(plugin.contains(event), "missing {event}");
+        }
+        // Handoff injection moved off v1's removed experimental hook and
+        // fires once per session (the context hook runs per model call).
+        // System items are `{ type: "text", text }` objects on the V2 API, not strings.
+        assert!(plugin.contains("handoffInjected"));
+        assert!(plugin.contains("system.push({ type: \"text\", text: handoff })"));
+        assert!(!plugin.contains("experimental."));
+        // Hook registrations are disposed on unload so a reload cannot
+        // leave stale callbacks capturing twice.
+        assert!(plugin.contains("registration.dispose()"));
+        // Pre-compaction arrives on its own start event; the completion
+        // event stays as the consolidation trigger, like v1.
+        assert!(plugin.contains("session.compaction.started"));
+        // Tool failures share the channel with the reason preserved.
+        assert!(plugin.contains("status === \"error\""));
+        // No v1 remnants.
+        assert!(!plugin.contains("export default AiMemoryHooks"));
+        assert!(!plugin.contains("chat.message"));
+        // Shared capture prelude survived the rewrite byte-identical.
+        for shared in [
+            "function startSession",
+            "function endSession",
+            "postHook(\"session-start\"",
+            "postHook(\"user-prompt\"",
+            "function applyMarkerParams",
+            "requestSpoolDrain();",
+        ] {
+            assert!(plugin.contains(shared), "missing {shared}");
+        }
+        // #625 made the generated adapters resolve the bearer at runtime
+        // (resolveToken() -> `${token}`) instead of the static `${TOKEN}`;
+        // the opencode2 plugin derives from v1 so it inherits that.
+        assert!(plugin.contains("Bearer ${token}"));
+        assert!(plugin.contains("tok"));
+    }
+
+    #[test]
+    fn opencode2_plugin_rejects_v1_template_drift() {
+        // The builder rewrites the v1 template, so a v1 edit that moves the
+        // binding anchor must fail loudly instead of shipping a hybrid.
+        let plugin = build_opencode2_plugin(
+            "http://127.0.0.1:49374/",
+            None,
+            Some("repo-root"),
+            "denylist",
+        )
+        .unwrap();
+        assert!(plugin.contains("const TOKEN: string | null = null;"));
+        assert!(
+            plugin.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
+            "strategy bake-through must survive the v2 rewrite"
+        );
+    }
+
+    #[test]
+    fn opencode2_anchor_rewrite_fails_loudly_on_drift() {
+        let err =
+            replace_opencode_anchor("no v1 anchors here", "missing", "x", "banner").unwrap_err();
+        assert!(
+            err.to_string().contains("banner"),
+            "drift must name the moved anchor: {err:#}"
+        );
+    }
+
+    #[test]
+    fn opencode2_plugin_bakes_allowlist_admit_gate() {
+        // opencode2 reuses v1's capture prelude verbatim (see
+        // `build_opencode2_plugin`'s doc comment), so the gate must survive
+        // the anchor rewrite into the beta's `{ id, setup }` host binding.
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist")
+                .unwrap();
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{plugin}"
+        );
+        assert!(plugin.contains(CAPTURE_ADMIT_GATE_TS), "{plugin}");
+    }
+
+    #[test]
+    fn opencode2_plugin_denylist_bakes_inert_gate() {
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist")
+                .unwrap();
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{plugin}"
+        );
+        assert!(plugin.contains(CAPTURE_ADMIT_GATE_TS), "{plugin}");
+    }
+
+    #[test]
     fn opencode_plugin_normalizes_payloads_without_legacy_wrapper() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374/", None, None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374/", None, None, "denylist");
 
         assert!(plugin.contains("const SERVER = \"http://127.0.0.1:49374/\".replace"));
         assert!(plugin.contains("const TOKEN: string | null = null;"));
@@ -7652,8 +8409,12 @@ model = "gpt-5"
 
     #[test]
     fn opencode_plugin_bakes_repo_root_default() {
-        let plugin =
-            build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), Some("repo-root"));
+        let plugin = build_opencode_plugin(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            Some("repo-root"),
+            "denylist",
+        );
         assert!(
             plugin.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
             "repo-root install default must bake the const: {plugin}"
@@ -7666,11 +8427,15 @@ model = "gpt-5"
             plugin.contains("if (repoProject) project = repoProject;"),
             "{plugin}"
         );
+        assert!(
+            plugin.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
+        );
     }
 
     #[test]
     fn opencode_plugin_default_omits_baked_strategy() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(
             !plugin.contains("DEFAULT_PROJECT_STRATEGY"),
             "basename default must bake no strategy: {plugin}"
@@ -7678,10 +8443,56 @@ model = "gpt-5"
     }
 
     #[test]
+    fn opencode_plugin_bakes_allowlist_admit_gate() {
+        let plugin =
+            build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{plugin}"
+        );
+        assert!(plugin.contains(CAPTURE_ADMIT_GATE_TS), "{plugin}");
+    }
+
+    #[test]
+    fn opencode_plugin_denylist_bakes_inert_gate() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{plugin}"
+        );
+        assert!(plugin.contains(CAPTURE_ADMIT_GATE_TS), "{plugin}");
+    }
+
+    #[test]
     fn opencode_plugin_uses_bounded_hook_queue() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert_generated_ts_uses_bounded_hook_queue(&plugin);
+    }
+
+    #[test]
+    fn opencode_plugin_resolves_token_at_runtime_when_not_embedded() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(plugin.contains("function resolveToken("));
+        assert!(plugin.contains("const token = resolveToken();"));
+        assert!(plugin.contains("if (!response.ok) return undefined;"));
+    }
+
+    #[test]
+    fn omp_extension_resolves_token_at_runtime_when_not_embedded() {
+        let extension = build_omp_extension("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(extension.contains("function resolveToken("));
+        assert!(extension.contains("process.env.AI_MEMORY_AUTH_TOKEN"));
+        assert!(extension.contains("auth-token"));
+        assert!(extension.contains("if (!response.ok) return undefined;"));
+    }
+
+    #[test]
+    fn omp_extension_prefers_statically_embedded_token() {
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(extension.contains("function resolveToken("));
+        assert!(extension.contains("if (TOKEN) return TOKEN;"));
     }
 
     // ----------------------------------------------------------------
@@ -7689,8 +8500,31 @@ model = "gpt-5"
     // ----------------------------------------------------------------
 
     #[test]
+    fn omp_extension_bakes_allowlist_admit_gate() {
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
+    fn omp_extension_denylist_bakes_inert_gate() {
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
     fn omp_extension_uses_native_lifecycle_events() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert!(extension.contains("export default function AiMemoryExtension"));
         assert!(extension.contains("const AGENT = \"omp\";"));
@@ -7714,11 +8548,21 @@ model = "gpt-5"
         assert!(extension.contains("tomlFlag(body, \"default_global\")"));
         assert!(extension.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(extension.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: same settings-walk as the OpenCode plugin (shared
+        // `ts_apply_marker_params`), so a nested capture-only marker does
+        // not shadow an outer marker's scope for the OMP/pi extensions.
+        assert!(extension.contains("function findSettingsMarker"));
+        assert!(extension.contains("function declaresSettings"));
+        assert!(extension.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(
+            extension
+                .contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(extension.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
         assert!(extension.contains("applyMarkerParams(url, cwd);"));
-        assert!(extension.contains("Bearer ${TOKEN}"));
+        assert!(extension.contains("Bearer ${token}"));
         assert!(extension.contains("tok"));
         assert!(
             extension
@@ -7734,12 +8578,32 @@ model = "gpt-5"
                 .contains("projectStrategy === \"repo-root\" || projectStrategy === \"repo_root\"")
         );
         assert!(extension.contains("url.searchParams.set(\"project\", repoProject)"));
+        // #676: pi/omp await session_shutdown's dispose flush instead of
+        // returning immediately, so the runtime teardown that follows a sync
+        // handler no longer kills the in-flight session-end fetch.
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(extension.contains("let hookDrainPromise: Promise<void> | undefined;"));
+        assert!(extension.contains("function requestHookDrain(): Promise<void>"));
+        assert!(extension.contains("function disposeDrainTimeout(): Promise<void>"));
+        assert!(extension.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(
+            extension.contains("api.on(\"session_shutdown\", async (_event: any, ctx: any) => {")
+        );
+        assert!(extension.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !extension.contains("api.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
+            "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
     }
 
     #[test]
     fn omp_extension_bakes_repo_root_default() {
-        let extension =
-            build_omp_extension("http://127.0.0.1:49374", Some("tok"), Some("repo-root"));
+        let extension = build_omp_extension(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            Some("repo-root"),
+            "denylist",
+        );
         assert!(
             extension.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
             "repo-root install default must bake the const: {extension}"
@@ -7748,11 +8612,16 @@ model = "gpt-5"
             extension.contains("if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;"),
             "{extension}"
         );
+        assert!(
+            extension.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {extension}"
+        );
     }
 
     #[test]
     fn omp_extension_default_omits_baked_strategy() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(
             !extension.contains("DEFAULT_PROJECT_STRATEGY"),
             "{extension}"
@@ -7761,7 +8630,8 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_uses_bounded_hook_queue() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert_generated_ts_uses_bounded_hook_queue(&extension);
     }
@@ -8079,8 +8949,32 @@ model = "gpt-5"
     }
 
     #[test]
+    fn pi_extension_bakes_allowlist_admit_gate() {
+        // Pi is `build_omp_extension` with the AGENT constant swapped, so the
+        // gate must survive that string-replace rewrite too.
+        let extension =
+            build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
+    fn pi_extension_denylist_bakes_inert_gate() {
+        let extension = build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
     fn pi_extension_contains_lifecycle_capture_and_mcp_bridge() {
-        let extension = build_pi_extension("http://127.0.0.1:49374/base", Some("tok"), None);
+        let extension =
+            build_pi_extension("http://127.0.0.1:49374/base", Some("tok"), None, "denylist");
 
         assert!(extension.contains("export default function AiMemoryExtension(pi: any): void"));
         assert!(extension.contains("const AGENT = \"pi\";"));
@@ -8125,12 +9019,26 @@ model = "gpt-5"
         assert!(extension.contains("payload?.result?.isError"));
         assert!(extension.contains("response.ok"));
         assert!(extension.contains("signal: mcpSignal(signal)"));
-        assert!(extension.contains("Bearer ${TOKEN}"));
+        assert!(extension.contains("Bearer ${token}"));
         assert!(extension.contains("tok"));
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(!extension.contains(".omp"));
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
+        // #676: the pi string-transform (api.on( -> pi.on() must still
+        // produce an async session_shutdown handler that awaits the bounded
+        // dispose flush, mirroring the omp source it derives from.
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(extension.contains("function requestHookDrain(): Promise<void>"));
+        assert!(extension.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(
+            extension.contains("pi.on(\"session_shutdown\", async (_event: any, ctx: any) => {")
+        );
+        assert!(extension.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !extension.contains("pi.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
+            "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
     }
 
     // Windows 11 + Git Bash support matters for regulated enterprise setups
@@ -8244,6 +9152,81 @@ model = "gpt-5"
     }
 
     #[test]
+    fn cursor_native_hooks_detection_requires_an_ai_memory_cursor_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.json");
+        assert!(!cursor_native_hooks_installed_in(&path), "missing file");
+
+        fs::write(&path, "not json").unwrap();
+        assert!(!cursor_native_hooks_installed_in(&path), "malformed file");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"sessionStart":[
+                {"command":"/opt/third-party","args":["--agent","cursor"]},
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            !cursor_native_hooks_installed_in(&path),
+            "third-party or non-cursor entries do not count"
+        );
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","stop","--agent","cursor","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(cursor_native_hooks_installed_in(&path), "exec form");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory hook --event stop --agent cursor --server-url http://h"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            cursor_native_hooks_installed_in(&path),
+            "command-string form"
+        );
+    }
+
+    #[test]
+    fn unrecognized_ai_memory_hook_entries_flags_wrappers_only() {
+        let root = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "sessionStart": [
+                    {"command": "/usr/bin/ai-memory", "args": ["hook", "--event", "session-start", "--agent", "cursor", "--server-url", "http://h"]},
+                    {"command": "~/bin/ai-memory-cwd-shim.sh session-start"},
+                    {"command": "/opt/other-tool --flag"}
+                ],
+                "stop": [
+                    {"matcher": "", "hooks": [{"command": "/home/u/.local/ai_memory_wrap stop"}]}
+                ]
+            }
+        });
+        let found = unrecognized_ai_memory_hook_entries(&root);
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "sessionStart".to_string(),
+                    "~/bin/ai-memory-cwd-shim.sh session-start".to_string()
+                ),
+                (
+                    "stop".to_string(),
+                    "/home/u/.local/ai_memory_wrap stop".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn cursor_apply_is_idempotent() {
         let hooks_tmp = TempDir::new().unwrap();
         stub_scripts(
@@ -8305,6 +9288,7 @@ model = "gpt-5"
                 "post-tool-use.sh",
                 "pre-compact.sh",
                 "stop.sh",
+                "session-end.sh",
             ],
         );
 
@@ -8333,13 +9317,13 @@ model = "gpt-5"
             "SessionStart hook should be present"
         );
         assert!(
-            parsed["hooks"].get("SessionEnd").is_none(),
-            "Codex has no reliable true SessionEnd hook; install must omit it"
+            parsed["hooks"]["SessionEnd"].is_array(),
+            "SessionEnd is wired for Codex since Codex CLI 0.145.0"
         );
     }
 
     #[test]
-    fn codex_removes_stale_session_end_key() {
+    fn codex_session_end_preserves_third_party_and_adds_ours() {
         let hooks_tmp = TempDir::new().unwrap();
         stub_scripts(
             hooks_tmp.path(),
@@ -8350,16 +9334,16 @@ model = "gpt-5"
                 "post-tool-use.sh",
                 "pre-compact.sh",
                 "stop.sh",
+                "session-end.sh",
             ],
         );
 
         let config_tmp = TempDir::new().unwrap();
         let config_path = config_tmp.path().join("hooks.json");
-        // Simulate a file with a stale SessionEnd entry from a previous
-        // install that mistakenly included the Claude-Code-only event.
+        // A third-party SessionEnd hook the user wired up themselves.
         fs::write(
             &config_path,
-            r#"{"hooks":{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"stale.sh"}]}]}}"#,
+            r#"{"hooks":{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"user-own.sh"}]}]}}"#,
         )
         .unwrap();
 
@@ -8375,13 +9359,19 @@ model = "gpt-5"
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        // SessionEnd must be gone.
+        let session_end = parsed["hooks"]["SessionEnd"].as_array().unwrap();
+        let rendered = serde_json::to_string(&parsed["hooks"]["SessionEnd"]).unwrap();
+        // Third-party entry survives.
         assert!(
-            parsed["hooks"].get("SessionEnd").is_none(),
-            "stale SessionEnd must be removed; got: {:?}",
-            parsed["hooks"]
+            rendered.contains("user-own.sh"),
+            "third-party SessionEnd entry must survive: {rendered}"
         );
-        // Our hooks are present.
+        // Our managed entry was added alongside it.
+        assert!(
+            rendered.contains("session-end"),
+            "ai-memory SessionEnd entry must be added: {rendered}"
+        );
+        assert_eq!(session_end.len(), 2);
         assert!(parsed["hooks"]["SessionStart"].is_array());
     }
 

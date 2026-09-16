@@ -22,13 +22,62 @@ pub struct ConsolidatedPage {
     /// outputs still deserialise.
     #[serde(default)]
     pub summary: Option<String>,
-    /// Typed edges to existing pages (2.0 item 3). Keys are the closed
-    /// vocabulary `causes` / `fixes` / `contradicts`; values are wiki
-    /// paths of the target pages. Only declare a relation when the
-    /// session's evidence states it plainly — an empty map is the
-    /// normal case. Unknown keys are dropped at the write boundary.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub relations: std::collections::BTreeMap<String, Vec<String>>,
+    /// Typed edges to existing pages (2.0 item 3). One field per
+    /// closed-vocabulary relation kind; values are wiki paths of the target
+    /// pages. Only declare a relation when the session's evidence states it
+    /// plainly — all-empty is the normal case.
+    #[serde(default)]
+    pub relations: Relations,
+}
+
+/// Typed edges emitted by consolidation, one field per closed relation
+/// kind (`causes` / `fixes` / `contradicts`).
+///
+/// This is a **fixed-shape object, not an open map**, deliberately (#630).
+/// An open `BTreeMap` renders as a JSON-Schema `additionalProperties` map,
+/// which OpenAI's strict structured-output mode cannot express — the strict
+/// normaliser closes it to `additionalProperties: false`, so the model was
+/// structurally unable to ever emit a relation on every OpenAI-family
+/// provider (the edges silently never appeared). Three named array fields
+/// are strict-expressible and serialise to the same `relations:` frontmatter
+/// object the wiki write boundary already parses, so nothing downstream
+/// changes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+// Keep implementation history out of the model's input budget.
+#[schemars(
+    description = "Typed edges to existing wiki pages. Declare only relations supported by the session's evidence; empty arrays are the normal case."
+)]
+pub struct Relations {
+    /// Wiki paths this page describes a cause of.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causes: Vec<String>,
+    /// Wiki paths whose described problem this page fixes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixes: Vec<String>,
+    /// Wiki paths this page contradicts (the lint pass surfaces these).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contradicts: Vec<String>,
+}
+
+impl Relations {
+    /// Whether no relation of any kind is declared (the normal case).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.causes.is_empty() && self.fixes.is_empty() && self.contradicts.is_empty()
+    }
+
+    /// The `(relation, targets)` pairs that are non-empty, in vocabulary
+    /// order — what the write boundary turns into typed links.
+    pub fn non_empty(&self) -> impl Iterator<Item = (ai_memory_core::Relation, &[String])> {
+        [
+            (ai_memory_core::Relation::Causes, &self.causes),
+            (ai_memory_core::Relation::Fixes, &self.fixes),
+            (ai_memory_core::Relation::Contradicts, &self.contradicts),
+        ]
+        .into_iter()
+        .filter(|(_, targets)| !targets.is_empty())
+        .map(|(rel, targets)| (rel, targets.as_slice()))
+    }
 }
 
 /// Semantic classification of one consolidated page. Surfaced into
@@ -120,6 +169,7 @@ pub struct ConsolidatedPageUpdate {
     /// `{ "type": "string" }` with no constraint, and both Kimi
     /// and qwen3 routinely emitted `tier: 2` (integer) instead of
     /// the documented string values.
+    #[schemars(description = "Tier classification: working, episodic, semantic, or procedural.")]
     pub tier: Tier,
     /// Semantic classification. Defaults to `fact` if the LLM
     /// doesn't supply one — existing consolidations without this
@@ -137,6 +187,9 @@ pub struct ConsolidatedPageUpdate {
     /// this field verbatim. Omit it rather than guessing. Defaults to absent
     /// so existing structured outputs still deserialise.
     #[serde(default)]
+    #[schemars(
+        description = "One plain sentence describing the page. No heading, bullet, list item, or repeated title. Omit rather than guess."
+    )]
     pub summary: Option<String>,
     /// Optional tags surfaced into frontmatter.
     #[serde(default)]
@@ -154,6 +207,10 @@ pub struct ConsolidatedPageUpdate {
     /// to empty so older structured outputs still deserialise.
     #[serde(default)]
     pub entities: Vec<String>,
+    /// Typed edges to existing pages, using the same closed vocabulary as
+    /// single-page consolidation. Older outputs may omit the field.
+    #[serde(default)]
+    pub relations: Relations,
 }
 
 /// Batch produced by [`ConsolidatorMulti`].

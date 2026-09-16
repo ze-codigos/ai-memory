@@ -52,7 +52,7 @@ struct FinalizeSessionReport {
 /// Returns an error if the configured server cannot list the scope's open
 /// sessions or rejects a synthetic `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
-    let agent = args.agent.kind();
+    let agent = args.agent;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -87,6 +87,12 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
         .await?;
         finalized.push(session.session_id.clone());
     }
+
+    // Agents with hook-maintained session state (ZCode: no SessionEnd event)
+    // keep a stored id in `<data_dir>/hook-state/<agent>-session-id`; once the
+    // session is finalized server-side, the stored id must go too, or the next
+    // agent session would inherit the closed id.
+    super::hook::clear_session_id(&config.data_dir, agent);
 
     print_report(args, workspace, project, agent, finalized)
 }

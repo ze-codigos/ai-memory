@@ -180,10 +180,19 @@ pub(crate) fn ts_string_literal(s: &str) -> String {
 /// The single capture-policy-v1 implementation embedded in every generated
 /// JavaScript integration.  It deliberately has no package dependency: these
 /// extensions run in several hosts with different module loaders.
+///
+/// `capture_mode` is the baked `--capture-mode` value ("allowlist" or
+/// "denylist", the same string [`crate::commands::install_hooks`]'s
+/// `persist_capture_mode` returns) and is spliced into the emitted
+/// `CAPTURE_MODE` constant that `capturePolicy` gates on. Under allowlist a
+/// repository with no `.ai-memory.toml` marker must emit nothing — mirroring
+/// the native admit gate in `commands/hook.rs` (`repository_admits_capture`)
+/// — so the check runs before any disposition logic, for every event kind.
 #[must_use]
-pub(crate) fn ts_capture_policy_v1() -> &'static str {
-    r##"// capture-policy-v1 (generated; do not fork between adapters)
+pub(crate) fn ts_capture_policy_v1(capture_mode: &str) -> String {
+    const TEMPLATE: &str = r##"// capture-policy-v1 (generated; do not fork between adapters)
 const CAPTURE_POLICY_V1 = 1;
+const CAPTURE_MODE: "allowlist" | "denylist" = "__AI_MEMORY_CAPTURE_MODE__";
 const CAPTURE_MARKER_MAX_BYTES = 64 * 1024;
 const CAPTURE_MAX_PATTERNS = 128;
 const CAPTURE_MAX_PATTERN_CHARS = 1024;
@@ -261,8 +270,9 @@ function captureConfig(cwd: string | undefined): CaptureConfig {
 }
 function captureGlob(pattern: string, candidate: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const p = [...pattern]; const c = [...candidate]; const eq = (a: string, b: string) => insensitive && a.charCodeAt(0) < 128 && b.charCodeAt(0) < 128 ? a.toLowerCase() === b.toLowerCase() : a === b; const previous = new Array<boolean>(p.length + 1).fill(false); previous[0] = true; for (let j = 1; j <= p.length; j++) previous[j] = p[j - 1] === "*" && p[j] !== "*" && previous[j - 1]; for (const ch of c) { const current = new Array<boolean>(p.length + 1).fill(false); for (let j = 1; j <= p.length; j++) { if (++budget.work > CAPTURE_MAX_WORK) return undefined; const x = p[j - 1]; current[j] = x === "*" && p[j] === "*" ? false : x === "*" && j >= 2 && p[j - 2] === "*" ? current[j - 2] || previous[j] : x === "*" ? current[j - 1] || (ch !== "/" && previous[j]) : x === "?" ? ch !== "/" && previous[j - 1] : eq(x, ch) && previous[j - 1]; } for (let j = 0; j <= p.length; j++) previous[j] = current[j]; } return previous[p.length]; }
 function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","execute","run_command","web_search"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && tool.family === "file") disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p))); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
-"##
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && tool.family === "file") disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p))); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+"##;
+    TEMPLATE.replace("__AI_MEMORY_CAPTURE_MODE__", capture_mode)
 }
 
 /// Build the Claude Code `settings.json` fragment that wires the
@@ -754,16 +764,20 @@ pub(crate) struct HookProfile {
 }
 
 /// Codex's hook-event vocabulary (per the openai/codex source —
-/// see `codex-rs/config/src/hooks_tests.rs`). Same shape as Claude
-/// Code's six common events, EXCEPT: Codex has no `SessionEnd` (it
-/// uses `Stop` for both turn-end and session-end signalling).
-pub(crate) const CODEX_EVENTS: [(&str, &str); 6] = [
+/// see `codex-rs/config/src/hook_config.rs`). Same nested shape as
+/// Claude Code. `SessionEnd` shipped in Codex CLI 0.145.0 (openai/codex
+/// PR #33895, "Add SessionEnd hooks for thread teardown"); it is a
+/// root-session-only event that runs synchronously during thread
+/// teardown. Codex still has no `SubagentStart`/`SubagentStop` in a
+/// first-party-supported form here, so those stay Claude-Code-only.
+pub(crate) const CODEX_EVENTS: [(&str, &str); 7] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
 ];
 
 /// Command Code's stable shell-hook vocabulary. Mods expose more lifecycle
@@ -1503,20 +1517,36 @@ fn hook_command(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
+            // Antigravity's executor wraps the whole command in `cmd /c "…"`
+            // and does not strip inner quotes, so it needs the bare form
+            // (#611); every other Windows agent keeps the double-quoted form.
+            let bare = windows_hook_command_is_bare(context.agent);
+            let quote = if bare {
+                NativeQuote::WindowsBare
+            } else {
+                NativeQuote::Windows
+            };
+            let quote_field = |s: &str| {
+                if bare {
+                    s.to_string()
+                } else {
+                    win_double_quote(s)
+                }
+            };
             let mut cmd = format!(
                 "{}{}{} hook --event {event} --agent {agent} --server-url {}",
                 powershell_call_operator(context.agent),
-                win_double_quote(&exe),
-                native_data_dir_arg(context.data_dir, NativeQuote::Windows),
-                win_double_quote(server_url),
+                quote_field(&exe),
+                native_data_dir_arg(context.data_dir, quote),
+                quote_field(server_url),
                 agent = context.agent,
             );
             if let Some(t) = auth_token {
-                cmd.push_str(&format!(" --auth-token {}", win_double_quote(t)));
+                cmd.push_str(&format!(" --auth-token {}", quote_field(t)));
             }
             cmd.push_str(&native_project_strategy_arg(
                 context.project_strategy,
-                NativeQuote::Windows,
+                quote,
             ));
             cmd.push_str(native_capture_assistant_arg(context, event));
             cmd
@@ -1624,6 +1654,23 @@ fn plain_windows_path_arg(path: &Path) -> String {
 enum NativeQuote {
     Posix,
     Windows,
+    /// Windows, but with NO surrounding double quotes. Antigravity's hook
+    /// executor runs the `command` string through `cmd /c "<string>"`, and
+    /// cmd does not strip the inner quotes, so a quoted `"C:\…\ai-memory.exe"`
+    /// is reported as "not recognized" and crashes the session (#611). The
+    /// whole-string wrapping means a bare path is what actually runs; a path
+    /// with a space in it is a known residual limitation (as it was before
+    /// the native-hook rendering added quotes).
+    WindowsBare,
+}
+
+/// Whether an agent's Windows hook executor needs the command rendered
+/// WITHOUT surrounding quotes (it wraps the whole string in `cmd /c "…"`
+/// and does not strip inner quotes). Antigravity CLI is the confirmed
+/// case (#611); other Windows JSON-hook agents run the command in a form
+/// where the double quotes are correct, so they keep them.
+fn windows_hook_command_is_bare(agent: &str) -> bool {
+    agent == "antigravity-cli"
 }
 
 fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
@@ -1636,6 +1683,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     match quote {
         NativeQuote::Posix => format!(" --data-dir {}", shell_quote(&path)),
         NativeQuote::Windows => format!(" --data-dir {}", win_double_quote(&path)),
+        NativeQuote::WindowsBare => format!(" --data-dir {path}"),
     }
 }
 
@@ -1649,6 +1697,7 @@ fn native_project_strategy_arg(strategy: Option<&str>, quote: NativeQuote) -> St
     match quote {
         NativeQuote::Posix => format!(" --project-strategy {}", shell_quote(strategy)),
         NativeQuote::Windows => format!(" --project-strategy {}", win_double_quote(strategy)),
+        NativeQuote::WindowsBare => format!(" --project-strategy {strategy}"),
     }
 }
 
@@ -1764,6 +1813,46 @@ fn claude_code_windows_command_is_unchanged_by_the_codex_fix() {
 /// `hook-spool` on-disk contract (same filenames, same `SpoolEntry` JSON,
 /// same permissions) plus a self-drain. Callers only need `TOKEN`,
 /// `timeoutSignal`, and the node `join`/`homedir`/fs imports in scope.
+/// Runtime credential fallback shared by every generated TypeScript
+/// integration. #552 moved the bearer out of generated files into a 0600
+/// `<data_dir>/auth-token` file and taught the native hook runtimes to read
+/// it back, but the generated TS adapters kept rendering `TOKEN = null`
+/// under `--apply` and had no equivalent read-back, so every request went
+/// out unauthenticated against a Bearer-enabled server. Generated files
+/// call this from `authHeaders()` and the spool writer. Needs `TOKEN`,
+/// `join`, `homedir`, `existsSync`, and `readFileSync` (as `readMarkerText`)
+/// in scope — the same surface `ts_spool_runtime` already assumes.
+pub(crate) fn ts_resolve_token_fn() -> &'static str {
+    r#"
+// Resolve the server bearer per request. A statically embedded token wins
+// (inline installs), then the environment, then the 0600 auth-token file
+// that `install-hooks --apply` persists under the data dir (#552).
+function resolveToken(): string | null {
+  if (TOKEN) return TOKEN;
+  const envToken = process.env.AI_MEMORY_AUTH_TOKEN;
+  if (envToken && envToken.trim()) return envToken.trim();
+  try {
+    const dataDir = process.env.AI_MEMORY_DATA_DIR?.trim();
+    const base = dataDir
+      ? dataDir
+      : process.platform === "darwin"
+        ? join(homedir(), "Library", "Application Support", "ai-memory")
+        : process.platform === "win32"
+          ? join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "ai-memory")
+          : join(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"), "ai-memory");
+    const tokenPath = join(base, "auth-token");
+    if (existsSync(tokenPath)) {
+      const fromFile = readMarkerText(tokenPath, "utf-8").trim();
+      if (fromFile) return fromFile;
+    }
+  } catch {
+    // Best effort: an unreadable token file leaves auth absent.
+  }
+  return null;
+}
+"#
+}
+
 pub(crate) fn ts_spool_runtime() -> &'static str {
     r#"
 // ---- offline spool (#580): the same on-disk contract as `ai-memory hook` ----
@@ -1796,7 +1885,7 @@ function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): v
     const key = `ts${createdMs.toString(16)}${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
     const u = new URL(String(url));
     if (!u.searchParams.has("ingest_key")) u.searchParams.set("ingest_key", key);
-    const token = TOKEN;
+    const token = resolveToken();
     const entry = {
       url: u.toString(),
       body: JSON.stringify(payload),
@@ -1895,6 +1984,18 @@ mod tests {
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>();
         String::from_utf16(&utf16).expect("invalid UTF-16 PowerShell program")
+    }
+
+    #[cfg(windows)]
+    fn command_for_available_powershell(command: &str, exe: &str) -> String {
+        if exe.eq_ignore_ascii_case("powershell.exe") {
+            command.to_owned()
+        } else {
+            format!(
+                "function powershell.exe {{ & {} @args }}; {command}",
+                powershell_quote(exe)
+            )
+        }
     }
 
     fn build_posix_hook_payload(
@@ -2045,7 +2146,7 @@ const activeKeep = capturePolicy({{ tool: "bash", args: {{ command: privateBody 
 check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 && activeKeep.protocol.policy_state === "active", "active-keep-adds-protocol");
 "#,
             fixture = fixture,
-            policy = ts_capture_policy_v1(),
+            policy = ts_capture_policy_v1("denylist"),
         );
         fs::write(&module, source).unwrap();
         let output = Command::new("node")
@@ -2077,6 +2178,60 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
                 "Node diagnostics leaked a private sentinel"
             );
         }
+
+        // #661: under `--capture-mode allowlist`, a repository with no marker
+        // must emit nothing at all — for a prompt/session event as much as a
+        // file event, since `inspect` (and its `search-list`/`file` families)
+        // is never reached for those event kinds. A repository WITH a marker
+        // but an empty `[capture]` section must still be admitted: `state`
+        // is "inactive" in both the no-marker and marker-with-no-section
+        // cases, so the gate must key on marker *presence*, never on
+        // `config.state`, or this second case would be wrongly dropped.
+        let allowlist_module = temp.path().join("capture-policy-allowlist-evidence.ts");
+        let allowlist_source = format!(
+            r#"import {{ closeSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, writeFileSync }} from "node:fs";
+import {{ dirname, join, resolve }} from "node:path";
+import {{ homedir }} from "node:os";
+
+const markerRoot = process.argv[2]!;
+const markerFixtures = new Map<string, string>();
+function findMarker(cwd: string | undefined): string | undefined {{ return cwd ? markerFixtures.get(cwd) : undefined; }}
+{policy}
+
+function fail(label: string): never {{ throw new Error(`allowlist runtime evidence failed: ${{label}}`); }}
+function check(ok: unknown, label: string): asserts ok {{ if (!ok) fail(label); }}
+
+const promptDrop = capturePolicy({{ prompt: "hello" }}, "/no-marker-allowlist");
+check(promptDrop.disposition === "drop", "allowlist-no-marker-prompt-event-drop");
+
+const fileDrop = capturePolicy({{ tool: "edit", args: {{ path: "x" }} }}, "/no-marker-allowlist");
+check(fileDrop.disposition === "drop", "allowlist-no-marker-file-event-drop");
+
+const markedDir = join(markerRoot, "marked-empty");
+mkdirSync(markedDir, {{ recursive: true }});
+const markerFile = join(markedDir, ".ai-memory.toml");
+writeFileSync(markerFile, "[capture]\n");
+markerFixtures.set("/marked-empty-cwd", markerFile);
+const markedButEmpty = capturePolicy({{ tool: "edit", args: {{ path: "x" }} }}, "/marked-empty-cwd");
+check(markedButEmpty.disposition === "keep", "allowlist-marker-present-empty-capture-not-dropped");
+"#,
+            policy = ts_capture_policy_v1("allowlist"),
+        );
+        fs::write(&allowlist_module, allowlist_source).unwrap();
+        let allowlist_output = Command::new("node")
+            .args([
+                "--experimental-strip-types",
+                allowlist_module.to_str().unwrap(),
+                temp.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            allowlist_output.status.success(),
+            "allowlist Node runtime evidence failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&allowlist_output.stdout),
+            String::from_utf8_lossy(&allowlist_output.stderr),
+        );
     }
 
     #[test]
@@ -2683,6 +2838,62 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
         );
     }
 
+    /// #611: Antigravity runs its hook `command` string through
+    /// `cmd /c "<string>"` without stripping inner quotes, so a quoted
+    /// `"C:\…\ai-memory.exe"` is "not recognized" and crashes the session.
+    /// Its Windows command must render UNQUOTED, while other Windows agents
+    /// keep the double quotes.
+    #[test]
+    fn antigravity_windows_command_is_unquoted_but_others_keep_quotes() {
+        let ag = build_antigravity_payload_for_platform(
+            Path::new(r"C:\Users\me\.local\bin"),
+            "https://memory.example.com",
+            Some("tok"),
+            HookCommandPlatform::WindowsNative,
+            "antigravity-cli",
+            Some(Path::new(r"C:\Users\me\AppData\Local\ai-memory")),
+            None,
+        );
+        let cmd = ag
+            .pointer("/ai-memory/PreInvocation/0/command")
+            .and_then(|v| v.as_str())
+            .expect("antigravity command string");
+        assert!(
+            !cmd.contains('"'),
+            "antigravity Windows command must carry no double quotes: {cmd}"
+        );
+        assert!(
+            cmd.contains(r"ai-memory hook --event") || cmd.contains(r"ai-memory.exe hook"),
+            "unexpected antigravity command shape: {cmd}"
+        );
+        assert!(
+            cmd.contains("--data-dir C:\\Users\\me\\AppData\\Local\\ai-memory")
+                && cmd.contains("--server-url https://memory.example.com"),
+            "bare (unquoted) args expected: {cmd}"
+        );
+
+        // Same renderer, a non-antigravity agent identity: the double quotes
+        // stay, so the fix is scoped to antigravity and does not regress the
+        // other Windows JSON-hook agents.
+        let other = build_antigravity_payload_for_platform(
+            Path::new(r"C:\Users\me\.local\bin"),
+            "https://memory.example.com",
+            Some("tok"),
+            HookCommandPlatform::WindowsNative,
+            "grok",
+            Some(Path::new(r"C:\Users\me\AppData\Local\ai-memory")),
+            None,
+        );
+        let other_cmd = other
+            .pointer("/ai-memory/PreInvocation/0/command")
+            .and_then(|v| v.as_str())
+            .expect("command string");
+        assert!(
+            other_cmd.contains('"'),
+            "non-antigravity Windows agents keep their double quotes: {other_cmd}"
+        );
+    }
+
     #[test]
     fn command_code_profile_omits_matchers_and_uses_native_agent_identity() {
         let value = build_hook_payload_for_platform(
@@ -2864,13 +3075,15 @@ $payload = [Console]::In.ReadToEnd()
             HookCommandContext::new(HookCommandPlatform::Windows, "antigravity-cli", None, None),
         );
 
-        let mut child = Command::new("powershell.exe")
+        let powershell = ai_memory_test_support::powershell_exe();
+        let outer_command = command_for_available_powershell(&command, powershell);
+        let mut child = Command::new(powershell)
             .args([
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                &command,
+                &outer_command,
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

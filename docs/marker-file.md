@@ -21,6 +21,14 @@ for the cases this marker file is built for:
 The marker file lets you declare these mappings without forking
 ai-memory or running CLI commands per directory.
 
+Static MCP clients also use the marker as the repository-owned source for
+explicit scope arguments. For safe concurrent use, declare both `workspace` and
+`project`: managed routing tells static clients to pass that pair on every
+project-scoped tool call because they cannot attach the real lifecycle-hook
+session id. If either value is absent, the agent must obtain it from the operator
+or server configuration rather than guessing from the checkout directory.
+Session-aware bridges keep automatic current-project routing.
+
 ## Where to put it
 
 `.ai-memory.toml` in **any allowed ancestor** of your `cwd`. Lifecycle hooks
@@ -31,6 +39,17 @@ itself is checked. Closer markers override outer ones. When a marker is found,
 hook scripts also forward the current `cwd` so
 workspace-only markers can still resolve `project = basename(cwd)` for
 handoff lookups.
+
+A marker whose only content is a `[capture]` section (see
+[Capture exclusions](#capture-exclusions) below) is **transparent** to this
+walk: `workspace`, `project`, `project_strategy`, and the other forwarded
+settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`
+keys) are resolved from the nearest ancestor marker that declares at least
+one of them, skipping past any nearer marker that declares nothing but
+`[capture]`. A subdirectory marker added only to exclude some paths from
+capture therefore no longer resets scope to `default` / basename for that
+subtree. `[capture]`/`ignore_paths` itself is unaffected by this and always
+comes from the nearest marker, even a capture-only one.
 
 The marker path is shared by the POSIX/PowerShell hook scripts and the
 generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
@@ -96,10 +115,14 @@ default_global = "true"
 [briefing]
 inject_on_session_start = "true"
 
-# Optional. Char budget for the brief (~4 chars per token). Bodies over
-# budget are truncated with a visible note; crowded-out core pages are
-# listed by path so the agent can `memory_query` them. Clamped
-# server-side to [500, 20000]; defaults to 4000.
+# Optional. Char budget for the WHOLE brief (~4 chars per token), headers
+# and footers included. Bodies over budget are truncated with a visible
+# note; crowded-out core pages are listed by path so the agent can
+# `memory_query` them, degrading to a count when even the paths do not
+# fit. Page bodies are served first, then those pointer sections out of
+# what is left; the security notice and the untrusted-history markers are
+# never traded for content. Clamped server-side to [1500, 20000];
+# defaults to 4000.
 max_chars = 4000
 ```
 
@@ -119,6 +142,16 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 (`true` / `1` / `yes` / `on`, quoted or bare — section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
+
+The session-start brief is **project-scoped**: it draws only from the
+session's resolved `(workspace, project)`, and the reserved `_global` scope
+is deliberately *not* unioned into it. A standing rule placed in
+`_global/_rules/` therefore does not reach the brief. It stays reachable on
+demand through `memory_query` (which *does* union `_global`), and a durable
+always-on rule belongs in the agent's own rules file (`CLAUDE.md` /
+`AGENTS.md`) — see the "Rules vs facts" guidance in `docs/usage.md`. The brief
+is compiled as *untrusted history*, so it is deliberately the wrong channel
+for instructions the agent is expected to obey every turn.
 
 `drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
 `"yes"` / `"on"`); any other value, or its absence, leaves this project's
@@ -150,11 +183,13 @@ direction whose failure you would rather explain.
 The mode is stored per install rather than per agent, and a later bare
 `install-hooks --apply` (including an upgrade refresh) leaves it in place.
 
-Like `ignore_paths` below, it is enforced by native `ai-memory hook` commands
-only — which is what `install-hooks --apply` writes by default. Script-based
-installs (the `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
-`setup-agent` snippets) POST to the server directly without running that
-binary, so allowlist mode does not gate them.
+It is enforced both by native `ai-memory hook` commands and by the generated
+TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`, `openclaw`) —
+each bakes the selected mode in and carries the same marker-presence gate
+before it ever POSTs. Only the raw script-fallback paths (the
+`AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
+`setup-agent` snippets) POST to the server directly without running either
+enforcement point, so allowlist mode does not gate them.
 
 ## Capture exclusions
 
@@ -165,6 +200,14 @@ below to keep recognized file-tool activity under matching paths out of capture:
 [capture]
 ignore_paths = ["private/**", "~/personal-notes/**"]
 ```
+
+A repository that keeps its decision records in the tree — an ADR directory,
+a [Keep the Why](https://github.com/oliver-zehentleitner/keep-the-why)
+`context/` tree — belongs here too: `ignore_paths = ["docs/adr/**"]` or
+`["context/**"]`. The repo owns that record; without the exclusion an agent's
+read of it is captured and consolidation compiles it into wiki pages that do
+not follow the repo, so the copy is stale the moment the record is superseded
+(see the "Repo-native decision records" section of [`usage.md`](usage.md)).
 
 The **nearest** `.ai-memory.toml` is authoritative; marker sections do not
 merge. A missing `[capture]` section or `ignore_paths = []` is inactive and

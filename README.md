@@ -94,6 +94,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Command Code | Supported |
 | Devin CLI | Supported |
 | OpenCode | Supported |
+| OpenCode 2 (`opencode2` beta) | Supported |
 | Cursor | Supported |
 | Gemini CLI | Supported |
 | Oh My Pi / OMP | Supported |
@@ -112,6 +113,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Pool | Hooks-only |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
+| Muse Code | MCP-only |
 | Hermes Agent | Community |
 | LLM/auth providers | Supported |
 | Embedding providers | Supported |
@@ -146,8 +148,8 @@ packaged unit. Full user-service, system-service, auth, and provider setup is in
 
 ### Docker
 
-You need: Docker + an agent CLI from the [Support Matrix](#support-matrix), or
-anything else that speaks MCP.
+You need: Docker or Podman + an agent CLI from the [Support Matrix](#support-matrix),
+or anything else that speaks MCP.
 
 The published Docker image includes `linux/amd64` and `linux/arm64` variants,
 so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
@@ -160,7 +162,7 @@ expose the server on the LAN; see [Security](#security) below.
 
 ```bash
 # 1. Install the ai-memory CLI wrapper (a small shell script that
-#    runs the binary inside docker with your $HOME mounted). This is
+#    runs the binary inside a container with your $HOME mounted). This is
 #    the only thing that needs to live on the host filesystem.
 mkdir -p ~/.local/bin
 wrapper_tmp="$(mktemp -d)"
@@ -197,11 +199,11 @@ docker run -d --name ai-memory \
     -e ANTHROPIC_API_KEY=sk-ant-... \
     -e AI_MEMORY_EMBEDDING_PROVIDER=openai \
     -e OPENAI_API_KEY=sk-... \
-    akitaonrails/ai-memory:latest
+    docker.io/akitaonrails/ai-memory:latest
 
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
-#    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent gemini-cli`,
+#    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent opencode2`, `--agent gemini-cli`,
 #    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent omp`,
 #    `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, `--client grok`, `--client kiro-cli`, etc.
@@ -209,6 +211,10 @@ docker run -d --name ai-memory \
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
+
+The examples use `docker`; replace it with `podman` on a Podman host. The
+wrapper automatically uses Podman when Docker is not installed. Set
+`AI_MEMORY_DOCKER=podman` to force Podman when both engines are available.
 
 On Linux/macOS, that's it. Start a Claude Code session as usual - every
 prompt and tool call now lands in ai-memory, and the next session you
@@ -286,7 +292,7 @@ The full model is in [`docs/security.md`](docs/security.md),
 
 Optional. Everything works with zero LLM calls; adding a provider
 upgrades session summaries and enables semantic search. Anthropic,
-OpenAI (incl. OAuth/Codex), GitHub Copilot, Gemini, OpenCode Zen, and
+OpenAI (incl. OAuth/Codex), GitHub Copilot, Gemini, OpenCode (Go and Zen), and
 any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) are supported
 for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
 endpoints for embeddings. Configuration lives in
@@ -320,7 +326,7 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
+| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for contributors adding managed resume, read-only transcript import, and startup context delivery to another harness. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
@@ -334,6 +340,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: Hermes-inspired scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 | [`docs/companion-crates.md`](docs/companion-crates.md) | Boundary and implementation plan for optional companion projects, including the standalone importer at [`companions/ai-memory-importer`](companions/ai-memory-importer), without widening core ai-memory. |
 | [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md) | Empirical notes behind the recommended LLM defaults. |
+| [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md) | Proposed opt-in fallback-chain design for transient LLM-provider failures; not yet a supported configuration surface. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | Research docs under `docs/` | Karpathy LLM Wiki notes, Hermes Agent, agentmemory / basic-memory / cognee deep-dives, lessons-learned from upstream issues. |
@@ -345,7 +352,7 @@ diagram, crate breakdown, schema notes, and invariants.
 - [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the plan for the 2.0 release, one item at a time.
 - [`docs/okf.md`](docs/okf.md) - the wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping.
 - [`docs/typed-edges.md`](docs/typed-edges.md) - typed relation edges (`causes` / `fixes` / `contradicts`) and how lint uses them.
-- [`docs/temporal.md`](docs/temporal.md) - ingestion-time validity on the entity index and `as_of` time-travel queries.
+- [`docs/temporal.md`](docs/temporal.md) - ingestion-time validity on the entity index and page versions, and `as_of` time-travel queries (entity timeline + version-filtered FTS).
 - [`docs/local-embeddings.md`](docs/local-embeddings.md) - in-process embeddings with no API key (`embedding_provider = "local"`).
 - [`docs/experience.md`](docs/experience.md) - the opt-in cross-session abstraction pass: knowledge visible only across trajectories.
 - [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) - upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore.

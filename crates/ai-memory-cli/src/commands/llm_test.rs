@@ -22,10 +22,13 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         provider,
         model: args.model,
         auth: config.provider_auth(provider, api_key_override),
-        base_url: args.base_url.or_else(|| config.llm_test_base_url()),
+        base_url: args.base_url.or_else(|| config.llm_test_base_url(provider)),
         compat_strict: config.llm_compat_strict,
         request_timeout_secs: config.llm_timeout_secs,
         reasoning_effort: config.llm_reasoning_effort,
+        extra_headers: config
+            .llm_extra_headers()
+            .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?,
     };
     let client = build_provider(provider_config).context("building LLM provider")?;
     info!(

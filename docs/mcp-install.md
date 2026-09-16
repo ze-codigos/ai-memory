@@ -38,8 +38,8 @@ ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they
-expose long-term memory to their LLMs via ai-memory's MCP tools
+Claude Desktop, VS Code Copilot, Zed, and Muse Code are **MCP-only** here:
+they expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
 endpoint. The trade-off:
@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed / muse
 > ```
 
 ---
@@ -334,6 +334,75 @@ resuming when you need manual continuity.
 
 Sources: <https://zed.dev/docs/ai/mcp>,
 <https://zed.dev/docs/configuring-zed>.
+
+---
+
+## Muse Code
+
+**Status:** MCP supported through Muse Code's native streamable-HTTP
+transport, including bearer authentication. No lifecycle-hook integration
+and no managed-workstream adapter.
+
+**Config file:** `~/.config/muse/settings.json`. Muse also reads
+`$XDG_CONFIG_HOME` for its skill roots; on a non-default XDG setup pass the
+concrete path with `--config-file`.
+
+Servers live under the top-level snake_case `mcp_servers` key. Note the
+casing: `mcpServers`, which most other clients use, is ignored here.
+
+```json
+{
+  "schema_version": 1,
+  "mcp_servers": {
+    "ai-memory": {
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      },
+      "enabled": true,
+      "mode": "optional"
+    }
+  }
+}
+```
+
+Print or apply the configuration with:
+
+```bash
+ai-memory install-mcp --client muse
+ai-memory install-mcp --client muse --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+```
+
+Two details of Muse's schema are worth knowing before hand-editing the file:
+
+- **`"schema_version": 1` is mandatory.** A settings file that omits it fails
+  *every* `muse` command at startup with `malformed settings file`. `--apply`
+  adds the key when it is missing and never rewrites an existing value, so a
+  future schema is not silently downgraded.
+- **`mode` defaults to `required`**, and a required server that fails to start
+  aborts the whole Muse run. ai-memory writes `"mode": "optional"` explicitly
+  so an unreachable memory server costs you recall rather than the session.
+
+A non-default `framing` value is rejected on `streamable_http`, so the
+generated entry omits the key.
+
+**Skills:** no extra step is needed. Muse Code loads user skills from
+`$XDG_CONFIG_HOME/muse/skills` and `~/.agents/skills`, and
+`ai-memory install-skills` already writes the cross-client `~/.agents/skills`
+root, so the ai-memory routing skills are visible to Muse. Confirm with
+`muse skills list`.
+
+Muse Code documents a lifecycle hook surface, but the output contract of its
+`SessionStart` event is not specified, so automatic capture and automatic
+handoff injection are not claimed here. Ask the agent to call
+`memory_handoff_begin` before leaving and `memory_handoff_accept` when
+resuming when you need continuity.
+
+Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
+<https://dev.meta.ai/docs/muse-code/extending>.
 
 ---
 
@@ -1232,6 +1301,7 @@ You: List the MCP tools you can call. Use one of them to check
 Model (any client): I can call: memory_query, memory_recent,
      memory_status, memory_briefing, memory_explore,
      memory_handoff_accept, memory_handoff_begin, memory_handoff_cancel,
+     memory_handoff_list,
      memory_consolidate, memory_auto_improve, memory_write_page,
      memory_read_page, memory_read_session_observations,
      memory_delete_page, memory_feedback,
@@ -1277,20 +1347,24 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex, Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn. MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero discard SessionStart stdout; Swival is MCP-only. Use (b) for those clients. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, OpenCode 2 beta, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero discard SessionStart stdout; Swival is MCP-only. Use (b) for those clients. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
-delivery. Its generated plugin also sends a deduped best-effort close for any
+delivery. The OpenCode 2 beta plugin subscribes to the same event name on the
+V2 event stream and injects handoffs through the `context` hook instead of
+v1's removed `experimental.chat.system.transform`. Its generated plugin also sends a deduped best-effort close for any
 still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.
 
-Codex and Antigravity `Stop` events are not session ends. Their hook installs
-intentionally omit `SessionEnd`; `ai-memory finalize-session` defaults to
-Codex, while `--agent antigravity-cli` selects Antigravity. The command finds
-the latest matching open session for the current workspace/project and posts a
-synthetic `session-end` event through the same server path as real hook clients.
+Codex and Antigravity `Stop` events are not session ends. Codex's hook install
+registers native `SessionEnd` for CLI 0.145.0 and later; Antigravity still needs
+explicit finalization. `ai-memory finalize-session` defaults to Codex for older
+clients or a missed native end, while `--agent antigravity-cli` selects
+Antigravity. The command finds the latest matching open session for the current
+workspace/project and posts a synthetic `session-end` event through the same
+server path as real hook clients.
 Use `--all` only when you want to close every matching open session for the
 selected agent in that scope.
 

@@ -4,19 +4,23 @@
 This project uses [ai-memory](https://github.com/akitaonrails/ai-memory)
 for cross-session continuity.
 
-**Default to the current project - always.** Every ai-memory tool
-auto-scopes to the project resolved from your session's working
-directory. **Do NOT pass `project`, `workspace`, or `cwd` arguments unless
-the user explicitly references a *different* project by name** (e.g. "what
-did we decide in the `other-app` project?"). Phrases like "this project",
-"here", "we", "our work", and "where did we leave off" all mean the
-*current* project, so call tools with no scoping args.
+**Choose project scope from the MCP client's identity support.**
 
-This default assumes the MCP client can identify the current agent
-session. Static MCP clients in parallel sessions for the same user cannot
-forward the real agent session id automatically; pass explicit
-`workspace` + `project` / `scopes`, or use a session-aware bridge that
-forwards the lifecycle-hook session id on MCP calls.
+- **Session-aware MCP clients** that forward the real lifecycle-hook session id
+  on every request should use automatic current-project routing. Omit `workspace`,
+  `project`, and `cwd` for the current repository; pass explicit scope only when
+  the user names a different project.
+- **Static MCP clients** (including clients with lifecycle hooks but no bridge
+  connecting that hook session id to MCP requests) must pass `workspace` and
+  `project` together on every project-scoped call, including requests about "this
+  project", "here", or "our work". Read the exact names from the nearest
+  `.ai-memory.toml` when it declares both. If it does not, obtain the names from
+  the operator or server configuration; never guess them from a directory name
+  and never rely on the server's last active project.
+
+This rule applies only to project-scoped calls. For cross-project retrieval,
+`global=true` must omit `workspace`, `project`, and `scopes`. For a standing
+preference written with `scope: "global"`, omit `workspace` and `project`.
 
 **Lifecycle hooks already capture sanitized, bounded prompt and tool-lifecycle
 observations automatically.** They are not complete native transcripts;
@@ -24,7 +28,14 @@ managed `ai-memory run` launches add the portable visible-event ledger. Do not
 manually write routine notes. Only write durable memory when the user explicitly asks
 to remember or annotate something permanently. For an explicitly time-bounded note,
 set `expires_at`; expired pages are hidden from normal reads and deleted by the next
-forget sweep, and a TTL outranks `pinned`.
+forget sweep, and a TTL outranks `pinned`. ai-memory is the cross-harness memory of
+record for this project: if the harness you run in has its own local memory feature,
+do not keep durable project facts there in parallel — a harness-local store is
+invisible to every other agent and fragments continuity, so capture them here instead.
+A reviewed decision record kept in the repository (an ADR directory, a Keep the Why
+`context/` tree) is not a harness-local store: when the project keeps one, record
+decisions there under the project's convention; ai-memory keeps recall, handoffs and
+session history and does not duplicate that record as a page.
 
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
@@ -60,8 +71,13 @@ install or refresh work.
 If you're about to write a durable project rule ("always X", "never
 Y", "all PRs must ..."), write it in the project's canonical agent instruction file.
 Many projects use CLAUDE.md for Claude Code and
-AGENTS.md for Codex / OpenCode / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
+AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
 but if the project says one file is canonical, use that file.
+
+Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
+where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md` import
+line. Without it a rule written to `AGENTS.md` is absent from context at
+session start and reaches Claude Code only if the agent opens the file.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
@@ -77,7 +93,7 @@ latest binary's recommended copy:
 - **From the agent** (no terminal needed): ask "refresh the ai-memory
   routing in this project". The agent calls `memory_install_self_routing`,
   picks the right filename for itself (Claude Code -> `CLAUDE.md`; Codex /
-  OpenCode / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code -> `AGENTS.md`),
+  OpenCode / OpenCode 2 / Cursor / Gemini / Grok -> `AGENTS.md`; Kimi Code / Kiro CLI / Command Code -> `AGENTS.md`),
   uses its Write / Edit tool to replace or append the returned
   `markered_block` while preserving
   non-ai-memory user content, then writes or updates each returned
@@ -94,7 +110,7 @@ start/end HTML-comment markers, without disturbing the rest of the file.
 # AGENTS.md — ai-memory contributor guide
 
 This file is the single canonical instruction file for AI coding agents
-working in this repository (Claude Code, Codex, OpenCode, Cursor, Gemini
+working in this repository (Claude Code, Codex, OpenCode, OpenCode 2, Cursor, Gemini
 CLI, Kimi Code, Command Code, and other AGENTS-aware harnesses). `CLAUDE.md` is only a
 short pointer here — do not duplicate rules into it.
 
@@ -196,27 +212,96 @@ below.
 
 ## Build and test commands
 
-Rust 1.95 is required (the pinned toolchain installs automatically via
-rustup). Before claiming any Rust change is ready, run the full local
-gate — the same gates CI (`.github/workflows/ci.yml`) and `bin/release`
-enforce:
+Rust 1.95, pinned in `rust-toolchain.toml`; rustup selects it automatically.
+The build is self-contained (bundled SQLite, vendored libgit2, vendored
+Tailwind CSS), so no command below needs an environment variable.
+
+Two loops, and the split matters: iterate with the everyday tier, run the
+full gate once before handing work off.
 
 ```bash
-cargo fmt --all -- --check                                # formatting
-git diff --check                                          # whitespace
-TAILWIND_SKIP=1 cargo test --workspace                    # tests
-TAILWIND_SKIP=1 cargo clippy --workspace --all-targets -- -D warnings
-cargo deny check                                          # dependency policy (if installed)
+# Everyday loop (nextest: `cargo install cargo-nextest --locked`).
+cargo t                        # every shipped crate: 11 test binaries, ~20s warm
+cargo t -p ai-memory-store     # one crate: builds only its binary, ~5s
+cargo t -E 'test(/purge/)'     # one topic (still builds everything)
+
+# Before claiming a change is ready: the gates CI and bin/release enforce.
+cargo fmt --all -- --check
+git diff --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo tf                       # whole workspace, every test, slow tier included
+cargo deny check               # dependency policy (if installed)
 ```
 
-- `TAILWIND_SKIP=1` skips the Tailwind asset build in `ai-memory-web`'s
-  build script; use it for local test/clippy runs. CI's Linux/macOS test
-  job runs the full build without it.
+`cargo t` and `cargo tf` are aliases in `.cargo/config.toml` for
+`cargo nextest run` under the `default` and `full` profiles of
+`.config/nextest.toml`. Run them from the repo root. `cargo t` builds the
+workspace's default members, which is every shipped crate; the evals harness
+is two more test binaries that only `cargo tf`, the pre-push hook, and CI
+build (`--workspace`). Without nextest,
+`cargo test --workspace --all-targets` is what CI runs: everything, slower,
+no tiers.
+
+- **Slow tier.** A test whose module path has a segment starting with `slow`
+  or `stress` (`packaging::slow::*`, `stress_autoscope::*`) runs only under
+  `cargo tf`, the pre-push hook, and CI. Budget for everything else: about 1s
+  per test alone; the everyday profile lists anything over 5s in its summary.
+  Fix a slow test before tiering it: an injectable timeout, a smaller fixture,
+  `journal_mode=MEMORY` for a throwaway SQLite, an accept-and-close endpoint
+  instead of a closed port.
+- **Adding an integration test.** Put the file in the crate's `tests/suite/`
+  and declare it with `mod name;` in the entry file there. For every crate
+  but the CLI the entry is `mod.rs`, included from `src/lib.rs` under
+  `#[cfg(test)]`, so the tests compile into the lib's own harness and cost no
+  extra binary; the CLI keeps a separate `main.rs` target because its tests
+  run the built executable. Every test binary is a link and, on macOS and
+  Windows, a first-run malware scan, so each crate gets at most one. A
+  repo-layout test in the CLI suite fails on an undeclared file, a stray
+  top-level `tests/*.rs`, or a `mod.rs` that `lib.rs` never includes.
+- **Shared test helpers** live in `crates/ai-memory-test-support`
+  (dev-dependency only, no workspace dependencies, no test binary of its own).
+- **Pre-push hook.** `scripts/install-git-hooks.sh` (from Git Bash on Windows)
+  installs a hook that runs the full tier before every push and only touches
+  its own marked block in `.git/hooks/pre-push`. Bypass a work-in-progress
+  push with `git push --no-verify`.
+- **Regenerating the web stylesheet.** `TAILWIND_BUILD=1 cargo build -p
+  ai-memory-web` downloads the pinned Tailwind CLI and rewrites
+  `static/tailwind.css`; commit the result. CI regenerates it on Linux and
+  fails if the committed file is stale, so nothing else needs the download.
 - Run the companion importer separately:
   `cargo test --manifest-path companions/ai-memory-importer/Cargo.toml`
   (plus fmt/clippy on the same manifest). Root `--workspace` commands do
   not cover it.
-- Useful focused runs: `cargo test -p ai-memory-store`, etc.
+
+### Platform notes
+
+- **All.** `target/` grows without bound: every edit to a shared crate leaves
+  the previous copy of each 100-180 MB test binary behind (seen at 157 GiB).
+  `cargo install cargo-sweep --locked` once, then `cargo sweep --time 7`
+  weekly. Give rust-analyzer its own target dir
+  (`rust-analyzer.cargo.targetDir = true`) so a save-triggered check never
+  holds the lock a `cargo t` is waiting on.
+- **macOS.** `SSL_CERT_FILE=/etc/ssl/cert.pem cargo t` stops reqwest
+  re-reading the Keychain in every test process (workspace test time 75s to
+  41s); leave it unset if you rely on a private CA in your login Keychain.
+  After a `cargo clean`, `touch target/.metadata_never_index` keeps Spotlight
+  off the build artifacts.
+- **Windows, GNU toolchain.** Two per-machine fixes, each worth about 2x on
+  the loop. mingw's `ld` is ~3x slower than the lld the toolchain ships; in
+  `~/.cargo/config.toml`:
+
+  ```toml
+  [target.x86_64-pc-windows-gnu]
+  rustflags = ["-C", "link-arg=-fuse-ld=lld",
+               "-C", "link-arg=-B<sysroot>/lib/rustlib/x86_64-pc-windows-gnu/bin/gcc-ld"]
+  ```
+
+  with `<sysroot>` from `rustc --print sysroot`, forward slashes. And Defender
+  scans every freshly linked binary on first run (~1.7s each, which nextest
+  pays serially for all 11 before the first test starts); from an elevated
+  PowerShell: `Add-MpPreference -ExclusionPath "$PWD\target", "$HOME\.cargo",
+  "$HOME\.rustup"`.
+
 - Shell-level checks: `tests/hooks/test_lib.sh`,
   `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
 - CI additionally runs `cargo build --release --bin ai-memory` on
@@ -225,9 +310,9 @@ cargo deny check                                          # dependency policy (i
   `.github/workflows/secret-scan.yml` runs the separate weekly/manual
   full-history gitleaks scan.
 - **Windows runs in its own workflow** (`.github/workflows/windows.yml`):
-  every push to `main`, nightly, on demand, and on any PR labelled
-  `windows`. It is the only place `#[cfg(windows)]` tests compile, and it
-  is ~4x slower than the same tests on Linux — keeping it out of `ci.yml`
+  nightly, on demand, and on any PR labelled `windows`. It is the only place
+  `#[cfg(windows)]` tests compile, and it is ~4x slower than the same tests on
+  Linux — keeping it out of `ci.yml`
   is what holds PR feedback near the eight minutes the gating jobs take.
   **Add the `windows` label** to a PR touching path handling, file
   locking, or git plumbing, so the check runs before the merge rather
@@ -349,6 +434,12 @@ Additional boundary rules:
   Parsers, ID derivation, and retention/decay math especially.
 - Filesystem tests use temp dirs or injected roots (`tempfile`); never
   depend on the real user home directory being writable.
+- Tests that build throwaway git repos must not inherit the contributor's
+  machine config: pass `--no-gpg-sign` on every fixture commit (a global
+  `commit.gpgsign = true` otherwise signs as the fixture's fake identity and
+  fails), and build `git2` signatures with a fixed `Signature::now(...)`,
+  never `repo.signature()`. CI cannot catch either — its runners have no
+  global gitconfig, so the breakage only ever shows up on a developer's box.
 - PRs touching scope resolution need table-driven tests for partial
   scope, missing explicit scope, active-project precedence, and
   cross-workspace isolation.
@@ -357,7 +448,8 @@ Additional boundary rules:
 - New disk+SQL mutations need recovery/rollback tests.
 - The recall-eval framework lives at
   `crates/ai-memory-consolidate/tests/recall_eval.rs`.
-- Tests run with `cargo test --workspace` (use `TAILWIND_SKIP=1` locally).
+- Tests run with `cargo t` locally and `cargo test --workspace --all-targets`
+  in CI.
 
 ## Security considerations
 
@@ -379,7 +471,7 @@ Additional boundary rules:
 - **Auth ladder:** static root bearer token → DB-user tokens
   (attribution only, no admin) → OIDC device tokens at the hook edge.
   `/admin/*` becomes root-only the moment the first DB user exists.
-- **Dependency policy:** `cargo deny check --all-features` and
+- **Dependency policy:** `cargo deny --all-features check` and
   `cargo audit` run in CI; do not add dependencies without checking the
   project doesn't already have the capability, and match existing
   versions/idioms.
@@ -402,6 +494,16 @@ Additional boundary rules:
   release**: dispatch `ci` (macOS legs) and `windows` on the exact
   release-candidate SHA and wait for green before tagging. Never tag a
   release whose SHA lacks a green full matrix.
+- **Every release updates the Homebrew tap — do not forget it.** After
+  `release.yml` publishes the GitHub release and its per-target tarballs,
+  update `~/Projects/homebrew-tap/Formula/ai-memory.rb`: bump `version` and
+  set each platform `sha256` to the value from the release's published
+  `ai-memory-<target>.tar.gz.sha256` assets (`macos-aarch64`, `macos-x86_64`,
+  `linux-aarch64`, `linux-x86_64`), then commit (`ai-memory X.Y.Z`) and push
+  the tap. Verify each `sha256` matches the published asset before pushing — a
+  wrong hash makes `brew install` fail for everyone. This is a mandatory,
+  recurring post-release step (it has been forgotten repeatedly); do not rely
+  on a contributor PR to the tap to remember it.
 - **No version bumps or release tags without explicit user approval.**
   Do not bump crate/package versions automatically.
 - **PR evaluation:** report pros, cons, and recommended fix, then ask for
@@ -409,7 +511,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 18 (see `docs/ARCHITECTURE.md`).
+  The tool count is currently 19 (see `docs/ARCHITECTURE.md`).
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
   subcommands, MCP tools, config keys, a new agent harness or LLM
   provider); major = breaking (on-disk format without migration, removed

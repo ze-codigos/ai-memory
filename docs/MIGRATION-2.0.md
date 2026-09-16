@@ -4,6 +4,12 @@
 v0.2](okf.md). The upgrade is automatic, backup-gated, and reversible.
 This page describes exactly what happens and how to go back.
 
+> **The safety archive is a true pre-migration recovery point.** It is
+> written **before** the SQLite schema is migrated forward (#633), so its
+> `db/` is still at the 1.x schema and restoring it lets you start the old
+> 1.x binary again. (Earlier 2.0.x builds took this archive *after* the DB
+> migration, which left it 2.x-only — fixed in 2.0.3.)
+
 ## What happens on the first 2.0 start
 
 When `ai-memory serve` starts on a data directory created by 1.x, a
@@ -107,7 +113,8 @@ grep -L "^type:" <data_dir>/wiki/*/*/*/*.md   # no output = all pages typed
 ## Restoring the backup
 
 Blunt and complete — returns the entire data directory to its exact
-pre-migration state:
+pre-migration state (the archive is taken before both the DB schema and
+the wiki are migrated, #633), so you can start the old 1.x binary again:
 
 ```bash
 # 1. stop the server (docker compose down / systemctl stop ai-memory)
@@ -131,8 +138,9 @@ migrates it (as above). An **older 2.0+** binary opening a **newer**
 wiki refuses to start with `NewerWikiFormat` instead of silently mixing
 formats. (1.x binaries predate the guard: they can open a migrated
 directory and will tolerate the extra frontmatter, but new writes from
-1.x will not carry the OKF keys — avoid mixing; restore the archive if
-you need to stay on 1.x.)
+1.x will not carry the OKF keys — avoid mixing. To stay on 1.x cleanly,
+restore the pre-migration archive, which is captured before the DB
+migration and so reopens under 1.x.)
 
 ## Sharing bundles
 

@@ -31,14 +31,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ai_memory_core::{PagePath, ProjectId, Tier, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
 use ai_memory_store::ReaderPool;
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -160,6 +162,15 @@ pub struct BootstrapPage {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BootstrapBatch {
     /// Pages to create.
+    ///
+    /// Defaulted because a chunk legitimately has nothing to add: later
+    /// chunks receive the paths earlier ones already wrote, so a model
+    /// that judges the material covered answers with a rationale and no
+    /// `pages` key. Anthropic's `tool_use` schema does not enforce
+    /// required fields the way OpenAI's `strict: true` does, so that
+    /// answer reaches serde — and without a default it aborts the whole
+    /// multi-chunk run, discarding every page the earlier chunks paid for.
+    #[serde(default)]
     pub pages: Vec<BootstrapPage>,
     /// Brief one-paragraph note about what was processed, surfaced
     /// in the wiki/bootstrap.md manifest + the auto-commit message.
@@ -267,6 +278,10 @@ pub struct BootstrapConfig {
     pub dry_run: bool,
     /// Allow re-running even when `wiki/bootstrap.md` already exists.
     pub force: bool,
+    /// Resume an interrupted bootstrap: reuse the chunks already completed
+    /// for the same sources (via durable per-chunk progress, #621) instead
+    /// of re-calling the LLM for them.
+    pub resume: bool,
 }
 
 /// Bootstrap driver. Holds the LLM provider + wiki handle + reader
@@ -279,6 +294,88 @@ pub struct Bootstrap {
     pub wiki: Wiki,
     /// LLM provider used to summarise sources into pages.
     pub llm: Arc<dyn LlmProvider>,
+    /// Writer handle used to record + reuse durable per-chunk progress (#621).
+    pub writer: ai_memory_store::WriterHandle,
+}
+
+/// Maximum attempts (initial + retries) for one bootstrap chunk's LLM call.
+const BOOTSTRAP_CHUNK_MAX_ATTEMPTS: u32 = 3;
+/// Fixed, short delay between chunk retries. Deliberately not tenacity-style
+/// escalating backoff — see the cognee #2840 lesson in `ai-memory-llm`.
+const BOOTSTRAP_CHUNK_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Run one chunk's structured LLM call with a short, bounded retry.
+///
+/// A chunk that fails on a *transient* error ([`LlmError::is_transient`] —
+/// `429`, any `5xx`, or a transport timeout/connect failure) would otherwise
+/// abort the whole multi-chunk run and discard every earlier chunk's pages
+/// (they live only in the in-memory accumulator). The reporter's own bootstrap
+/// runs died repeatedly this way to provider `520`s and connection resets
+/// (#617). A few short retries turn those into a completed run; deterministic
+/// failures (auth, schema, a `4xx`, bad JSON) are not retried — they would only
+/// burn another expensive call.
+async fn complete_chunk_with_retry(
+    llm: &(dyn LlmProvider + 'static),
+    request: ChatRequest,
+    retry_delay: Duration,
+) -> Result<BootstrapBatch, LlmError> {
+    let mut attempt = 1;
+    loop {
+        match complete_structured::<BootstrapBatch>(llm, request.clone()).await {
+            Ok(batch) => return Ok(batch),
+            Err(e) if attempt < BOOTSTRAP_CHUNK_MAX_ATTEMPTS && e.is_transient() => {
+                warn!(
+                    attempt,
+                    max = BOOTSTRAP_CHUNK_MAX_ATTEMPTS,
+                    error = %e,
+                    "bootstrap chunk hit a transient LLM error; retrying shortly",
+                );
+                tokio::time::sleep(retry_delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Deterministic fingerprint of a bootstrap run's inputs, used to key durable
+/// per-chunk progress (#621).
+///
+/// Chunking is a pure function of the pruned source set + budget, so hashing
+/// `(workspace, project, chunk_budget, every chunk's every source's label +
+/// text)` is enough to detect "this is the same run" — a resume only reuses
+/// progress when the inputs are byte-identical; anything else (new commits,
+/// a different budget) re-chunks and starts fresh rather than risking a
+/// mismatched seed.
+#[must_use]
+pub fn bootstrap_fingerprint(
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    chunk_budget: usize,
+    chunks: &[Vec<BootstrapSource>],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(workspace_id.to_string().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(project_id.to_string().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(chunk_budget.to_le_bytes());
+    for chunk in chunks {
+        hasher.update(b"|chunk|");
+        for source in chunk {
+            hasher.update(source.label.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(source.text.as_bytes());
+            hasher.update([0u8]);
+        }
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 impl Bootstrap {
@@ -352,10 +449,68 @@ impl Bootstrap {
         let llm_chunks = chunks.len();
         info!(llm_chunks, chunk_budget, "bootstrap LLM chunk plan",);
 
+        let fingerprint =
+            bootstrap_fingerprint(cfg.workspace_id, cfg.project_id, chunk_budget, &chunks);
+
         let mut pages_by_path = std::collections::BTreeMap::new();
         let mut rationales = Vec::with_capacity(llm_chunks);
+        let mut completed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        if cfg.resume {
+            let recorded = self
+                .writer
+                .load_bootstrap_progress(fingerprint.clone())
+                .await?;
+            // Adopt only the CONTIGUOUS prefix of completed chunks (0, 1, 2, …).
+            // Each chunk's output depends on the pages the earlier chunks wrote,
+            // in order (`prior` below), so reusing a later chunk while an earlier
+            // one is missing — a gap left by a crash, or an unreadable row —
+            // would seed it with context a clean run never had, and a resumed run
+            // must not diverge from a fresh one (#635). Records arrive ordered by
+            // chunk_index; stop at the first gap or unreadable row and re-run
+            // everything from there (the re-run overwrites the stale later rows).
+            for (expected, record) in recorded.into_iter().enumerate() {
+                if record.chunk_index as usize != expected {
+                    break;
+                }
+                let pages: Vec<BootstrapPage> = match serde_json::from_str(&record.pages_json) {
+                    Ok(pages) => pages,
+                    Err(e) => {
+                        warn!(
+                            chunk = record.chunk_index,
+                            error = %e,
+                            "unreadable bootstrap progress row; re-running from this chunk on"
+                        );
+                        break;
+                    }
+                };
+                for page in pages {
+                    insert_bootstrap_page(
+                        &mut pages_by_path,
+                        page,
+                        record.chunk_index as usize + 1,
+                    );
+                }
+                rationales.push(record.rationale);
+                completed.insert(record.chunk_index as usize);
+            }
+            if !completed.is_empty() {
+                info!(
+                    resumed_chunks = completed.len(),
+                    total = llm_chunks,
+                    "bootstrap resuming from durable per-chunk progress",
+                );
+            }
+        }
 
         for (idx, chunk) in chunks.iter().enumerate() {
+            if completed.contains(&idx) {
+                debug!(
+                    chunk = idx + 1,
+                    "bootstrap chunk already completed; skipping LLM call"
+                );
+                continue;
+            }
             let mut prior: Vec<String> = pages_by_path.keys().cloned().collect();
             prior.sort_unstable();
             let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
@@ -370,7 +525,19 @@ impl Bootstrap {
                     .sum::<usize>(),
                 "bootstrap LLM chunk",
             );
-            let batch: BootstrapBatch = complete_structured(&*self.llm, request).await?;
+            let batch: BootstrapBatch =
+                complete_chunk_with_retry(&*self.llm, request, BOOTSTRAP_CHUNK_RETRY_DELAY).await?;
+
+            let pages_json = serde_json::to_string(&batch.pages).unwrap_or_else(|_| "[]".into());
+            self.writer
+                .record_bootstrap_chunk(
+                    fingerprint.clone(),
+                    idx as u32,
+                    pages_json,
+                    batch.rationale.clone(),
+                )
+                .await?;
+
             rationales.push(batch.rationale);
             for page in batch.pages {
                 insert_bootstrap_page(&mut pages_by_path, page, idx + 1);
@@ -412,6 +579,7 @@ impl Bootstrap {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             });
         }
         // Plus the manifest itself.
@@ -442,6 +610,7 @@ impl Bootstrap {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         });
 
         let _ids = self.wiki.apply_batch(requests).await?;
@@ -449,6 +618,14 @@ impl Bootstrap {
             "bootstrap: {llm_chunks} LLM chunk(s), ingested {collected} sources, wrote {} pages",
             written_paths.len() + 1,
         ));
+
+        // Best-effort: the run already succeeded (pages are written), so a
+        // failure here must not fail the whole run — it would just leave
+        // stale progress rows that a future `--resume` on an unrelated
+        // fingerprint never sees anyway.
+        if let Err(e) = self.writer.clear_bootstrap_progress(fingerprint).await {
+            warn!(error = %e, "failed to clear bootstrap progress after a successful run");
+        }
 
         // Manifest is the last entry but conceptually first; list it.
         let mut out_paths = written_paths.clone();
@@ -1310,7 +1487,113 @@ fn render_manifest_body(input: ManifestRender<'_>) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    /// Fails its first `transient_failures` structured calls with a transient
+    /// provider error (unless `permanent`, which always fails non-transiently),
+    /// then returns an empty batch.
+    struct FlakyLlm {
+        calls: AtomicUsize,
+        transient_failures: usize,
+        permanent: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FlakyLlm {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        fn model(&self) -> &str {
+            "flaky"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("bootstrap only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.permanent {
+                return Err(LlmError::Auth("nope".into()));
+            }
+            if n < self.transient_failures {
+                return Err(LlmError::Provider {
+                    status: 503,
+                    body: "busy".into(),
+                });
+            }
+            Ok(serde_json::json!({ "pages": [], "rationale": "ok" }))
+        }
+    }
+
+    fn chunk_request() -> ChatRequest {
+        ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("x")],
+            max_tokens: 16,
+            temperature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_retry_recovers_from_transient_failures() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            transient_failures: 2, // fails twice, succeeds on the 3rd (= MAX)
+            permanent: false,
+        };
+        let batch = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+            .await
+            .expect("a transient failure that clears within the attempt budget must succeed");
+        assert!(batch.pages.is_empty());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            3,
+            "should have retried twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_retry_gives_up_after_the_attempt_budget() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            transient_failures: usize::MAX, // never clears
+            permanent: false,
+        };
+        let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+            .await
+            .expect_err("a persistently transient failure must eventually give up");
+        assert!(err.is_transient());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            BOOTSTRAP_CHUNK_MAX_ATTEMPTS as usize,
+            "must stop at the attempt budget, not retry forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_retry_does_not_retry_a_deterministic_error() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            transient_failures: 0,
+            permanent: true, // returns Auth — not transient
+        };
+        let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+            .await
+            .expect_err("an auth error must not be retried");
+        assert!(!err.is_transient());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            1,
+            "a deterministic error must fail on the first call, no retries"
+        );
+    }
 
     fn make_repo(tmp: &Path) -> Result<(), Box<dyn std::error::Error>> {
         // Use system git via std::process::Command instead of git2's
@@ -1327,15 +1610,19 @@ mod tests {
         run(&["init", "-q", "-b", "main"])?;
         run(&["config", "user.email", "test@example.com"])?;
         run(&["config", "user.name", "Test"])?;
+        // --no-gpg-sign throughout: a global `commit.gpgsign = true` would make
+        // git sign as this fixture's throwaway identity, and fail.
         run(&[
             "commit",
+            "--no-gpg-sign",
             "--allow-empty",
             "-m",
             "feat: initial scaffolding for storage substrate with WAL + supersession chain",
         ])?;
-        run(&["commit", "--allow-empty", "-m", "typo"])?;
+        run(&["commit", "--no-gpg-sign", "--allow-empty", "-m", "typo"])?;
         run(&[
             "commit",
+            "--no-gpg-sign",
             "--allow-empty",
             "-m",
             "design: choose Karpathy compile-not-retrieve model over RAG for capture",
@@ -1557,6 +1844,16 @@ mod tests {
     }
 
     #[test]
+    fn batch_without_pages_key_deserialises_as_empty() {
+        let batch: BootstrapBatch =
+            serde_json::from_str(r#"{"rationale":"already covered by earlier chunks"}"#)
+                .expect("a chunk that adds no pages must not fail the whole run");
+
+        assert!(batch.pages.is_empty());
+        assert_eq!(batch.rationale, "already covered by earlier chunks");
+    }
+
+    #[test]
     fn duplicate_page_paths_keep_first_page() {
         let mut pages = std::collections::BTreeMap::new();
         insert_bootstrap_page(
@@ -1664,10 +1961,9 @@ mod tests {
             assert!(status.success(), "git {args:?} failed");
             Ok(())
         };
+        // `git init` alone is enough: MainRepoRoot resolves through
+        // `Repository::discover` + `commondir()`, which never reads HEAD.
         run(&["init", "-q", "-b", "main"]).unwrap();
-        run(&["config", "user.email", "t@t"]).unwrap();
-        run(&["config", "user.name", "t"]).unwrap();
-        run(&["commit", "--allow-empty", "-m", "init"]).unwrap();
 
         let from_sub = repo.join("sub").join("dir");
         let (name, root) =
@@ -1695,6 +1991,324 @@ mod tests {
         assert!(
             root.is_none(),
             "no git repo found ⇒ no repo path in the tuple"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Durable per-chunk progress + --resume (#621)
+    // ----------------------------------------------------------------
+
+    /// Same inputs (workspace, project, chunk budget, chunk contents)
+    /// hash to the same fingerprint every time; a different budget (which
+    /// reshapes the chunk plan) must hash differently, so a resume never
+    /// mixes progress from a differently-shaped run into a new one.
+    #[test]
+    fn fingerprint_is_deterministic_and_budget_sensitive() {
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let sources = vec![BootstrapSource {
+            kind: SourceKind::Readme,
+            label: "r".into(),
+            text: "hello".into(),
+        }];
+
+        let chunks_a = plan_bootstrap_chunks(sources.clone(), 24_000);
+        let fp1 = bootstrap_fingerprint(ws, proj, 24_000, &chunks_a);
+        let fp2 = bootstrap_fingerprint(ws, proj, 24_000, &chunks_a);
+        assert_eq!(fp1, fp2, "identical inputs must hash identically");
+
+        let chunks_b = plan_bootstrap_chunks(sources, 12_000);
+        let fp3 = bootstrap_fingerprint(ws, proj, 12_000, &chunks_b);
+        assert_ne!(
+            fp1, fp3,
+            "a different chunk budget must not collide with the original run"
+        );
+    }
+
+    /// A fake LLM whose response (or permanent failure) is scripted per call,
+    /// in order. Lets a test assert exactly how many times bootstrap asked
+    /// the model for a chunk — the thing `--resume` is supposed to change.
+    struct SequencedLlm {
+        calls: AtomicUsize,
+        responses: Vec<serde_json::Value>,
+        /// 0-based call index that fails permanently (non-transient), or
+        /// `None` if every scripted call should succeed.
+        fail_at: Option<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SequencedLlm {
+        fn name(&self) -> &'static str {
+            "sequenced"
+        }
+        fn model(&self) -> &str {
+            "sequenced"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("bootstrap only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_at == Some(n) {
+                return Err(LlmError::Auth("nope".into()));
+            }
+            Ok(self
+                .responses
+                .get(n)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "pages": [], "rationale": "ok" })))
+        }
+    }
+
+    fn page_response(path: &str, rationale: &str) -> serde_json::Value {
+        serde_json::json!({
+            "pages": [{
+                "path": path,
+                "title": path,
+                "body_markdown": format!("body for {path}"),
+                "tags": [],
+            }],
+            "rationale": rationale,
+        })
+    }
+
+    /// Two sources sized so `plan_bootstrap_chunks` splits them into exactly
+    /// two chunks under a small `chunk_input_tokens` budget.
+    fn two_chunk_sources() -> Vec<BootstrapSource> {
+        vec![
+            BootstrapSource {
+                kind: SourceKind::GitCommit,
+                label: "git: one".into(),
+                text: "a".repeat(2_000),
+            },
+            BootstrapSource {
+                kind: SourceKind::GitCommit,
+                label: "git: two".into(),
+                text: "b".repeat(2_000),
+            },
+        ]
+    }
+
+    async fn bootstrap_fixture(
+        tmp: &Path,
+        llm: Arc<dyn LlmProvider>,
+    ) -> (ai_memory_store::Store, Bootstrap, WorkspaceId, ProjectId) {
+        let store = ai_memory_store::Store::open(tmp).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp, store.writer.clone()).unwrap();
+        let bootstrap = Bootstrap {
+            reader: store.reader.clone(),
+            wiki,
+            llm,
+            writer: store.writer.clone(),
+        };
+        (store, bootstrap, ws, proj)
+    }
+
+    fn resume_test_config(ws: WorkspaceId, proj: ProjectId, resume: bool) -> BootstrapConfig {
+        BootstrapConfig {
+            repo_path: PathBuf::new(),
+            workspace_id: ws,
+            project_id: proj,
+            max_input_tokens: 100_000,
+            chunk_input_tokens: 800,
+            sources_collected: None,
+            include_git: true,
+            include_readme: true,
+            include_docs: true,
+            include_code: true,
+            since: None,
+            dry_run: false,
+            force: false,
+            resume,
+        }
+    }
+
+    /// A chunk that fails past its retry budget must not discard the pages
+    /// earlier chunks already produced: the surviving chunk's output is
+    /// recorded durably, and `--resume` picks it up without re-asking the
+    /// LLM for it (#621). Covers the full seed-and-skip path against a real
+    /// `Store` + `Wiki`, not just the isolated store round-trip.
+    #[tokio::test]
+    async fn resume_skips_chunks_already_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sources = two_chunk_sources();
+        // Sanity check on the fixture: chunk_input_tokens=800 must actually
+        // split these two sources into two chunks, or this test proves
+        // nothing about per-chunk resume.
+        let chunk_budget = effective_chunk_budget(800, 100_000);
+        let planned = plan_bootstrap_chunks(sources.clone(), chunk_budget);
+        assert_eq!(planned.len(), 2, "fixture must produce exactly two chunks");
+
+        let first_llm = Arc::new(SequencedLlm {
+            calls: AtomicUsize::new(0),
+            responses: vec![page_response("concepts/a.md", "chunk0")],
+            fail_at: Some(1),
+        });
+        let (store, bootstrap, ws, proj) = bootstrap_fixture(tmp.path(), first_llm.clone()).await;
+
+        let cfg = resume_test_config(ws, proj, false);
+        let err = bootstrap
+            .process_sources(&cfg, sources.clone())
+            .await
+            .expect_err("chunk 1's permanent failure must fail the run");
+        assert!(matches!(err, BootstrapError::Llm(_)));
+        assert_eq!(
+            first_llm.calls.load(Ordering::SeqCst),
+            2,
+            "both chunks must have been attempted"
+        );
+
+        // Chunk 0's pages are durable even though the run as a whole failed.
+        let fingerprint = bootstrap_fingerprint(ws, proj, chunk_budget, &planned);
+        let recorded = store
+            .writer
+            .load_bootstrap_progress(fingerprint.clone())
+            .await
+            .unwrap();
+        assert_eq!(recorded.len(), 1, "only the surviving chunk is recorded");
+        assert_eq!(recorded[0].chunk_index, 0);
+
+        // Re-running with --resume must not re-ask the LLM for chunk 0.
+        let second_llm = Arc::new(SequencedLlm {
+            calls: AtomicUsize::new(0),
+            responses: vec![page_response("concepts/b.md", "chunk1")],
+            fail_at: None,
+        });
+        let bootstrap2 = Bootstrap {
+            reader: store.reader.clone(),
+            wiki: bootstrap.wiki.clone(),
+            llm: second_llm.clone(),
+            writer: store.writer.clone(),
+        };
+        let resume_cfg = resume_test_config(ws, proj, true);
+        let outcome = bootstrap2
+            .process_sources(&resume_cfg, sources)
+            .await
+            .expect("resume should complete once the failing chunk succeeds");
+
+        assert_eq!(
+            second_llm.calls.load(Ordering::SeqCst),
+            1,
+            "chunk 0 must be seeded from progress, not re-asked of the LLM"
+        );
+        assert!(outcome.pages_written.contains(&"concepts/a.md".to_string()));
+        assert!(outcome.pages_written.contains(&"concepts/b.md".to_string()));
+
+        let cleared = store
+            .writer
+            .load_bootstrap_progress(fingerprint)
+            .await
+            .unwrap();
+        assert!(cleared.is_empty(), "a completed run clears its progress");
+    }
+
+    /// Three sources sized so `plan_bootstrap_chunks` splits them into exactly
+    /// three chunks under the same small budget as `two_chunk_sources`.
+    fn three_chunk_sources() -> Vec<BootstrapSource> {
+        (0..3u8)
+            .map(|i| BootstrapSource {
+                kind: SourceKind::GitCommit,
+                label: format!("git: {i}"),
+                text: ((b'a' + i) as char).to_string().repeat(2_000),
+            })
+            .collect()
+    }
+
+    fn one_page_json(path: &str) -> String {
+        serde_json::to_string(&vec![BootstrapPage {
+            path: path.into(),
+            title: path.into(),
+            body_markdown: "body".into(),
+            tags: vec![],
+        }])
+        .unwrap()
+    }
+
+    /// #635: a NON-CONTIGUOUS recorded set — chunk 0 and chunk 2 durable, chunk
+    /// 1 missing (the crash case this feature exists for) — must adopt only the
+    /// contiguous prefix `{0}` and re-run chunks 1 AND 2, so each sees the same
+    /// prior context a clean run would. The stale chunk-2 pages must NOT be
+    /// adopted; they are re-produced by the re-run.
+    #[tokio::test]
+    async fn resume_ignores_a_non_contiguous_gap_and_reruns_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sources = three_chunk_sources();
+        let chunk_budget = effective_chunk_budget(800, 100_000);
+        let planned = plan_bootstrap_chunks(sources.clone(), chunk_budget);
+        assert_eq!(planned.len(), 3, "fixture must produce three chunks");
+
+        // Re-run scripts chunk 1 -> b.md, chunk 2 -> c.md (the fresh chunk-2
+        // page, distinct from the stale one seeded below).
+        let llm = Arc::new(SequencedLlm {
+            calls: AtomicUsize::new(0),
+            responses: vec![
+                page_response("concepts/b.md", "chunk1"),
+                page_response("concepts/c.md", "chunk2"),
+            ],
+            fail_at: None,
+        });
+        let (store, bootstrap, ws, proj) = bootstrap_fixture(tmp.path(), llm.clone()).await;
+        let fingerprint = bootstrap_fingerprint(ws, proj, chunk_budget, &planned);
+
+        // Seed a GAP: chunk 0 (kept) and chunk 2 (stale, must be discarded);
+        // chunk 1 deliberately absent.
+        store
+            .writer
+            .record_bootstrap_chunk(
+                fingerprint.clone(),
+                0,
+                one_page_json("concepts/a.md"),
+                "c0".into(),
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .record_bootstrap_chunk(
+                fingerprint.clone(),
+                2,
+                one_page_json("concepts/stale.md"),
+                "c2-stale".into(),
+            )
+            .await
+            .unwrap();
+
+        let outcome = bootstrap
+            .process_sources(&resume_test_config(ws, proj, true), sources)
+            .await
+            .expect("resume completes");
+
+        // Only chunk 0 was contiguous → chunks 1 and 2 were both re-run.
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            2,
+            "chunk 2 must be re-run (not adopted across the gap), so both 1 and 2 call the LLM"
+        );
+        assert!(outcome.pages_written.contains(&"concepts/a.md".to_string()));
+        assert!(outcome.pages_written.contains(&"concepts/b.md".to_string()));
+        assert!(outcome.pages_written.contains(&"concepts/c.md".to_string()));
+        assert!(
+            !outcome
+                .pages_written
+                .contains(&"concepts/stale.md".to_string()),
+            "the stale chunk-2 page across the gap must not be adopted"
         );
     }
 }

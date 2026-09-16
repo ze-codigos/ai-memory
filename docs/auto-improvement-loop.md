@@ -15,7 +15,11 @@ What that means for you:
 - **Solo with an LLM**: the default is fine — proposals are small,
   bounded, audited (every one lands in the pending-writes trail with
   evidence quotes and a confidence score), and reversible via wiki
-  history. Watch `_pending/` for a week if you want to build trust.
+  history. Run `ai-memory pending-writes list` for a week if you want to
+  build trust — that (and SQLite) is the source of truth for a proposal's
+  status. The `_pending/auto-improve/` sidecar files are a human-readable
+  snapshot frozen at staging time; they do not track a proposal to
+  approved/applied/rejected.
 - **Shared / team server**: set `[auto_improve] require_approval =
   true`. On a server several people trust, an LLM should not
   auto-apply edits nobody reviewed — proposals then wait in
@@ -510,6 +514,10 @@ Durable pending proposal storage lives under `_pending/auto-improve/` as
 non-indexed sidecars plus SQLite rows, with list/diff/approve/reject commands
 and audit rows. Approval applies through the existing wiki mutation boundaries
 with the `auto_improve` actor preserved in proposal provenance.
+
+Only the project-root `_pending/` directory is reserved proposal storage and
+excluded from the OKF migration scan. A nested path such as
+`notes/_pending/legacy.md` remains an ordinary wiki page and must still migrate.
 
 Tests:
 

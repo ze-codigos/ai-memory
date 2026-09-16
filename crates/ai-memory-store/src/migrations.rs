@@ -14,7 +14,45 @@ refinery::embed_migrations!("migrations");
 /// is remapped to [`StoreError::DataSchemaAhead`], which names the offending
 /// migration and points the operator at the fix.
 pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
+    repair_fork_v59_history(conn)?;
     migrations::runner().run(conn).map_err(classify_run_error)?;
+    Ok(())
+}
+
+/// Name the ze-codigos fork gave its `managed_runs` cancelled-state
+/// migration, shipped as V59 before upstream took that number.
+const FORK_MANAGED_RUNS_MIGRATION: &str = "managed_runs_cancelled_state";
+
+/// ze-codigos fork: forget the fork-era V59 so the renumbered V64 can land.
+///
+/// The fork deployed `managed_runs_cancelled_state` as V59 (2026-09-15) and
+/// upstream 2.1 then took V59 for `purged_scopes_tombstones`, so the merge
+/// moved ours to V64. A store migrated by the fork build still records it at
+/// 59 with the old checksum: refinery would reject that row as divergent,
+/// and even with the row renumbered it would refuse to apply upstream
+/// V59–V63 below an applied 64. Dropping the row instead lets the runner
+/// replay upstream V59–V63 and re-apply V64, whose table rebuild is
+/// idempotent on a `managed_runs` that already carries the CHECK.
+fn repair_fork_v59_history(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_history: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'table' AND name = 'refinery_schema_history'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_history == 0 {
+        return Ok(());
+    }
+    let removed = conn.execute(
+        "DELETE FROM refinery_schema_history WHERE version = 59 AND name = ?1",
+        [FORK_MANAGED_RUNS_MIGRATION],
+    )?;
+    if removed > 0 {
+        tracing::warn!(
+            "fork-era V59 ({FORK_MANAGED_RUNS_MIGRATION}) forgotten from schema history; \
+             upstream V59-V63 will apply and it is re-applied as V64"
+        );
+    }
     Ok(())
 }
 
@@ -188,6 +226,81 @@ mod tests {
             schema_object_count(&conn, "trigger", "workstreams_ws_proj_pairing_ai"),
             1
         );
+    }
+
+    /// A store migrated by the ze-codigos fork build carries our
+    /// `managed_runs` cancelled-state migration at V59 — the number upstream
+    /// later took for `purged_scopes_tombstones`. Opening it with this build
+    /// must replay upstream V59–V63, re-apply ours as V64 and keep the rows
+    /// (including a `cancelled` one) instead of aborting as divergent.
+    #[test]
+    fn fork_v59_history_is_replayed_as_v64() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 58).unwrap();
+        // The fork build's V59 is byte-for-byte today's V64.
+        conn.execute_batch(include_str!(
+            "../migrations/V64__managed_runs_cancelled_state.sql"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+             VALUES (59, ?1, '2026-09-15T00:00:00Z', '1')",
+            [FORK_MANAGED_RUNS_MIGRATION],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO managed_runs (id, workstream_id, agent_kind, lease_owner, state, \
+             lease_expires_at, started_at) \
+             VALUES (zeroblob(16), zeroblob(16), 'claude-code', 'host', 'cancelled', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let applied = applied_versions(&conn);
+        assert_eq!(
+            applied.last(),
+            Some(&i64::from(max_supported_version())),
+            "must reach the embedded ceiling: {applied:?}"
+        );
+        assert!(
+            (59..=64).all(|v| applied.contains(&v)),
+            "upstream V59-V63 and our V64 must all be recorded: {applied:?}"
+        );
+        assert_eq!(
+            applied.iter().filter(|v| **v == 59).count(),
+            1,
+            "the fork-era row must be gone, not duplicated: {applied:?}"
+        );
+        let fork_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 64 AND name = ?1",
+                [FORK_MANAGED_RUNS_MIGRATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fork_rows, 1, "ours must be recorded at V64");
+        assert_eq!(schema_object_count(&conn, "table", "purged_scopes"), 1);
+        assert_eq!(
+            schema_object_count(&conn, "index", "idx_managed_runs_one_active"),
+            1
+        );
+        let state: String = conn
+            .query_row("SELECT state FROM managed_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "cancelled", "the rebuild must keep existing rows");
+    }
+
+    /// A store that never saw the fork build has nothing to repair.
+    #[test]
+    fn fork_v59_repair_is_a_no_op_elsewhere() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        let before = applied_versions(&conn);
+        run(&mut conn).unwrap();
+        assert_eq!(applied_versions(&conn), before);
     }
 
     fn applied_versions(conn: &Connection) -> Vec<i64> {

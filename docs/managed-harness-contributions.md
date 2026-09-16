@@ -1,7 +1,7 @@
 # Adding a managed harness
 
 Managed-workstream support is narrower than MCP or lifecycle-hook support. This
-release can manage Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command
+release can manage Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command
 Code, Kiro CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI. Gemini CLI,
 Devin CLI, Cursor, and the other integrations in the README support matrix do
 not become managed merely because ai-memory can capture their hooks.
@@ -167,6 +167,6 @@ Run the repository's complete Rust gate before requesting review:
 ```bash
 cargo fmt --check
 git diff --check
-TAILWIND_SKIP=1 cargo test --workspace
-TAILWIND_SKIP=1 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```

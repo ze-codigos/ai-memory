@@ -244,8 +244,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub fresh: bool,
     /// Agent harness to launch. When omitted, continue the newest managed or
-    /// checkout-local session among the auto-detected harnesses.
-    #[arg(value_enum)]
+    /// checkout-local session among the auto-detected harnesses. Any value
+    /// starting with `claude` (e.g. `claude-corp`, `claude-personal`) also
+    /// selects the Claude harness — see `parse_run_harness_choice`.
+    #[arg(value_parser = parse_run_harness_choice)]
     pub harness: Option<RunHarnessChoice>,
     /// Native harness arguments, forwarded byte-for-byte and in order.
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -255,7 +257,9 @@ pub struct RunArgs {
 /// Harnesses supported by managed workstreams.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum RunHarnessChoice {
-    /// Anthropic Claude Code (`claude`).
+    /// Anthropic Claude Code (`claude`). Any `claude*`-prefixed name (e.g.
+    /// `claude-corp`, `claude-personal`) also selects this harness — see
+    /// `parse_run_harness_choice`.
     #[value(alias = "claude-code")]
     Claude,
     /// OpenAI Codex CLI.
@@ -263,6 +267,9 @@ pub enum RunHarnessChoice {
     /// OpenCode.
     #[value(name = "opencode", alias = "open-code")]
     OpenCode,
+    /// OpenCode 2.0 beta (`opencode2` binary, side-by-side with v1).
+    #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
+    OpenCode2,
     /// Pi coding agent.
     Pi,
     /// Charmbracelet Crush.
@@ -290,6 +297,40 @@ pub enum RunHarnessChoice {
     /// Google Antigravity CLI (`agy`).
     #[value(name = "antigravity", alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+}
+
+/// Parses the `run` harness positional, additionally wildcarding every
+/// `claude*` spelling onto [`RunHarnessChoice::Claude`].
+///
+/// Callers who juggle more than one Claude account (e.g. Corporate and
+/// Personal) commonly resolve `claude` to different accounts through a
+/// `PATH`-visible wrapper script per account (a plain shell `alias` is
+/// invisible to us — `ai-memory run` execs directly, without going through
+/// an interactive shell). Naming those wrappers `claude-corp` /
+/// `claude-personal` and then passing `--executable claude-corp` (bare names
+/// resolve through `PATH` just like the default) already selects the right
+/// binary; this parser just stops the harness argument itself from being
+/// rejected as an unknown value, so `ai-memory run claude-corp --executable
+/// claude-corp` (or any other `claude*` spelling used consistently) reads
+/// naturally instead of forcing every account onto the literal `claude`
+/// token.
+fn parse_run_harness_choice(value: &str) -> Result<RunHarnessChoice, String> {
+    use clap::ValueEnum as _;
+    if let Ok(choice) = RunHarnessChoice::from_str(value, true) {
+        return Ok(choice);
+    }
+    if value.len() > "claude".len() && value.to_ascii_lowercase().starts_with("claude") {
+        return Ok(RunHarnessChoice::Claude);
+    }
+    let known = RunHarnessChoice::value_variants()
+        .iter()
+        .filter_map(clap::ValueEnum::to_possible_value)
+        .map(|value| value.get_name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "invalid value '{value}' for harness; expected one of: {known}, or any `claude*` spelling"
+    ))
 }
 
 /// Arguments for `show`.
@@ -1013,6 +1054,10 @@ pub struct InstallInstructionsArgs {
     /// Skip installing/updating the managed ai-memory Agent Skills.
     #[arg(long)]
     pub no_skills: bool,
+    /// Write a compact routing snippet that delegates to installed Agent Skills
+    /// instead of inlining full operational guidance.
+    #[arg(long)]
+    pub compact: bool,
     /// Scope for managed ai-memory skill installation.
     #[arg(long = "skills-scope", value_enum)]
     pub skills_scope: Option<InstallSkillsScope>,
@@ -1144,6 +1189,10 @@ pub struct BootstrapArgs {
     /// the same project (the manifest is `wiki/bootstrap.md`).
     #[arg(long)]
     pub force: bool,
+    /// Resume an interrupted bootstrap: reuse the chunks already completed
+    /// for the same sources instead of re-running them.
+    #[arg(long)]
+    pub resume: bool,
 }
 
 /// Arguments for `setup-agent`.
@@ -1381,6 +1430,13 @@ pub enum AgentChoice {
     /// them straight to `--agent`, which used to fail on this one.
     #[value(alias = "opencode")]
     OpenCode,
+    /// OpenCode 2.0 beta (`opencode2`, side-by-side with v1) — TypeScript
+    /// plugin hooks under `~/.config/opencode/plugins/` using the V2
+    /// `{ id, setup }` plugin shape. `--apply` writes `ai-memory-opencode2.ts`
+    /// directly; restart OpenCode 2 for it to load. Shares v1's config
+    /// dir, session store, and agent kind.
+    #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
+    OpenCode2,
     /// Real Pi coding agent. The generated TypeScript extension provides
     /// lifecycle capture and bridges ai-memory's HTTP MCP tools into Pi.
     Pi,
@@ -1469,7 +1525,7 @@ impl AgentChoice {
             Self::Codex => AgentKind::Codex,
             Self::Cursor => AgentKind::Cursor,
             Self::GeminiCli => AgentKind::GeminiCli,
-            Self::OpenCode => AgentKind::OpenCode,
+            Self::OpenCode | Self::OpenCode2 => AgentKind::OpenCode,
             Self::Pi => AgentKind::Pi,
             Self::Omp => AgentKind::Omp,
             Self::Openclaw => AgentKind::OpenClaw,
@@ -1493,22 +1549,51 @@ impl AgentChoice {
     #[must_use]
     pub const fn script_hook_subdir(self) -> Option<&'static str> {
         match self {
-            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw | Self::Zero | Self::Zcode => {
-                None
-            }
+            Self::OpenCode
+            | Self::OpenCode2
+            | Self::Pi
+            | Self::Omp
+            | Self::Openclaw
+            | Self::Zero
+            | Self::Zcode => None,
             _ => Some(self.kind().as_str()),
         }
     }
 }
 
+/// Parse a `finalize-session --agent` value into an [`ai_memory_core::AgentKind`].
+///
+/// Unlike the install-oriented `AgentChoice` value-enum, this accepts every
+/// agent the store's CHECK constraint permits, because finalize-session is
+/// agent-agnostic and must be able to close a session for any captured harness
+/// (#623). A genuine typo — which `from_wire` would silently map to `Other` —
+/// is rejected so the operator gets a clear error instead of a mis-scoped
+/// finalize.
+fn parse_finalizable_agent(s: &str) -> Result<ai_memory_core::AgentKind, String> {
+    use ai_memory_core::AgentKind;
+    let kind = AgentKind::from_wire(s);
+    if matches!(kind, AgentKind::Other) && !s.eq_ignore_ascii_case("other") {
+        let known = AgentKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("unknown agent '{s}'; expected one of: {known}"));
+    }
+    Ok(kind)
+}
+
 /// Arguments for `finalize-session`.
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
-    /// Agent kind to finalize. Defaults to Codex for backward compatibility;
-    /// Codex, Antigravity CLI, Pool, and ZCode have no reliable true
-    /// SessionEnd hook.
-    #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
-    pub agent: AgentChoice,
+    /// Agent kind to finalize. Accepts any agent the store recognises — unlike
+    /// `install-hooks`/`setup-agent`, which are limited to agents with a
+    /// first-party installer. finalize-session is agent-agnostic (it just posts
+    /// a synthetic session-end and summarises), so refusing a captured harness
+    /// like `hermes` here only stranded its sessions unclosable (#623).
+    /// Defaults to Codex for backward compatibility.
+    #[arg(long, default_value = "codex", value_parser = parse_finalizable_agent)]
+    pub agent: ai_memory_core::AgentKind,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
     /// `workspace`, else `default`.
     #[arg(long)]
@@ -1554,6 +1639,12 @@ pub enum McpClient {
     /// hook-staging dir name.
     #[value(alias = "opencode")]
     OpenCode,
+    /// OpenCode 2.0 beta (`opencode2`) — `opencode.jsonc`, nested
+    /// `mcp.servers` map with `type: "remote"` + `url` + `headers`.
+    /// V2 drops v1's `enabled` field and disables OAuth discovery for
+    /// header-credentialed servers via `oauth: false`.
+    #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
+    OpenCode2,
     /// Cursor IDE — `~/.cursor/mcp.json` or `.cursor/mcp.json`.
     Cursor,
     /// Anthropic Claude Desktop — uses the `mcp-remote` stdio shim
@@ -1622,6 +1713,22 @@ pub enum McpClient {
     /// `context_servers` map. This integration is MCP-only because Zed
     /// does not expose ai-memory-compatible lifecycle hooks.
     Zed,
+    /// Muse Code (Meta) — `~/.config/muse/settings.json`, servers under a
+    /// top-level snake_case `mcp_servers` map with `transport:
+    /// "streamable_http"` + `url` + `headers`.
+    ///
+    /// Two documented constraints shape the generated entry. The settings
+    /// file must carry `"schema_version": 1` or *every* Muse Code command
+    /// fails at startup with `malformed settings file`, so the writer adds
+    /// the key when it is absent and never rewrites an existing value. And
+    /// `mode` defaults to `required`, which aborts the whole Muse run when
+    /// the server is unreachable; ai-memory augments a session rather than
+    /// gating it, so the entry sets `mode: "optional"` explicitly.
+    ///
+    /// MCP-only: Muse Code's hook surface is documented but its
+    /// `SessionStart` output contract is not, so lifecycle capture and
+    /// managed workstreams are not claimed. See `install-mcp --client muse`.
+    Muse,
 }
 
 /// Arguments for `commit`.
@@ -1649,7 +1756,7 @@ pub enum LlmProviderChoice {
     OpenaiOauth,
     /// GitHub Copilot Chat backend.
     Copilot,
-    /// OpenCode Zen/Go cloud API.
+    /// OpenCode cloud API (Go by default; AI_MEMORY_LLM_BASE_URL selects Zen).
     Opencode,
 }
 
@@ -2298,6 +2405,39 @@ mod tests {
     }
 
     #[test]
+    fn finalize_session_accepts_hermes_and_every_captured_agent() {
+        // #623: hermes is accepted for capture/storage but the install-oriented
+        // AgentChoice enum lacked it, so finalize-session refused it and hermes
+        // sessions could never be closed. finalize is agent-agnostic; it must
+        // accept every AgentKind the store recognises.
+        let parsed = Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "hermes"])
+            .expect("hermes must be a valid finalize agent");
+        let Command::FinalizeSession(args) = parsed.command else {
+            panic!("expected finalize-session command");
+        };
+        assert_eq!(args.agent, ai_memory_core::AgentKind::Hermes);
+
+        // Drift guard: every AgentKind must be finalizable, so the CLI accept
+        // set can never again fall behind the store's CHECK set (the exact
+        // drift that caused #623). `other` is included via its explicit spelling.
+        for kind in ai_memory_core::AgentKind::ALL {
+            let parsed =
+                Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", kind.as_str()])
+                    .unwrap_or_else(|e| panic!("agent {} must finalize: {e}", kind.as_str()));
+            let Command::FinalizeSession(args) = parsed.command else {
+                panic!("expected finalize-session command");
+            };
+            assert_eq!(args.agent, kind, "wire round-trip for {}", kind.as_str());
+        }
+
+        // A genuine typo is rejected rather than silently mapped to Other.
+        assert!(
+            Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "hermez"]).is_err(),
+            "an unknown agent must be rejected, not silently accepted as Other"
+        );
+    }
+
+    #[test]
     fn architecture_lists_every_visible_cli_subcommand() {
         let architecture = include_str!("../../../docs/ARCHITECTURE.md");
         let cli_section = architecture
@@ -2763,6 +2903,84 @@ mod tests {
     }
 
     #[test]
+    fn opencode2_aliases_parse_to_the_beta_variants() {
+        for alias in ["opencode2", "opencode-v2", "open-code2"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse opencode2 alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for opencode2 alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::OpenCode2);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::OpenCode);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374/mcp",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse opencode2 alias {alias}: {error}"));
+            let Command::InstallMcp(args) = cli.command else {
+                panic!("expected install-mcp for opencode2 alias {alias}");
+            };
+            assert_eq!(args.client, McpClient::OpenCode2);
+
+            let cli = Cli::try_parse_from(["ai-memory", "run", alias])
+                .unwrap_or_else(|error| panic!("failed to parse run {alias}: {error}"));
+            let Command::Run(args) = cli.command else {
+                panic!("expected run for opencode2 alias {alias}");
+            };
+            assert!(matches!(args.harness, Some(RunHarnessChoice::OpenCode2)));
+        }
+    }
+
+    #[test]
+    fn claude_wildcard_names_parse_to_the_claude_harness() {
+        // A caller juggling several Claude accounts (Corporate, Personal, ...)
+        // names each account's PATH wrapper `claude-<account>`; every such
+        // spelling must resolve to the Claude harness rather than being
+        // rejected as an unknown value. Case is not significant, and this
+        // covers both the fixed `claude`/`claude-code` names and the
+        // `claude*` wildcard fallback so there is one alias mechanism, not
+        // two overlapping ones.
+        for name in [
+            "claude",
+            "claude-code",
+            "claude-corp",
+            "claude-personal",
+            "CLAUDE-WORK",
+            "claudex",
+        ] {
+            let cli = Cli::try_parse_from(["ai-memory", "run", name])
+                .unwrap_or_else(|error| panic!("failed to parse run {name}: {error}"));
+            let Command::Run(args) = cli.command else {
+                panic!("expected run for claude wildcard name {name}");
+            };
+            assert!(matches!(args.harness, Some(RunHarnessChoice::Claude)));
+        }
+    }
+
+    #[test]
+    fn non_claude_unknown_harness_is_still_rejected() {
+        let error = Cli::try_parse_from(["ai-memory", "run", "banana"])
+            .expect_err("unknown non-claude harness must still be rejected");
+        assert!(
+            error.to_string().contains("expected one of"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn devin_hook_agent_parses() {
         let hook_cli = Cli::try_parse_from([
             "ai-memory",
@@ -2838,7 +3056,7 @@ mod tests {
         let Command::FinalizeSession(args) = cli.command else {
             panic!("expected finalize-session for pool");
         };
-        assert_eq!(args.agent, AgentChoice::Pool);
+        assert_eq!(args.agent, ai_memory_core::AgentKind::Pool);
     }
 
     #[test]
@@ -2866,7 +3084,7 @@ mod tests {
         let Command::FinalizeSession(args) = cli.command else {
             panic!("expected finalize-session for zcode");
         };
-        assert_eq!(args.agent, AgentChoice::Zcode);
+        assert_eq!(args.agent, ai_memory_core::AgentKind::Zcode);
     }
 
     #[test]

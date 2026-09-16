@@ -401,6 +401,26 @@ pub fn parse_agent(s: &str) -> AgentKind {
     AgentKind::from_wire(s)
 }
 
+/// Identify the harness from the payload itself when it carries an
+/// unambiguous vendor marker, overriding the `?agent=` the hook command
+/// declared.
+///
+/// The Cursor CLI also loads and runs the hook commands declared in Claude
+/// Code's `~/.claude/settings.json` (its Claude Code config compatibility
+/// path, alongside `~/.cursor/hooks.json`). Those commands were installed by
+/// `install-hooks --agent claude-code`, so they hardcode
+/// `--agent claude-code` — and a Cursor-driven session was therefore stored
+/// with `agent_kind = claude-code`. The query string is the *installer's*
+/// guess; `cursor_version` is stamped on every Cursor hook payload and never
+/// appears in a Claude Code one, so the body is the stronger evidence.
+///
+/// Returns `None` when the payload carries no vendor marker, leaving the
+/// declared `?agent=` untouched.
+#[must_use]
+pub fn agent_from_payload(raw: &serde_json::Value) -> Option<AgentKind> {
+    extract_string(raw, &["cursor_version"]).map(|_| AgentKind::Cursor)
+}
+
 impl HookEnvelope {
     /// Build an envelope from the parsed query + the body JSON. Performs
     /// best-effort extraction of `session_id` / `cwd` / a body excerpt
@@ -409,10 +429,12 @@ impl HookEnvelope {
     #[must_use]
     pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
-        let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
+        let agent = agent_from_payload(&raw)
+            .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
         // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
-        // tool.execute.*/session.* events; Claude Code uses `session_id`,
-        // Codex `sessionId`, and Antigravity CLI uses `conversationId`.
+        // tool.execute.*/session.* events; Claude Code and native Codex use
+        // `session_id`, older Codex bridges `sessionId`, and Antigravity CLI
+        // uses `conversationId`.
         // JSON keys are case-sensitive, so all spellings must be listed
         // or tool events fail the router's "missing session_id" check.
         let body_session_id = extract_string(
@@ -441,8 +463,16 @@ impl HookEnvelope {
             )
         });
         let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
+        // Cursor spells the workspace directory `workspace_roots` (an array,
+        // normally one entry; multi-root workspaces carry several) and never
+        // sends a usable top-level `cwd`: its `sessionStart` / `sessionEnd`
+        // payloads omit `cwd` entirely, and its tool events send `cwd: ""`.
+        // Without this spelling every Cursor session resolved to no cwd at all
+        // and landed in the server-default `default/scratch` bucket.
         let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
-            .or_else(|| extract_first_string_array_item(&raw, &["workspacePaths"]))
+            .or_else(|| {
+                extract_first_string_array_item(&raw, &["workspacePaths", "workspace_roots"])
+            })
             .or_else(|| {
                 extract_string_path(
                     &raw,
@@ -595,6 +625,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
         agent,
         AgentKind::ClaudeCode
             | AgentKind::CommandCode
+            | AgentKind::Codex
             | AgentKind::OpenCode
             | AgentKind::Pi
             | AgentKind::AntigravityCli
@@ -654,11 +685,16 @@ fn safe_tool_body(
             if metadata.tool_family == crate::capture_policy::ToolFamily::Unknown {
                 return Some(summary);
             }
-            let result =
+            let result = if agent == AgentKind::Codex {
+                // Codex's native schema has one top-level JSON response.
+                // Do not promote unrelated aliases or nested payloads to output.
+                raw.get("tool_response").and_then(value_to_text)
+            } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
                     .or_else(|| antigravity_edit_content(agent, raw))
-                    .unwrap_or_else(|| "(no output captured)".into());
+            }
+            .unwrap_or_else(|| "(no output captured)".into());
             summary.push_str("\n---\n");
             summary.push_str(&result);
             Some(truncate_excerpt(&summary))
@@ -1365,6 +1401,111 @@ mod tests {
         assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
     }
 
+    /// Cursor's `sessionStart` carries no `cwd` key at all — the workspace
+    /// directory arrives only as `workspace_roots`. Shape captured live from
+    /// Cursor CLI 2026.09.02-c22c1a3.
+    #[test]
+    fn envelope_resolves_cursor_session_start_cwd_from_workspace_roots() {
+        let q = HookQuery {
+            event: "session-start".into(),
+            agent: Some("cursor".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "conversation_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "is_background_agent": false,
+            "hook_event_name": "sessionStart",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "workspace_roots": ["/checkouts/repo-a"],
+            "transcript_path": serde_json::Value::Null
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.event, HookEvent::SessionStart);
+        assert_eq!(env.agent, AgentKind::Cursor);
+        assert_eq!(
+            env.cwd.as_deref(),
+            Some("/checkouts/repo-a"),
+            "without workspace_roots the session resolves to no cwd and lands \
+             in the server-default scratch project"
+        );
+    }
+
+    /// Cursor's tool events DO carry a `cwd` key, but send it as an empty
+    /// string; resolution must fall through to `workspace_roots` instead of
+    /// accepting `""`.
+    #[test]
+    fn envelope_resolves_cursor_tool_event_cwd_despite_empty_cwd_string() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("cursor".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "conversation_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "tool_name": "Shell",
+            "tool_input": {"command": "echo cap > CAP.txt", "cwd": "", "timeout": 30000},
+            "tool_use_id": "b0fe7c49-7ee7-45e6-91ee-6ee68b7b17e2",
+            "cwd": "",
+            "hook_event_name": "postToolUse",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "workspace_roots": ["/checkouts/repo-a"]
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.cwd.as_deref(), Some("/checkouts/repo-a"));
+    }
+
+    /// The Cursor CLI also runs the hook commands declared in Claude Code's
+    /// `~/.claude/settings.json`, which `install-hooks --agent claude-code`
+    /// hardcoded to `--agent claude-code`. The payload's `cursor_version`
+    /// identifies the real harness, so the session must not be filed as
+    /// Claude Code.
+    #[test]
+    fn envelope_attributes_cursor_payload_to_cursor_over_declared_claude_code() {
+        let q = HookQuery {
+            event: "session-start".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "conversation_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "hook_event_name": "sessionStart",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "workspace_roots": ["/checkouts/repo-a"]
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.agent, AgentKind::Cursor);
+        assert_eq!(env.cwd.as_deref(), Some("/checkouts/repo-a"));
+    }
+
+    /// A genuine Claude Code payload carries no vendor marker, so the
+    /// declared `?agent=` still decides.
+    #[test]
+    fn envelope_keeps_declared_agent_when_payload_has_no_vendor_marker() {
+        let q = HookQuery {
+            event: "session-start".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "session_id": "abc-123",
+            "cwd": "/checkouts/repo-a",
+            "hook_event_name": "SessionStart"
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.agent, AgentKind::ClaudeCode);
+    }
+
     #[test]
     fn envelope_uses_query_session_id_when_body_omits_it() {
         let q = HookQuery {
@@ -2038,6 +2179,152 @@ mod tests {
         assert_eq!(env.body_excerpt.as_deref(), Some("MARKER_PROMPT_789"));
     }
 
+    // Native fields and canonical tool names follow Codex rust-v0.154.0's
+    // pre/post-tool-use schemas. `tool_response` accepts any JSON value.
+    #[test]
+    fn codex_native_tool_pairs_capture_bounded_output_and_stable_metadata() {
+        for (tool, input, response, family, text) in [
+            (
+                "Bash",
+                serde_json::json!({"command": "echo private-input"}),
+                serde_json::json!("native stdout"),
+                "non-file",
+                "native stdout",
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"command": "*** Begin Patch\n*** Add File: private-input\n+text\n*** End Patch"}),
+                serde_json::json!("Success. Updated the following files:\nA public.txt"),
+                "file",
+                "public.txt",
+            ),
+            (
+                "Bash",
+                serde_json::json!({"command": "private-input"}),
+                serde_json::json!({"stdout": "structured stdout", "exit_code": 1}),
+                "non-file",
+                "structured stdout",
+            ),
+            (
+                "Bash",
+                serde_json::json!({"command": "private-input"}),
+                serde_json::json!([{"type": "text", "text": "block output"}]),
+                "non-file",
+                "block output",
+            ),
+        ] {
+            for event in ["PreToolUse", "PostToolUse"] {
+                let env = HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("codex".into()),
+                        ..Default::default()
+                    },
+                    serde_json::json!({
+                        "session_id": "native-codex", "cwd": "/repo", "turn_id": "turn-1",
+                        "hook_event_name": event, "permission_mode": "bypassPermissions",
+                        "tool_name": tool, "tool_input": input, "tool_response": response,
+                        "tool_use_id": "call-native-1",
+                    }),
+                );
+                assert_eq!(env.agent, AgentKind::Codex);
+                assert_eq!(env.session_id.as_deref(), Some("native-codex"));
+                assert_eq!(env.cwd.as_deref(), Some("/repo"));
+                assert_eq!(env.title_hint, Some(format!("tool {family}")));
+                let body = env.body_excerpt.unwrap();
+                assert!(body.starts_with(&format!(
+                    "tool_family: {family}\ntool_call_id: call-native-1"
+                )));
+                assert!(!body.contains("private-input"));
+                if event == "PostToolUse" {
+                    assert!(body.contains("outcome: unknown"));
+                    assert!(body.contains(text));
+                } else {
+                    assert!(!body.contains(text));
+                    assert!(!body.contains("outcome:"));
+                }
+            }
+        }
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("codex".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"tool_name": "Bash", "tool_use_id": "call-long", "tool_response": {"content": [{"type": "text", "text": "é".repeat(2_000)}]}}),
+        );
+        let body = env.body_excerpt.unwrap();
+        assert!(body.contains('é'));
+        assert!(body.len() <= TOOL_EXCERPT_MAX_BYTES);
+    }
+
+    #[test]
+    fn codex_native_unknown_and_malformed_tools_do_not_promote_unproven_content() {
+        for raw in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!(42),
+            serde_json::json!({"tool_name": 7, "tool_input": {}, "tool_response": "UNPROVEN"}),
+            serde_json::json!({"payload": {"tool_name": "Bash", "tool_input": {}, "tool_response": "UNPROVEN"}}),
+            serde_json::json!({"tool": "Bash", "args": {}, "output": "UNPROVEN"}),
+        ] {
+            for event in ["PreToolUse", "PostToolUse"] {
+                let env = HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("codex".into()),
+                        ..Default::default()
+                    },
+                    raw.clone(),
+                );
+                assert!(env.title_hint.is_none());
+                assert!(env.body_excerpt.is_none());
+            }
+        }
+        for tool in ["mcp__fs__read", "update_plan", "UNPROVEN_TOOL"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PostToolUse".into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"tool_name": tool, "tool_input": {"path": "UNPROVEN"}, "tool_use_id": "call-unknown", "tool_response": {"content": [{"type": "text", "text": "UNPROVEN"}], "structuredContent": {"text": "UNPROVEN"}, "isError": false}}),
+            );
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some("tool_family: unknown\ntool_call_id: call-unknown\noutcome: unknown")
+            );
+        }
+        for response in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        ] {
+            let raw = serde_json::json!({"tool_name": "Bash", "tool_use_id": "invalid\nUNPROVEN", "tool_response": response, "output": "UNPROVEN", "error": "UNPROVEN", "payload": {"tool_response": "UNPROVEN"}});
+            let pre = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PreToolUse".into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                raw.clone(),
+            );
+            assert!(pre.body_excerpt.is_none(), "missing native input");
+            let post = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PostToolUse".into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            assert_eq!(
+                post.body_excerpt.as_deref(),
+                Some("tool_family: non-file\noutcome: unknown\n---\n(no output captured)")
+            );
+        }
+    }
+
     #[test]
     fn closed_tool_summaries_keep_only_safe_metadata_and_cap_total_body() {
         let fixtures = [
@@ -2171,7 +2458,7 @@ mod tests {
         let unsupported = HookEnvelope::from_query_and_body(
             HookQuery {
                 event: "pre-tool-use".into(),
-                agent: Some("codex".into()),
+                agent: Some("other".into()),
                 ..Default::default()
             },
             serde_json::json!({"tool_name":"Bash","tool_input":{"command":"private"}}),

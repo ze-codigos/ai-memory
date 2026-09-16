@@ -114,6 +114,10 @@ struct Storage {
     freelist_count: u64,
     database_bytes: u64,
     reclaimable_bytes: u64,
+    /// Free space on the filesystem holding the database (absent from
+    /// pre-#629 servers).
+    #[serde(default)]
+    data_dir_free_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -282,6 +286,9 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 super::compact::human_bytes(report.storage.database_bytes),
                 super::compact::human_bytes(report.storage.reclaimable_bytes),
             );
+            if let Some(free) = report.storage.data_dir_free_bytes {
+                println!("    filesystem free: {}", super::compact::human_bytes(free));
+            }
             if pct >= RECLAIM_ADVICE_PCT
                 && report.storage.reclaimable_bytes >= RECLAIM_ADVICE_MIN_BYTES
             {
@@ -372,8 +379,34 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         {
             println!("    retry:     {hint}");
         }
+        // Only present when `llm_fallbacks` is configured — an older server
+        // or a plain single-provider setup reports an empty list.
+        if !report.providers.llm_candidates.is_empty() {
+            println!("    fallback chain:");
+            for candidate in &report.providers.llm_candidates {
+                println!("      {}", fallback_candidate_line(candidate));
+            }
+        }
     }
     Ok(())
+}
+
+/// One line per `llm_candidates` entry: label, whether it answered the last
+/// completed call, and its most notable state (an open circuit takes
+/// priority over a stale last-error status).
+fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String {
+    let mut line = format!("{}/{}", candidate.provider, candidate.model);
+    if candidate.last_selected {
+        line.push_str(" (last selected)");
+    }
+    if let Some(until) = &candidate.circuit_open_until {
+        line.push_str(&format!(" — circuit open until {until}"));
+    } else if let Some(status) = candidate.last_error_status {
+        line.push_str(&format!(" — last error: status {status}"));
+    } else if let Some(class) = &candidate.last_error_class {
+        line.push_str(&format!(" — last error: {class}"));
+    }
+    line
 }
 
 /// Render a spool age (ms) as a compact human duration, or `-` when the spool
@@ -506,6 +539,32 @@ mod tests {
         report_offline_spool(&spool, true);
     }
 
+    /// A pre-#629 server's `/admin/status` response has no
+    /// `data_dir_free_bytes` key at all; the field must default to `None`
+    /// rather than fail the whole `storage` object.
+    #[test]
+    fn storage_deserializes_without_free_space_from_an_older_server() {
+        let storage: Storage = serde_json::from_str(
+            r#"{"page_size":4096,"page_count":10,"freelist_count":0,
+                "database_bytes":40960,"reclaimable_bytes":0}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.data_dir_free_bytes, None);
+    }
+
+    /// The signal #629 adds: once a server reports free space, it round-trips
+    /// through the CLI's own struct unchanged.
+    #[test]
+    fn storage_deserializes_free_space_from_a_current_server() {
+        let storage: Storage = serde_json::from_str(
+            r#"{"page_size":4096,"page_count":10,"freelist_count":0,
+                "database_bytes":40960,"reclaimable_bytes":0,
+                "data_dir_free_bytes":80740352}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.data_dir_free_bytes, Some(80_740_352));
+    }
+
     #[test]
     fn provider_health_line_renders_unknown_and_disabled() {
         assert_eq!(
@@ -541,6 +600,42 @@ mod tests {
         assert!(provider_health_line(&role).contains("anthropic-oauth/claude-sonnet-4-6 error"));
         assert!(provider_health_line(&role).contains("status 401"));
         assert!(provider_health_line(&role).contains("bad token"));
+    }
+
+    #[test]
+    fn fallback_candidate_line_marks_the_last_selected_candidate() {
+        let candidate = ai_memory_llm::CandidateHealth {
+            provider: "gemini".to_string(),
+            model: "gemini-3.5-flash".to_string(),
+            last_selected: true,
+            last_success_at: Some("2026-05-28T12:00:00Z".parse::<Timestamp>().unwrap()),
+            last_error_at: None,
+            last_error_status: None,
+            last_error_class: None,
+            circuit_open_until: None,
+        };
+        let line = fallback_candidate_line(&candidate);
+        assert!(line.contains("gemini/gemini-3.5-flash"));
+        assert!(line.contains("last selected"));
+    }
+
+    #[test]
+    fn fallback_candidate_line_surfaces_an_open_circuit_over_a_stale_error() {
+        let when = "2026-05-28T12:00:30Z".parse::<Timestamp>().unwrap();
+        let candidate = ai_memory_llm::CandidateHealth {
+            provider: "openai-compat".to_string(),
+            model: "local-router".to_string(),
+            last_selected: false,
+            last_success_at: None,
+            last_error_at: Some(when),
+            last_error_status: Some(503),
+            last_error_class: Some("provider".to_string()),
+            circuit_open_until: Some(when),
+        };
+        let line = fallback_candidate_line(&candidate);
+        assert!(line.contains("openai-compat/local-router"));
+        assert!(line.contains("circuit open until"));
+        assert!(!line.contains("last error"));
     }
 
     #[test]
