@@ -45,7 +45,7 @@ pub use capture_policy::{
 };
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
-    USER_PROMPT_EXCERPT_MAX_BYTES, cap_lifecycle_body_for_client,
+    USER_PROMPT_EXCERPT_MAX_BYTES, agent_from_payload, cap_lifecycle_body_for_client,
 };
 pub use router::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
@@ -54,3 +54,13 @@ pub use router::{
 };
 pub use synth::synthesize_session_page;
 pub use workstream::{WorkstreamState, workstream_router};
+
+// Integration tests compile into this crate's test harness instead of a
+// separate binary: every test binary is another link and, on macOS and
+// Windows, another first-run malware scan. They still exercise only the
+// public API; `extern crate self` lets them keep addressing it by crate name.
+#[cfg(test)]
+extern crate self as ai_memory_hooks;
+#[cfg(test)]
+#[path = "../tests/suite/mod.rs"]
+mod integration;

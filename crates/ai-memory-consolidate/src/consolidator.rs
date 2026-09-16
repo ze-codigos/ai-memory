@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::projection::{ObservationProjectionConfig, project_observations};
 use crate::types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,
-    SlotKind,
+    Relations, SlotKind,
 };
 
 /// Errors raised by the consolidator.
@@ -214,6 +214,10 @@ impl Consolidator {
                 }),
                 author_id,
                 actor,
+                evidence: vec![ai_memory_core::PageEvidence {
+                    kind: ai_memory_core::PageEvidenceKind::Session,
+                    source_id: session_id.to_string(),
+                }],
             })
             .await?;
         // Auto-commit the result so the supersession lands in git.
@@ -405,6 +409,7 @@ impl Consolidator {
                 // surfaced from here, so no owner scoping applies.
                 ai_memory_core::OwnerFilter::Any,
                 &visibility,
+                false,
             )
             .await?;
         let mut slots = Vec::with_capacity(briefing.slots.len());
@@ -537,6 +542,10 @@ impl Consolidator {
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
             }
+            req.evidence = vec![ai_memory_core::PageEvidence {
+                kind: ai_memory_core::PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+            }];
             // A slot the engine writes belongs to the operator whose session
             // produced it, and `build_update` keeps the model's path verbatim
             // for every non-Rule kind — so the path here is attacker-reachable
@@ -737,6 +746,7 @@ fn build_update(
             serde_json::Value::String(upd.slot_kind.as_str().into()),
         );
     }
+    insert_relations(&mut fm, &upd.relations);
     fm.insert("consolidated".into(), serde_json::Value::Bool(true));
 
     let req = WritePageRequest {
@@ -755,6 +765,7 @@ fn build_update(
         }),
         author_id,
         actor: actor.clone(),
+        evidence: Vec::new(),
     };
     let outcome = ConsolidationOutcome {
         path,
@@ -1052,9 +1063,10 @@ fn build_batch_request_with_slots(
          - \"kind\"            (string)  required — one of: decision | gotcha | rule | fact\n\
          - \"tags\"            (array of string)  required — may be empty `[]`, but the key must be present\n\
          - \"entities\"        (array of string)  required — may be empty `[]`, but the key must be present; see below\n\
+         - \"relations\"       (object) optional — keys: \"causes\", \"fixes\", \"contradicts\"; each contains an array of existing wiki paths. Declare only evidence-backed edges; empty arrays are normal.\n\
          - \"slot_kind\"       (string) optional — ONLY for `_slots/*`; one of \"state\" or \"invariant\"; this is the SLOT WRITE REGIME, NOT a tier value\n\
-         - \"summary\"         (string) optional — ONE line of plain prose saying what the page covers, shown beside the title in listings. NOT a heading, NOT a `- **key:** value` bullet, NOT a list item, NOT a repeat of the title: a summary shaped like any of those is discarded and the page ends up described worse than if you had omitted it. Omit the key rather than guessing.\n\
-         No other keys except optional `slot_kind` on `_slots/*` and optional `summary`. No `body`, no `content`. Field names \
+         - \"summary\"         (string) optional — ONE line of plain prose describing the page, shown beside its title. Headings, `- **key:** value` bullets, list items, and repeated titles are discarded. Omit rather than guess.\n\
+         Use only the keys listed above. No `body`, no `content`. Field names \
          are case-sensitive and the `_markdown` suffix matters.\n\
          \n## `entities` field — the specific nouns the page is about\n\
          Up to 10 short names (max 64 chars each), lowercase, taken from \
@@ -1465,18 +1477,20 @@ fn build_frontmatter(
     if let Some(summary) = usable_summary(page.summary.as_deref(), &page.title) {
         map.insert("summary".into(), serde_json::Value::String(summary));
     }
+    insert_relations(&mut map, &page.relations);
+    map.insert("consolidated".into(), serde_json::Value::Bool(true));
+    serde_json::Value::Object(map)
+}
+
+fn insert_relations(map: &mut serde_json::Map<String, serde_json::Value>, relations: &Relations) {
     // Typed edges (2.0 item 3): only vocabulary keys survive — an LLM
     // inventing `blames:` must not mint a new edge kind. The wiki write
     // boundary parses this frontmatter into typed links.
-    let relations: serde_json::Map<String, serde_json::Value> = page
-        .relations
-        .iter()
-        .filter(|(key, targets)| {
-            ai_memory_core::Relation::parse(key).is_some() && !targets.is_empty()
-        })
-        .map(|(key, targets)| {
+    let relations: serde_json::Map<String, serde_json::Value> = relations
+        .non_empty()
+        .map(|(relation, targets)| {
             (
-                key.clone(),
+                relation.as_str().to_string(),
                 serde_json::Value::Array(
                     targets
                         .iter()
@@ -1489,8 +1503,6 @@ fn build_frontmatter(
     if !relations.is_empty() {
         map.insert("relations".into(), serde_json::Value::Object(relations));
     }
-    map.insert("consolidated".into(), serde_json::Value::Bool(true));
-    serde_json::Value::Object(map)
 }
 
 fn stamp_session_origin(
@@ -1938,6 +1950,7 @@ mod tests {
             summary: summary.map(str::to_owned),
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: Vec::new(),
         }
     }
@@ -1998,7 +2011,7 @@ mod tests {
             body_markdown: "Body prose.".into(),
             tags: Vec::new(),
             summary: Some("Bounded the queue so backpressure is testable.".into()),
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations::default(),
         };
         let session_id = SessionId::new();
         let frontmatter = build_frontmatter(&page, session_id, AgentKind::Codex);
@@ -2036,26 +2049,173 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("ONE line of plain prose"));
     }
 
-    /// Only the closed vocabulary survives into `relations:` frontmatter
-    /// — an LLM inventing `blames:` must not mint a new edge kind.
+    /// Only non-empty, closed-vocabulary edges reach `relations:` frontmatter.
+    /// The vocabulary is now enforced by the `Relations` type (#630) — there is
+    /// no field for an invented `blames:`, so a bogus edge kind is unrepresentable
+    /// rather than filtered — and an empty kind is omitted.
     #[test]
-    fn relations_frontmatter_keeps_only_the_vocabulary() {
-        let mut page = ConsolidatedPage {
+    fn relations_frontmatter_keeps_only_non_empty_vocabulary() {
+        let page = ConsolidatedPage {
             title: "T".into(),
             body_markdown: "b".into(),
             tags: vec![],
             summary: None,
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations {
+                fixes: vec!["gotchas/g.md".into()],
+                causes: vec![], // empty -> omitted
+                contradicts: vec![],
+            },
         };
-        page.relations
-            .insert("fixes".into(), vec!["gotchas/g.md".into()]);
-        page.relations
-            .insert("blames".into(), vec!["notes/x.md".into()]);
-        page.relations.insert("causes".into(), vec![]);
         let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
         let relations = fm["relations"].as_object().unwrap();
         assert_eq!(relations.len(), 1, "{relations:?}");
         assert_eq!(relations["fixes"][0], "gotchas/g.md");
+    }
+
+    /// #630: the `relations` schema must be a FIXED object with named fields,
+    /// not an open `additionalProperties` map — otherwise OpenAI strict mode
+    /// closes it and the model can never emit an edge on any OpenAI-family
+    /// provider. Pin the shape so a revert to `BTreeMap` fails here.
+    #[test]
+    fn relations_schema_is_a_fixed_object_not_an_open_map() {
+        let schema = serde_json::to_value(schemars::schema_for!(Relations)).unwrap();
+        let props = schema["properties"]
+            .as_object()
+            .expect("relations must be a fixed object with named properties, not an open map");
+        assert!(props.contains_key("causes"));
+        assert!(props.contains_key("fixes"));
+        assert!(props.contains_key("contradicts"));
+        // An open map renders `additionalProperties` as a *schema object*; a
+        // fixed struct renders it as absent or `false`. It must not be a schema.
+        assert!(
+            !schema["additionalProperties"].is_object(),
+            "relations must not carry a schema-valued additionalProperties (open map)"
+        );
+    }
+
+    #[test]
+    fn batch_relations_schema_uses_the_closed_vocabulary() {
+        let request = build_batch_request(SessionId::new(), &[]);
+        assert!(request.messages[0].content.contains("- \"relations\""));
+        let schema = serde_json::to_value(schemars::schema_for!(ConsolidatedBatch)).unwrap();
+        let update = &schema["$defs"]["ConsolidatedPageUpdate"];
+        assert_eq!(
+            update["properties"]["relations"]["$ref"], "#/$defs/Relations",
+            "the batch prompt's relations field must be expressible in structured output"
+        );
+        let relations = &schema["$defs"]["Relations"];
+        let properties = relations["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 3);
+        for kind in ["causes", "fixes", "contradicts"] {
+            assert_eq!(properties[kind]["type"], "array");
+            assert_eq!(properties[kind]["items"]["type"], "string");
+        }
+        assert!(!relations["additionalProperties"].is_object());
+    }
+
+    #[tokio::test]
+    async fn batch_relations_reach_frontmatter_and_typed_link_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let target = "gotchas/linker.md";
+        let target_id = wiki
+            .write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(target).unwrap(),
+                frontmatter: serde_json::json!({}),
+                body: "The linker runs out of memory.".into(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Linker memory limit".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let path = PagePath::new("notes/linker-investigation.md").unwrap();
+        let relations = serde_json::json!({
+            "causes": [target], "fixes": [target], "contradicts": [target]
+        });
+        let mut response = batch_targeting(path.as_str(), "The session investigated the linker.");
+        response["updates"][0]["relations"] = relations.clone();
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        assert_eq!(stored.frontmatter["relations"], relations);
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let rows: Vec<(String, Vec<u8>)> = db
+            .prepare(
+                "SELECT link_type, to_page_id FROM links WHERE from_page_id = ?1 \
+                 ORDER BY link_type",
+            )
+            .unwrap()
+            .query_map([outcomes[0].page_id.unwrap().as_bytes()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            ["causes", "contradicts", "fixes"]
+                .into_iter()
+                .map(|kind| (kind.to_string(), target_id.as_bytes().to_vec()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn batch_relations_omit_empty_and_unknown_kinds() {
+        for supplied in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"causes": [], "fixes": [], "contradicts": []})),
+            Some(
+                serde_json::json!({"fixes": ["gotchas/linker.md"], "causes": [], "blames": ["notes/a.md"]}),
+            ),
+        ] {
+            let mut response = batch_targeting("notes/fix.md", "Fixed the linker.");
+            if let Some(ref relations) = supplied {
+                response["updates"][0]["relations"] = relations.clone();
+            }
+            let batch: ConsolidatedBatch = serde_json::from_value(response).unwrap();
+            let (req, _) = build_update(
+                WorkspaceId::new(),
+                ProjectId::new(),
+                &batch.updates[0],
+                false,
+                &ai_memory_core::ActorContext::anonymous(),
+                None,
+            )
+            .unwrap();
+            if supplied.as_ref().is_some_and(|r| r.get("blames").is_some()) {
+                assert_eq!(
+                    req.frontmatter["relations"],
+                    serde_json::json!({"fixes": ["gotchas/linker.md"]})
+                );
+            } else {
+                assert!(req.frontmatter.get("relations").is_none());
+            }
+        }
     }
 
     #[test]
@@ -2065,7 +2225,7 @@ mod tests {
             body_markdown: "b".into(),
             tags: vec![],
             summary: None,
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations::default(),
         };
         let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
         assert!(fm.get("relations").is_none());
@@ -2082,6 +2242,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: Vec::new(),
         };
         let (req, _) = build_update(
@@ -2107,6 +2268,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: Vec::new(),
         };
         let actor = ai_memory_core::ActorContext {
@@ -2147,6 +2309,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: Vec::new(),
         };
         let (req, outcome) = build_update(
@@ -2177,6 +2340,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: vec![
                 " SQLite ".into(),
                 "sqlite".into(),
@@ -2213,6 +2377,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::Invariant,
+            relations: Relations::default(),
             entities: Vec::new(),
         };
         let (req, _) = build_update(
@@ -2484,6 +2649,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2576,6 +2742,50 @@ mod tests {
         }
     }
 
+    /// P2 (docs/design-hindsight-borrowings.md §3): the single-page
+    /// consolidation write cites the session it consolidated as evidence,
+    /// in the same transaction as the page upsert — purely rule-based, no
+    /// LLM involvement in the citation itself.
+    #[tokio::test]
+    async fn single_page_consolidation_records_session_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "title": "Queue decision",
+            "body_markdown": "The queue is bounded.",
+            "tags": [],
+        });
+
+        let outcome = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let page_id = outcome.page_id.unwrap();
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let rows: Vec<(String, String)> = db
+            .prepare("SELECT source_kind, source_id FROM page_evidence WHERE page_id = ?1")
+            .unwrap()
+            .query_map([page_id.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![("session".to_string(), session.to_string())]);
+    }
+
     /// The multi-page provider path uses the same provenance contract for its
     /// canonical session anchor, while non-session pages remain outside item 1
     /// of #494.
@@ -2606,7 +2816,7 @@ mod tests {
             ]
         });
 
-        Consolidator::new(
+        let outcomes = Consolidator::new(
             store.reader.clone(),
             store.writer.clone(),
             wiki.clone(),
@@ -2635,6 +2845,27 @@ mod tests {
             .unwrap();
         assert!(concept.frontmatter.get("agent").is_none());
         assert!(concept.frontmatter.get("session_id").is_none());
+
+        // P2 (docs/design-hindsight-borrowings.md §3): unlike the anchor-only
+        // `session_id`/`agent` frontmatter stamp above, EVERY page a batch
+        // produces cites the session that produced it as evidence.
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        for outcome in &outcomes {
+            let page_id = outcome.page_id.unwrap();
+            let rows: Vec<(String, String)> = db
+                .prepare("SELECT source_kind, source_id FROM page_evidence WHERE page_id = ?1")
+                .unwrap()
+                .query_map([page_id.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![("session".to_string(), session.to_string())],
+                "path {} must cite the batch's session as evidence",
+                outcome.path.as_str()
+            );
+        }
     }
 
     /// A batch whose single update targets `path` — the model chooses this
@@ -3520,6 +3751,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -3529,7 +3761,7 @@ mod tests {
             .await
             .expect("page body becomes instructions");
         assert!(from_page.contains("Prefer the `infra` tag."));
-        assert!(from_page.contains("[REDACTED]"));
+        assert!(from_page.contains("[REDACTED:api_key]"));
         assert!(!from_page.contains("deadbeef"));
         assert!(
             from_page.chars().count() <= MAX_PROJECT_INSTRUCTIONS_CHARS,
@@ -3556,6 +3788,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -3588,6 +3821,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

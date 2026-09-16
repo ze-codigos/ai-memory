@@ -16,6 +16,8 @@
 //! * **OpenAI**: `response_format = { type: "json_schema", strict: true }`.
 //! * **OpenAI OAuth/Codex**: ChatGPT/Codex Responses API with
 //!   `text.format = { type: "json_schema", strict: true }`.
+//! * **OpenCode Go**: Responses API for GPT-5.6 Luna; OpenAI-compatible Chat
+//!   Completions for the rest of the catalogue.
 //! * **GitHub Copilot**: GitHub token exchange to a short-lived Copilot API
 //!   token, then OpenAI-style Chat Completions with JSON schema format.
 //! * **Gemini**: `generationConfig.responseMimeType = "application/json"`
@@ -36,12 +38,42 @@
 /// (read once by `Config::load`, applied to every chat provider).
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// `User-Agent` ai-memory sends on provider requests.
+///
+/// `reqwest` sends no `User-Agent` at all unless one is configured, so every
+/// ai-memory provider request used to arrive anonymous. Gateways increasingly
+/// require callers to identify themselves — OpenCode asks for a
+/// specific agent ("no broad user agents") and reports traffic without one as
+/// an unknown client — and an unattributable request is the one a rate
+/// limiter throttles first.
+///
+/// Layered *under* `AI_MEMORY_LLM_HEADERS` by
+/// [`factory::build_provider`], so an operator can still override it. The
+/// Copilot provider keeps [`copilot::COPILOT_USER_AGENT`] instead: GitHub's
+/// Copilot API expects the editor-plugin agent and rejects requests without
+/// it.
+pub const DEFAULT_USER_AGENT: &str = concat!("ai-memory/", env!("CARGO_PKG_VERSION"));
+
+/// `HTTP-Referer` ai-memory sends to OpenRouter.
+///
+/// OpenRouter attributes usage to an app on its public leaderboard by
+/// `HTTP-Referer` and [`OPENROUTER_X_TITLE`]; without them, ai-memory's
+/// requests show up unattributed. Layered under `AI_MEMORY_LLM_HEADERS` by
+/// [`factory::build_provider`] only when the `openai-compat` base URL points
+/// at `openrouter.ai`, so a non-OpenRouter compat endpoint (Ollama, vLLM,
+/// LM Studio) never receives these.
+pub const OPENROUTER_HTTP_REFERER: &str = "https://github.com/akitaonrails/ai-memory";
+
+/// `X-Title` ai-memory sends to OpenRouter. See [`OPENROUTER_HTTP_REFERER`].
+pub const OPENROUTER_X_TITLE: &str = "ai-memory";
+
 pub mod anthropic;
 pub mod auth;
 pub mod copilot;
 pub mod embedding;
 pub mod error;
 pub mod factory;
+pub mod fallback;
 pub mod gemini;
 pub mod google;
 pub mod health;
@@ -76,10 +108,12 @@ pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
     default_embedding_dim, try_default_embedding_dim,
 };
+pub use fallback::{CIRCUIT_COOLDOWN, Candidate, FallbackLlmProvider};
 pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
-    ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
+    CandidateHealth, ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus,
+    ProviderRoleHealthSnapshot,
 };
 #[cfg(feature = "local-embeddings")]
 pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
@@ -95,10 +129,25 @@ pub use openai_oauth::{
     OPENAI_OAUTH_TOKEN_URL, OpenAiExtras, OpenAiOAuthProvider, OpenAiOAuthToken,
     OpenAiOAuthTokenResponse,
 };
-pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
+#[allow(deprecated)]
+pub use opencode::OPENCODE_ZEN_BASE_URL;
+pub use opencode::{
+    OPENCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL, OPENCODE_SESSION_HEADER, OpenCodeProvider,
+};
 pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
 pub use types::{
-    ChatMessage, ChatRequest, ChatResponse, LlmOperationId, ReasoningEffort, Role, Usage,
+    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Role,
+    Usage,
 };
+
+// Integration tests compile into this crate's test harness instead of a
+// separate binary: every test binary is another link and, on macOS and
+// Windows, another first-run malware scan. They still exercise only the
+// public API; `extern crate self` lets them keep addressing it by crate name.
+#[cfg(test)]
+extern crate self as ai_memory_llm;
+#[cfg(test)]
+#[path = "../tests/suite/mod.rs"]
+mod integration;

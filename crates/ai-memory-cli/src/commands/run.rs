@@ -1359,6 +1359,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Claude => ManagedHarness::Claude,
         RunHarnessChoice::Codex => ManagedHarness::Codex,
         RunHarnessChoice::OpenCode => ManagedHarness::OpenCode,
+        RunHarnessChoice::OpenCode2 => ManagedHarness::OpenCode2,
         RunHarnessChoice::Pi => ManagedHarness::Pi,
         RunHarnessChoice::Crush => ManagedHarness::Crush,
         RunHarnessChoice::Omp => ManagedHarness::Omp,

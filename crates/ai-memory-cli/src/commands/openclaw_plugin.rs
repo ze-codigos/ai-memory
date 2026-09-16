@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 
 use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
-use crate::commands::render_shared::{ts_capture_policy_v1, ts_spool_runtime, ts_string_literal};
+use crate::commands::render_shared::{
+    ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime, ts_string_literal,
+};
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
 pub(crate) const PACKAGE_NAME: &str = "@ai-memory/openclaw-plugin";
@@ -22,12 +24,13 @@ pub(crate) fn apply(
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
+    capture_mode: &str,
 ) -> Result<()> {
     let plugin_dir = resolve_plugin_dir(args)?;
     let strategy = args
         .project_strategy
         .and_then(crate::cli::ProjectStrategyArg::baked);
-    let outcomes = write_package(&plugin_dir, server_url, auth_token, strategy)?;
+    let outcomes = write_package(&plugin_dir, server_url, auth_token, strategy, capture_mode)?;
     for (path, outcome) in &outcomes {
         println!(
             "✓ {} {} ({})",
@@ -62,7 +65,12 @@ pub(crate) fn apply(
 }
 
 /// Print the generated package for manual installation.
-pub(crate) fn render(server_url: &str, auth_token: Option<&str>, project_strategy: Option<&str>) {
+pub(crate) fn render(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+    capture_mode: &str,
+) {
     println!("# OpenClaw native plugin package");
     println!("# Re-run with `--apply` to write the package and call:");
     println!("#   openclaw plugins install --link <package-dir> --force");
@@ -74,7 +82,10 @@ pub(crate) fn render(server_url: &str, auth_token: Option<&str>, project_strateg
     println!("## {MANIFEST_JSON}");
     println!("{}", manifest_json());
     println!("## {ENTRYPOINT_TS}");
-    println!("{}", build_plugin(server_url, auth_token, project_strategy));
+    println!(
+        "{}",
+        build_plugin(server_url, auth_token, project_strategy, capture_mode)
+    );
 }
 
 fn outcome_detail(outcome: ApplyOutcome) -> &'static str {
@@ -104,13 +115,14 @@ fn write_package(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> Result<Vec<(PathBuf, ApplyOutcome)>> {
     let files = [
         (PACKAGE_JSON, package_json()),
         (MANIFEST_JSON, manifest_json()),
         (
             ENTRYPOINT_TS,
-            build_plugin(server_url, auth_token, project_strategy),
+            build_plugin(server_url, auth_token, project_strategy, capture_mode),
         ),
     ];
     let mut outcomes = Vec::with_capacity(files.len());
@@ -203,15 +215,21 @@ pub(crate) fn manifest_json() -> String {
 /// default when no marker pins a `project_strategy` (#128); a marker's own
 /// `project` / `project_strategy` still win (§3.3). Mirrors the opencode/omp
 /// `ts_apply_marker_params` in `install_hooks.rs`.
+///
+/// Scope/settings resolution walks past a capture-only marker to the nearest
+/// ancestor marker that declares a setting (#668) via `findSettingsMarker`
+/// (`TS_FIND_SETTINGS_MARKER`, shared with `ts_apply_marker_params` so both
+/// copies stay equivalent).
 fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     let toml_flag = super::install_hooks::TS_TOML_FLAG;
+    let find_settings_marker = super::install_hooks::TS_FIND_SETTINGS_MARKER;
     let Some(default) = default_strategy else {
         return format!(
-            "{toml_flag}\n{}",
+            "{toml_flag}\n{find_settings_marker}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   if (!cwd) return;
   url.searchParams.set("cwd", cwd);
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (!marker) return;
   try {
     const body = readFileSync(marker, "utf8");
@@ -254,7 +272,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
       const body = readFileSync(marker, "utf8");
@@ -289,7 +307,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{find_settings_marker}\n{body}",
         ts_string_literal(default)
     )
 }
@@ -298,12 +316,14 @@ fn build_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> String {
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
+    let resolve_fn = ts_resolve_token_fn();
     let apply_marker_params = apply_marker_params_ts(project_strategy);
-    let capture_policy = ts_capture_policy_v1();
+    let capture_policy = ts_capture_policy_v1(capture_mode);
     format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent openclaw --apply`.
 // Edit by re-running the command, not by hand. install-hooks owns
@@ -317,7 +337,7 @@ import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
 const AGENT = "openclaw";
-{token_line}
+{token_line}{resolve_fn}
 {capture_policy}
 
 function timeoutSignal(ms: number): AbortSignal | undefined {{
@@ -327,7 +347,8 @@ function timeoutSignal(ms: number): AbortSignal | undefined {{
 }}
 
 function authHeaders(): Record<string, string> {{
-  return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
+  const token = resolveToken();
+  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
 }}
 
 function findMarker(cwd: string | undefined): string | undefined {{
@@ -429,6 +450,28 @@ const startedSessions = new Set<string>();
 const handoffChecked = new Set<string>();
 const preCompactLast = new Map<string, number>();
 
+const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
+const pendingHookRequests = new Set<Promise<void>>();
+
+function trackHookRequest(request: Promise<void>): void {{
+  pendingHookRequests.add(request);
+  void request.finally(() => pendingHookRequests.delete(request));
+}}
+
+function disposeDrainTimeout(): Promise<void> {{
+  return new Promise((resolve) => {{
+    const timer = setTimeout(resolve, HOOK_DISPOSE_DRAIN_BUDGET_MS);
+    timer.unref?.();
+  }});
+}}
+
+async function drainHookQueueForDispose(): Promise<void> {{
+  await Promise.race([
+    Promise.allSettled(Array.from(pendingHookRequests)),
+    disposeDrainTimeout(),
+  ]);
+}}
+
 function rememberSession(event: any, ctx: any): void {{
   const id = sessionID(event, ctx);
   if (!id || startedSessions.has(id)) return;
@@ -457,7 +500,9 @@ function postPreCompact(event: any, ctx: any): void {{
     // Fire-and-forget, but never silent loss: an unreachable server or
     // 5xx spools the event in the CLI hook-spool format for a later
     // drain (#580); a delivered post opportunistically drains backlog.
-    void fetch(url, {{
+    // Tracked in pendingHookRequests so session_end can await a bounded
+    // flush instead of letting teardown kill the in-flight fetch (#676).
+    const request = fetch(url, {{
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
@@ -469,6 +514,7 @@ function postPreCompact(event: any, ctx: any): void {{
         else requestSpoolDrain();
       }})
       .catch(() => undefined);
+    trackHookRequest(request);
   }} catch (_e) {{
     try {{ spoolFailedHook(url, policy.payload); }} catch (_e2) {{}}
   }}
@@ -485,6 +531,7 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
+    if (!response.ok) return undefined;
     const text = (await response.text()).trim();
     return text.length > 0 ? text : undefined;
   }} catch (_e) {{
@@ -501,9 +548,10 @@ export default definePluginEntry({{
       rememberSession(event, ctx);
     }});
 
-    api.on("session_end", (event: any, ctx: any) => {{
+    api.on("session_end", async (event: any, ctx: any) => {{
       rememberSession(event, ctx);
       postHook("session-end", payload(event, ctx, {{ reason: event?.reason }}));
+      await drainHookQueueForDispose();
     }});
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {{
@@ -568,7 +616,7 @@ mod tests {
     fn openclaw_plugin_spools_failed_deliveries() {
         // #580: OpenClaw's fire-and-forget postHook must persist failures
         // in the CLI hook-spool format and drain the backlog on success.
-        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(plugin.contains("function spoolFailedHook("));
         assert!(plugin.contains("async function drainHookSpool()"));
         assert!(
@@ -595,7 +643,7 @@ mod tests {
     fn package_has_manifest_and_hook_entrypoint() {
         let package = package_json();
         let manifest = manifest_json();
-        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert!(package.contains(r#""extensions""#));
         assert!(package.contains(r#""./index.ts""#));
@@ -605,6 +653,19 @@ mod tests {
         assert!(plugin.contains("definePluginEntry"));
         assert!(plugin.contains("api.on(\"session_start\""));
         assert!(plugin.contains("api.on(\"session_end\""));
+        // #676: session_end must be async and await a bounded flush of the
+        // in-flight postHook fetch, otherwise the gateway tears the plugin
+        // down before the session-end request reaches the server.
+        assert!(plugin.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(plugin.contains("function disposeDrainTimeout(): Promise<void>"));
+        assert!(plugin.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(plugin.contains("function trackHookRequest("));
+        assert!(plugin.contains("api.on(\"session_end\", async (event: any, ctx: any) => {"));
+        assert!(plugin.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !plugin.contains("api.on(\"session_end\", (event: any, ctx: any) => {"),
+            "session_end must not regress to the sync fire-and-forget form: {plugin}"
+        );
         assert!(plugin.contains("api.on(\"before_prompt_build\""));
         assert!(plugin.contains("api.on(\"before_tool_call\""));
         assert!(plugin.contains("api.on(\"after_tool_call\""));
@@ -620,6 +681,16 @@ mod tests {
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: same settings-walk as the shared ts_apply_marker_params
+        // (install_hooks.rs) — the two applyMarkerParams copies stay
+        // equivalent, so a nested capture-only marker does not shadow an
+        // outer marker's scope here either.
+        assert!(plugin.contains("function findSettingsMarker"));
+        assert!(plugin.contains("function declaresSettings"));
+        assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(
+            plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(plugin.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(
             plugin.contains("import { basename, dirname, join, resolve, sep } from \"node:path\";")
@@ -642,13 +713,26 @@ mod tests {
         assert!(plugin.contains("const policy = capturePolicy(body"));
         assert!(plugin.contains("body: JSON.stringify(policy.payload)"));
         assert!(plugin.contains("prependContext: handoff"));
-        assert!(plugin.contains("Bearer ${TOKEN}"));
+        assert!(plugin.contains("Bearer ${token}"));
         assert!(plugin.contains("tok"));
     }
 
     #[test]
+    fn openclaw_plugin_resolves_token_at_runtime_when_not_embedded() {
+        let plugin = build_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(plugin.contains("function resolveToken("));
+        assert!(plugin.contains("const token = resolveToken();"));
+        assert!(plugin.contains("if (!response.ok) return undefined;"));
+    }
+
+    #[test]
     fn openclaw_plugin_bakes_repo_root_default() {
-        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), Some("repo-root"));
+        let plugin = build_plugin(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            Some("repo-root"),
+            "denylist",
+        );
         assert!(
             plugin.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
             "repo-root install default must bake the const: {plugin}"
@@ -657,11 +741,15 @@ mod tests {
             plugin.contains("if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;"),
             "must apply the default when a marker pins no strategy: {plugin}"
         );
+        assert!(
+            plugin.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
+        );
     }
 
     #[test]
     fn openclaw_plugin_default_omits_baked_strategy() {
-        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(
             !plugin.contains("DEFAULT_PROJECT_STRATEGY"),
             "basename default must bake no strategy: {plugin}"
@@ -669,9 +757,47 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_plugin_bakes_allowlist_admit_gate() {
+        // #661: the generated OpenClaw plugin POSTs to `<server>/hook` directly
+        // and never runs through the native `ai-memory hook` admit gate
+        // (`repository_admits_capture` in `ai-memory-hooks::capture_policy`), so
+        // the shared TS template must carry an equivalent gate keyed on marker
+        // *presence*, baked from `--capture-mode`.
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "allowlist mode must be baked into the emitted constant: {plugin}"
+        );
+        assert!(
+            plugin.contains(
+                "const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === \"allowlist\" && !markerPresent) return { disposition: \"drop\", payload };"
+            ),
+            "allowlist build must carry the marker-presence admit gate: {plugin}"
+        );
+    }
+
+    #[test]
+    fn openclaw_plugin_denylist_bakes_inert_gate() {
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "denylist mode must be baked into the emitted constant: {plugin}"
+        );
+        // The gate expression is present in every build (it's part of the one
+        // shared template) but is inert under denylist, since `CAPTURE_MODE`
+        // never equals `"allowlist"`.
+        assert!(
+            plugin.contains(
+                "const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === \"allowlist\" && !markerPresent) return { disposition: \"drop\", payload };"
+            )
+        );
+    }
+
+    #[test]
     fn package_writes_all_required_files() {
         let tmp = TempDir::new().unwrap();
-        let outcomes = write_package(tmp.path(), "http://127.0.0.1:49374", None, None).unwrap();
+        let outcomes =
+            write_package(tmp.path(), "http://127.0.0.1:49374", None, None, "denylist").unwrap();
 
         assert_eq!(outcomes.len(), 3);
         assert!(tmp.path().join(PACKAGE_JSON).is_file());

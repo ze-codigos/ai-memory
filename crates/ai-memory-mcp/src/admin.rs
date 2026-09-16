@@ -218,6 +218,10 @@ struct BootstrapRequest {
     /// Allow re-bootstrap when `wiki/bootstrap.md` already exists.
     #[serde(default)]
     force: bool,
+    /// Resume an interrupted bootstrap: reuse the chunks already completed
+    /// for the same sources instead of re-running them (#621).
+    #[serde(default)]
+    resume: bool,
 }
 
 fn default_max_input_tokens() -> usize {
@@ -1789,12 +1793,14 @@ async fn handle_bootstrap(
         since: None,
         dry_run: req.dry_run,
         force: req.force,
+        resume: req.resume,
     };
 
     let bootstrap = Bootstrap {
         reader: state.reader.clone(),
         wiki: state.wiki.clone(),
         llm,
+        writer: state.writer.clone(),
     };
 
     match bootstrap.process_sources(&cfg, req.sources).await {
@@ -1824,7 +1830,22 @@ fn bootstrap_error_response(
         BootstrapError::Llm(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    log_server_error(status, "bootstrap", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
+/// Record a failure the server owns.
+///
+/// A 5xx says the request was fine and *we* could not serve it, so the reason
+/// belongs in the server's log: the response body reaches one client once and
+/// is gone when its process exits, which is how an upstream provider 404
+/// managed to fail every bootstrap while the log showed only the run starting
+/// (#692). A 4xx stays quiet — the caller was told, and the caller was at
+/// fault.
+fn log_server_error(status: StatusCode, operation: &str, error: &dyn std::fmt::Display) {
+    if status.is_server_error() {
+        warn!(%status, operation, %error, "admin request failed");
+    }
 }
 
 /// Build a dry-run [`BootstrapOutcome`] without an LLM by applying the
@@ -2284,6 +2305,7 @@ fn auto_improve_error_response(
         AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
         AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    log_server_error(status, "auto-improve", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
 }
 
@@ -3559,6 +3581,39 @@ struct PurgeSessionRequest {
     compact: bool,
 }
 
+/// Wire-format summary returned by `POST /admin/purge-session`.
+#[derive(Debug, Serialize)]
+pub struct PurgeSessionReport {
+    /// Session id that was purged.
+    pub session_id: String,
+    /// Human workspace name.
+    pub workspace: String,
+    /// Human project name.
+    pub project: String,
+    /// Number of observations deleted.
+    pub observations_deleted: u64,
+    /// Number of authored handoffs deleted.
+    pub handoffs_deleted: u64,
+    /// Number of page rows deleted, counting superseded versions.
+    pub pages_deleted: u64,
+    /// Number of auto-improvement runs deleted.
+    pub auto_improve_runs_deleted: u64,
+    /// Distinct wiki page paths whose database rows were deleted.
+    pub removed_paths: Vec<PagePath>,
+    /// Distinct wiki page paths removed from disk after the database purge.
+    pub files_deleted: Vec<PagePath>,
+    /// Distinct wiki page paths that could not be removed from disk.
+    pub files_failed: Vec<PagePath>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran).
+    pub compacted: bool,
+    /// Pre-purge checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-purge checkpoint, if the purge changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
 /// `POST /admin/purge-session` — delete one session and everything derived
 /// from it, inside a single workspace/project scope.
 async fn handle_purge_session(
@@ -3605,13 +3660,21 @@ async fn handle_purge_session(
         actor,
         ..Default::default()
     };
-    if let Err(e) = state
+    let mut dispatch_ctx = match state
         .wiki
         .admit_purge_session(ws_id, proj_id, Some(ctx))
         .await
     {
-        return internal_err(e.to_string());
-    }
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let label = format!("{}/{}: {}", req.workspace, req.project, session_id);
+    let pre_checkpoint = match checkpoint_or_500(&state.wiki, format!("pre-purge-session {label}"))
+    {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
 
     let compaction = if req.compact {
         ai_memory_store::Compaction::Reclaim
@@ -3619,14 +3682,14 @@ async fn handle_purge_session(
         ai_memory_store::Compaction::Skip
     };
 
-    let summary = match state
-        .writer
+    let outcome = match state
+        .wiki
         .purge_session(ws_id, proj_id, session_id, author_id, compaction)
         .await
     {
         Ok(s) => s,
         // Absent from this scope (or already purged) is a 404, not a fault.
-        Err(e @ StoreError::NotFound(_)) => {
+        Err(WikiError::Store(e @ StoreError::NotFound(_))) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": e.to_string() })),
@@ -3635,20 +3698,37 @@ async fn handle_purge_session(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "session_id": session_id.to_string(),
-            "workspace": req.workspace,
-            "project": req.project,
-            "observations_deleted": summary.observations_deleted,
-            "handoffs_deleted": summary.handoffs_deleted,
-            "pages_deleted": summary.pages_deleted,
-            "auto_improve_runs_deleted": summary.auto_improve_runs_deleted,
-            "removed_paths": summary.removed_paths,
-            "compacted": summary.compacted,
-        })),
-    )
+    let ai_memory_wiki::PurgeSessionOutcome {
+        summary,
+        files_deleted,
+        files_failed,
+    } = outcome;
+    if !files_failed.is_empty()
+        && let Some(ref mut ctx) = dispatch_ctx
+    {
+        ctx.partial_failure = true;
+    }
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
+
+    let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-session {label}"));
+
+    let report = PurgeSessionReport {
+        session_id: session_id.to_string(),
+        workspace: req.workspace,
+        project: req.project,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        pages_deleted: summary.pages_deleted,
+        auto_improve_runs_deleted: summary.auto_improve_runs_deleted,
+        removed_paths: summary.removed_paths,
+        files_deleted,
+        files_failed,
+        compacted: summary.compacted,
+        pre_checkpoint,
+        checkpoint,
+    };
+
+    (StatusCode::OK, Json(json_or_empty(&report)))
 }
 
 // ---------------------------------------------------------------------
@@ -3888,7 +3968,7 @@ async fn handle_purge_project(
     {
         c.partial_failure = true;
     }
-    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
 
     state.active_project.clear_project(proj_id);
     invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
@@ -4217,7 +4297,7 @@ async fn delete_workspace_core(
     {
         c.partial_failure = true;
     }
-    state.wiki.dispatch_purge_workspace(dispatch_ctx.as_ref());
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
 
     state.active_project.clear_workspace(ws_id);
     invalidate_scope_cache(state, ScopeInvalidation::Workspace(ws_id)).await;
@@ -5964,6 +6044,7 @@ async fn copy_purge_merge(
                 }),
                 author_id: None,
                 actor: actor.clone(),
+                evidence: Vec::new(),
             })
             .await
         {
@@ -6111,7 +6192,7 @@ async fn copy_purge_merge(
     {
         c.partial_failure = true;
     }
-    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
 
     // The source project_id was just purged; if it was the published active
     // project, the pointer now dangles — clear it so the next hook re-resolves
@@ -6458,6 +6539,7 @@ async fn handle_write_page(
             admission_ctx,
             author_id,
             actor,
+            evidence: Vec::new(),
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;
@@ -8533,6 +8615,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8688,6 +8771,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8827,6 +8911,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8944,6 +9029,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

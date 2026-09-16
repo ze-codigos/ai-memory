@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -41,6 +41,7 @@ dependencies = [
  "ai-memory-llm",
  "ai-memory-mcp",
  "ai-memory-store",
+ "ai-memory-test-support",
  "ai-memory-web",
  "ai-memory-wiki",
  "ai-memory-workstream",
@@ -80,11 +81,12 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
  "ai-memory-store",
+ "ai-memory-test-support",
  "ai-memory-wiki",
  "anyhow",
  "async-trait",
@@ -104,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "jiff",
  "regex",
@@ -119,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -141,12 +143,13 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
  "ai-memory-llm",
  "ai-memory-store",
+ "ai-memory-test-support",
  "ai-memory-wiki",
  "anyhow",
  "async-trait",
@@ -166,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -186,7 +189,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
- "tokenizers 0.21.4",
+ "tokenizers",
  "tokio",
  "tracing",
  "uuid",
@@ -195,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -223,16 +226,18 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "ai-memory-store"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
  "argon2",
  "base64 0.22.1",
+ "fs2",
  "getrandom 0.3.4",
  "jiff",
  "parking_lot",
@@ -251,8 +256,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-memory-test-support"
+version = "2.2.2"
+
+[[package]]
 name = "ai-memory-web"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-store",
@@ -275,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -285,6 +294,7 @@ dependencies = [
  "axum",
  "dirs",
  "flate2",
+ "fs2",
  "futures-util",
  "git2",
  "jiff",
@@ -306,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "2.0.2"
+version = "2.2.2"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -665,7 +675,7 @@ dependencies = [
  "rayon",
  "safetensors",
  "thiserror 2.0.18",
- "tokenizers 0.22.2",
+ "tokenizers",
  "yoke",
  "zerocopy",
  "zip",
@@ -3326,9 +3336,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -3390,9 +3400,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -3997,39 +4007,6 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizers"
-version = "0.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a620b996116a59e184c2fa2dfd8251ea34a36d0a514758c6f966386bd2e03476"
-dependencies = [
- "ahash",
- "aho-corasick",
- "compact_str",
- "dary_heap",
- "derive_builder",
- "esaxx-rs",
- "fancy-regex 0.14.0",
- "getrandom 0.3.4",
- "itertools",
- "log",
- "macro_rules_attribute",
- "monostate",
- "paste",
- "rand 0.9.4",
- "rayon",
- "rayon-cond",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror 2.0.18",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
-
-[[package]]
-name = "tokenizers"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223"
@@ -4040,6 +4017,7 @@ dependencies = [
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
+ "fancy-regex 0.14.0",
  "getrandom 0.3.4",
  "itertools",
  "log",

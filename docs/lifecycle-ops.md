@@ -48,6 +48,7 @@ regulatory erasure request rather than tidying up:
 |---|---|---|
 | Reachable through the API / MCP tools | no | no |
 | Returned by search (FTS) | no | no |
+| Live wiki Markdown file | no, best-effort | no, best-effort |
 | Bytes still present in `memory.sqlite` | **yes**, in free pages | no |
 | Text still in the wiki git history | **yes** | **yes** |
 | Present in backups taken before the purge | **yes** | **yes** |
@@ -88,6 +89,20 @@ purge needs. Rebuilding only the indexes a given caller "should" have touched
 is what leaves a managed agent's transcript text in the file after an operator
 asked for it to be reclaimed.
 
+Session purges hold the wiki mutation guard across the database deletion and
+file cleanup. In-flight page writes and watcher reindexes finish before the
+purge starts; new ones wait until cleanup completes. This also serializes the
+purge with wiki project/session moves. Admission webhooks run before this guard.
+File cleanup failures still leave the database purge committed and are reported
+in `files_failed`; this coordination does not provide crash-atomic rollback.
+
+The guard is taken before the purge is submitted to the writer actor, so it also
+covers the wait for whatever that single queue is already draining, and — with
+`compact: true` — the `VACUUM` that runs after the delete commits. A purge on a
+busy server therefore holds up wiki mutations for longer than the delete itself.
+The git checkpoints taken before and after the purge sit outside the guard: they
+bracket it, they do not snapshot it.
+
 ### Scope containment
 
 The session id is never authority on its own. Every statement is filtered on
@@ -97,7 +112,12 @@ derived pages are deleted by **id** rather than by path — two projects can
 hold the same `sessions/<uuid>.md`, and deleting by path would take the other
 one with it. `/admin/purge-session` runs the admission chain before any row is
 touched, so a `failure_policy = reject` webhook can still abort the whole
-operation while the data is intact.
+operation while the data is intact. After the SQL transaction commits, the
+server removes only the returned page paths under that same UUID-keyed project
+root; the response keeps `removed_paths` for the logical DB purge and reports
+actual cleanup in `files_deleted` / `files_failed`. If filesystem removal fails,
+the DB purge is not rolled back, the call still returns 200 with `files_failed`
+populated, and async `purge_session` observers receive `partial_failure: true`.
 
 
 ## What "project isolation" means here
@@ -731,6 +751,10 @@ volume.
 ai-memory reindex --data-dir <path>
 ```
 
+If reindex reports a missing scope `_meta.md`, the error includes its exact
+path. Restore the original DB, start and stop the current server once so its
+startup backfill writes missing manifests, then retry against a clean DB.
+
 Direct-disk lifecycle operation. Refuses if any sibling `ai-memory` process is
 alive, and also refuses if SQLite already contains rows. `reindex` is a
 rebuild-from-files path, not an in-place dirty-index repair.
@@ -754,6 +778,15 @@ What is not rebuilt:
 
 - Sessions, observations, handoffs, users/tokens, audit rows, access counters,
   and embeddings. Those are DB-only state; keep a backup if you need them.
+
+Every scope directory carries the `_meta.md` manifest `reindex` reads its
+workspace/project name from. The manifest is written with the scope's first
+page, so a project that first appears while the server is running is
+rebuildable from that moment on — no restart required. The startup backfill
+still runs on every boot and repairs a tree written by an older release, or one
+whose manifests were removed by hand. If `reindex` reports a missing manifest,
+start the server once against that data directory and let the backfill write
+it, then stop the server and reindex again.
 
 ## Operator workflows
 

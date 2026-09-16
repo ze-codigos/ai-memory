@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, NewHandoff,
-    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageId,
-    PagePath, ProjectId, SessionId, WorkspaceId,
+    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageEvidence,
+    PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -532,6 +532,15 @@ pub fn ensure_project_with_id(
 /// Wiki writes call this before touching the filesystem so a stale hook/cache
 /// carrying the old workspace for a moved project fails before it can create an
 /// orphan file. The pairing INSERT triggers are still the final SQL backstop.
+///
+/// The two ways this fails need different words, because they send a reader
+/// looking in different places. A project that moved workspaces is a stale
+/// pairing: the row exists, and the caller's copy of its scope is out of date.
+/// A project id with no row at all is a dangling reference — nothing moved,
+/// and there is no scoping question to answer. Reporting the second as "does
+/// not belong to workspace X" costs whoever reads that line a hunt for a
+/// workspace/project mismatch that does not exist. The disambiguating query
+/// runs only on the failure path, so the common case still pays one lookup.
 pub fn ensure_project_workspace(
     conn: &Connection,
     workspace_id: &WorkspaceId,
@@ -545,12 +554,23 @@ pub fn ensure_project_workspace(
         )
         .optional()?;
     if found.is_some() {
-        Ok(())
-    } else {
-        Err(StoreError::NotFound(format!(
-            "project {project_id} does not belong to workspace {workspace_id}"
-        )))
+        return Ok(());
     }
+    let owner: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT workspace_id FROM projects WHERE id = ?1",
+            params![project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Err(StoreError::NotFound(match owner {
+        Some(owner) => format!(
+            "project {project_id} does not belong to workspace {workspace_id}; \
+             it belongs to {}",
+            WorkspaceId::from_slice(&owner)?
+        ),
+        None => format!("project {project_id} does not exist"),
+    }))
 }
 
 /// Upsert a batch of pages inside one transaction. Either *all* pages
@@ -851,13 +871,21 @@ pub(crate) fn upsert_page_in_tx(
             && existing.tier == tier_str
             && existing.pinned == i64::from(page.pinned)
         {
-            return PageId::from_slice(&existing.id).map_err(StoreError::from);
+            let unchanged_id = PageId::from_slice(&existing.id).map_err(StoreError::from)?;
+            // The content short-circuit skips a new version row, but a
+            // reconsolidation from a different session still cites the
+            // page it reaffirmed (P2, docs/design-hindsight-borrowings.md
+            // §3) — record the evidence against the still-current id.
+            insert_evidence_in_tx(tx, &unchanged_id, &page.evidence, now)?;
+            return Ok(unchanged_id);
         }
         let frontmatter_str = stamped_frontmatter(conformed, now)?;
         let new_id = PageId::new();
+        // The page-grain ingestion window closes in the same statement,
+        // same instant (issue #656, docs/design-page-ingestion-windows.md).
         tx.execute(
-            "UPDATE pages SET is_latest = 0 WHERE id = ?1",
-            params![&existing.id],
+            "UPDATE pages SET is_latest = 0, valid_to = ?2 WHERE id = ?1",
+            params![&existing.id, now],
         )?;
         // Close the superseded version's entity-link windows at the new
         // version's birth instant (docs/temporal.md).
@@ -870,8 +898,8 @@ pub(crate) fn upsert_page_in_tx(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
               frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15)",
+              created_at, updated_at, expires_at, valid_from) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -893,6 +921,7 @@ pub(crate) fn upsert_page_in_tx(
         replace_links_in_tx(tx, &new_id, page)?;
         attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
+        insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
         audit(
             tx,
             "supersede_page",
@@ -911,8 +940,8 @@ pub(crate) fn upsert_page_in_tx(
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, valid_from) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?13)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -933,6 +962,7 @@ pub(crate) fn upsert_page_in_tx(
     replace_links_in_tx(tx, &new_id, page)?;
     attach_entities_in_tx(tx, &new_id, page, now)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
+    insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
     audit(
         tx,
         "create_page",
@@ -1029,6 +1059,28 @@ fn replace_links_in_tx(
                 link.relation
                     .map_or("references", ai_memory_core::Relation::as_str),
             ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record a page write's evidence sources (P2,
+/// docs/design-hindsight-borrowings.md §3), in the same transaction as the
+/// page upsert. `INSERT OR IGNORE` on the `(page_id, source_kind,
+/// source_id)` PK makes re-citing the same source a no-op — a session that
+/// reconsolidates the same path twice does not inflate the count. Empty
+/// `evidence` (every pre-2.2 caller) inserts nothing.
+fn insert_evidence_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+    evidence: &[PageEvidence],
+    now: i64,
+) -> StoreResult<()> {
+    for e in evidence {
+        tx.execute(
+            "INSERT OR IGNORE INTO page_evidence (page_id, source_kind, source_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![page_id.as_bytes(), e.kind.as_str(), e.source_id, now],
         )?;
     }
     Ok(())
@@ -1281,10 +1333,18 @@ fn end_lifecycle_only_session_in_tx(
     tx: &Transaction<'_>,
     session_id: &SessionId,
 ) -> StoreResult<LifecycleOnlyEndOutcome> {
+    // Substantive is defined POSITIVELY: at least one observation that is
+    // real work (a user prompt or a tool use). This MUST stay in sync with
+    // `is_ephemeral_session` in ai-memory-hooks/src/router.rs — both sides
+    // must classify every observation set identically, or this atomic
+    // re-check would silently revert the router's verdict. Everything else,
+    // including `stop` and `notification` (some harnesses, e.g. OpenCode,
+    // fire these for purely internal work), is ephemeral.
     let has_substantive_observation: bool = tx.query_row(
         "SELECT EXISTS( \
              SELECT 1 FROM observations \
-             WHERE session_id = ?1 AND kind NOT IN ('session-start', 'session-end') \
+             WHERE session_id = ?1 \
+               AND kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use') \
          )",
         params![session_id.as_bytes()],
         |row| row.get(0),
@@ -1783,22 +1843,41 @@ pub fn store_embedding(
 
 /// Store / replace a batch of page embeddings in one transaction.
 pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) -> StoreResult<()> {
+    store_embeddings_in_table(conn, "page_embeddings", embeddings)
+}
+
+/// Store / replace a batch of L0 abstract embeddings
+/// (`page_abstract_embeddings`) in one transaction. Same row shape and
+/// upsert rule as [`store_embeddings`]; only the table differs.
+pub fn store_abstract_embeddings(
+    conn: &mut Connection,
+    embeddings: &[EmbeddingWrite],
+) -> StoreResult<()> {
+    store_embeddings_in_table(conn, "page_abstract_embeddings", embeddings)
+}
+
+fn store_embeddings_in_table(
+    conn: &mut Connection,
+    table: &'static str,
+    embeddings: &[EmbeddingWrite],
+) -> StoreResult<()> {
     if embeddings.is_empty() {
         return Ok(());
     }
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO page_embeddings (page_id, vector, provider, model, dim, created_at) \
+        let sql = format!(
+            "INSERT INTO {table} (page_id, vector, provider, model, dim, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(page_id) DO UPDATE SET \
                  vector = excluded.vector, \
                  provider = excluded.provider, \
                  model = excluded.model, \
                  dim = excluded.dim, \
-                 created_at = excluded.created_at",
-        )?;
+                 created_at = excluded.created_at"
+        );
+        let mut stmt = tx.prepare(&sql)?;
         for embedding in embeddings {
             stmt.execute(params![
                 embedding.page_id.as_bytes(),
@@ -1811,6 +1890,17 @@ pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) ->
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Remove a page's L0 abstract embedding row, if any. Called when a page is
+/// rewritten without its frontmatter `abstract:` so the abstract stream
+/// never ranks on a line the page no longer carries.
+pub fn delete_abstract_embedding(conn: &mut Connection, page_id: &PageId) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM page_abstract_embeddings WHERE page_id = ?1",
+        params![page_id.as_bytes()],
+    )?;
     Ok(())
 }
 
@@ -2067,7 +2157,7 @@ pub fn soft_delete_for_decay_if_latest(
     let tx = conn.transaction()?;
     let affected = tx.execute(
         "UPDATE pages \
-         SET is_latest = 0, superseded_at = ?1 \
+         SET is_latest = 0, superseded_at = ?1, valid_to = ?1 \
          WHERE id = ?2 \
            AND workspace_id = ?3 \
            AND project_id = ?4 \
@@ -2084,7 +2174,8 @@ pub fn soft_delete_for_decay_if_latest(
     if affected != 0 {
         // Retirement is supersession for the entity timeline too: an
         // open window on a tombstoned page made `as_of` resurrect
-        // retired knowledge forever (post-audit finding).
+        // retired knowledge forever (post-audit finding). The page-grain
+        // window closes in the same statement above (issue #656).
         tx.execute(
             "UPDATE entity_page_links SET superseded_at = ?1 \
              WHERE page_id = ?2 AND superseded_at IS NULL",
@@ -3116,16 +3207,19 @@ pub fn reorg_sessions(
         observations_updated += obs_rows;
     }
     // Graveyard only this workspace's latest pages; sibling workspaces may
-    // have already-consolidated pages that must remain current.
+    // have already-consolidated pages that must remain current. Both
+    // grains close at one shared instant (issue #656).
+    let retire_at = Timestamp::now().as_microsecond();
     tx.execute(
         "UPDATE entity_page_links SET superseded_at = ?2 \
          WHERE superseded_at IS NULL AND page_id IN ( \
              SELECT id FROM pages WHERE workspace_id = ?1 AND is_latest = 1)",
-        params![workspace_id.as_bytes(), Timestamp::now().as_microsecond()],
+        params![workspace_id.as_bytes(), retire_at],
     )?;
     let pages_graveyarded: usize = tx.execute(
-        "UPDATE pages SET is_latest = 0 WHERE workspace_id = ?1 AND is_latest = 1",
-        params![workspace_id.as_bytes()],
+        "UPDATE pages SET is_latest = 0, valid_to = ?2 \
+         WHERE workspace_id = ?1 AND is_latest = 1",
+        params![workspace_id.as_bytes(), retire_at],
     )?;
     tx.commit()?;
     Ok(ReorgSummary {
@@ -3365,7 +3459,7 @@ pub struct PurgeSessionSummary {
     /// `auto_improve_runs` rows removed.
     pub auto_improve_runs_deleted: u64,
     /// On-disk wiki paths whose rows are gone, for the caller to unlink.
-    pub removed_paths: Vec<String>,
+    pub removed_paths: Vec<PagePath>,
     /// Whether the freed bytes were reclaimed (`VACUUM` ran).
     pub compacted: bool,
 }
@@ -3452,7 +3546,7 @@ pub fn purge_session(
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let removed_paths: Vec<String> = if page_ids.is_empty() {
+    let removed_paths: Vec<PagePath> = if page_ids.is_empty() {
         Vec::new()
     } else {
         let mut stmt = tx.prepare(
@@ -3466,10 +3560,11 @@ pub fn purge_session(
                     row.get(0)
                 })
                 .optional()?;
-            if let Some(path) = found
-                && !paths.contains(&path)
-            {
-                paths.push(path);
+            if let Some(path) = found {
+                let path = PagePath::new(path)?;
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
             }
         }
         paths
@@ -3607,6 +3702,139 @@ pub fn purge_session(
 /// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
 /// still live and `force` is false, or [`StoreError`] if any SQL statement
 /// fails. The transaction is rolled back automatically on error.
+/// Whether `(workspace_id, project_id)` — or the whole workspace — was purged
+/// and tombstoned by [`purge_project`] / [`delete_workspace`] (#607).
+///
+/// Returns true when either an exact project tombstone exists or a
+/// whole-workspace tombstone (the `zeroblob(16)` sentinel project id) covers
+/// the workspace. `reindex` calls this before recreating a scope from on-disk
+/// `_meta.md`, so a purge whose file removal crashed cannot be resurrected.
+pub fn scope_is_purged(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+) -> StoreResult<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM purged_scopes \
+             WHERE workspace_id = ?1 AND (project_id = ?2 OR project_id = zeroblob(16)) \
+             LIMIT 1",
+            rusqlite::params![workspace_id.as_bytes(), project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// Session ids tombstoned by `purge_session` in one scope.
+///
+/// The scope-level twin of [`scope_is_purged`], read the same way and for the
+/// same reason: a purge whose page-file removal did not complete leaves the
+/// markdown on disk, and the wiki reindex must not put it back (#701). Loaded
+/// once per directory per reindex pass rather than once per page — a purged
+/// scope is one row, but a project accumulates one purged session per purge.
+///
+/// # Errors
+/// Propagates SQL errors.
+pub fn purged_session_ids(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+) -> StoreResult<Vec<SessionId>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id FROM purged_sessions \
+         WHERE workspace_id = ?1 AND project_id = ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![workspace_id.as_bytes(), project_id.as_bytes()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(SessionId::from_slice(&row?)?);
+    }
+    Ok(out)
+}
+
+/// One recorded bootstrap chunk, as loaded by [`load_bootstrap_progress`].
+#[derive(Debug, Clone)]
+pub struct BootstrapChunkRecord {
+    /// Position of this chunk in the run's chunk plan (0-based).
+    pub chunk_index: u32,
+    /// The chunk's `BootstrapPage` batch, serialized as JSON.
+    pub pages_json: String,
+    /// The chunk's LLM-authored rationale.
+    pub rationale: String,
+}
+
+/// Durably record one completed bootstrap chunk's output (#621).
+///
+/// `INSERT OR REPLACE` makes this idempotent: a non-resume run still records
+/// every chunk (so a later `--resume` has something to reuse), and re-running
+/// the same chunk index just overwrites its row.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn record_bootstrap_chunk(
+    conn: &Connection,
+    fingerprint: &str,
+    chunk_index: u32,
+    pages_json: &str,
+    rationale: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO bootstrap_chunk_progress \
+         (fingerprint, chunk_index, pages_json, rationale, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            fingerprint,
+            chunk_index,
+            pages_json,
+            rationale,
+            Timestamp::now().as_microsecond(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load every recorded chunk for `fingerprint`, ordered by `chunk_index` — the
+/// order `bootstrap --resume` needs to seed its `pages_by_path` accumulator.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn load_bootstrap_progress(
+    conn: &Connection,
+    fingerprint: &str,
+) -> StoreResult<Vec<BootstrapChunkRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_index, pages_json, rationale FROM bootstrap_chunk_progress \
+         WHERE fingerprint = ?1 ORDER BY chunk_index",
+    )?;
+    let rows = stmt
+        .query_map(params![fingerprint], |row| {
+            Ok(BootstrapChunkRecord {
+                chunk_index: row.get(0)?,
+                pages_json: row.get(1)?,
+                rationale: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete every recorded chunk for `fingerprint`. Called once a bootstrap run
+/// completes successfully — a fresh run has nothing left to resume.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM bootstrap_chunk_progress WHERE fingerprint = ?1",
+        params![fingerprint],
+    )?;
+    Ok(())
+}
+
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -3729,6 +3957,17 @@ pub fn purge_project(
         rusqlite::params![&pid[..], workspace_id.as_bytes()],
     )?;
 
+    // Tombstone the scope so a `reindex` cannot resurrect it from an on-disk
+    // directory the post-commit file removal failed to (or crashed before)
+    // deleting. Written in the same transaction as the DELETE so the deletion
+    // and its terminality commit atomically (#607). `INSERT OR REPLACE` keeps
+    // a repeated purge idempotent and refreshes `purged_at`.
+    tx.execute(
+        "INSERT OR REPLACE INTO purged_scopes (workspace_id, project_id, purged_at) \
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![workspace_id.as_bytes(), &pid[..], now],
+    )?;
+
     // Attributed audit trail for the destructive purge. `page_id` is None
     // (the whole project is gone); the operator identity comes from the
     // authenticated request (NULL when single-user / unauthenticated).
@@ -3834,6 +4073,18 @@ pub fn delete_workspace(
     if removed == 0 {
         return Err(StoreError::NotFound("workspace".into()));
     }
+
+    // Whole-workspace tombstone (#607): a 16-byte all-zero project id marks the
+    // entire workspace as purged so `reindex` cannot recreate it — or any of
+    // its projects — from on-disk `_meta.md` that the post-commit directory
+    // removal failed to delete. Same transaction as the DELETE for atomic
+    // terminality.
+    tx.execute(
+        "INSERT OR REPLACE INTO purged_scopes (workspace_id, project_id, purged_at) \
+         VALUES (?1, zeroblob(16), ?2)",
+        rusqlite::params![&wid[..], Timestamp::now().as_microsecond()],
+    )?;
+
     tx.commit()?;
 
     if compaction == Compaction::Reclaim {
@@ -4343,7 +4594,10 @@ pub fn move_session(
             }
             PagesMode::Regenerate => {
                 // Close the retiring page's entity windows first (the
-                // predicate needs is_latest = 1, flipped just below).
+                // predicate needs is_latest = 1, flipped just below); the
+                // page-grain window closes with the flip, same instant
+                // (issue #656).
+                let retire_at = Timestamp::now().as_microsecond();
                 tx.execute(
                     &format!(
                         "UPDATE entity_page_links SET superseded_at = ?4 \
@@ -4355,15 +4609,20 @@ pub fn move_session(
                         page_scope_params.0,
                         page_scope_params.1,
                         page_path.as_str(),
-                        Timestamp::now().as_microsecond(),
+                        retire_at,
                     ],
                 )?;
                 summary.pages_regenerated = tx.execute(
                     &format!(
-                        "UPDATE pages SET is_latest = 0 \
+                        "UPDATE pages SET is_latest = 0, valid_to = ?4 \
                          WHERE {page_scope_sql} AND path = ?3 AND is_latest = 1"
                     ),
-                    params![page_scope_params.0, page_scope_params.1, page_path.as_str()],
+                    params![
+                        page_scope_params.0,
+                        page_scope_params.1,
+                        page_path.as_str(),
+                        retire_at
+                    ],
                 )? as u64;
                 // The session's summary pointer targeted the page just
                 // retired; the next consolidation sets it again.
@@ -4480,8 +4739,8 @@ pub(crate) mod tests {
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
     use ai_memory_core::{
-        FeedbackKind, LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier,
-        UserId, WorkspaceId,
+        FeedbackKind, LinkTarget, NewHandoff, NewPage, NewSession, PageEvidence, PageEvidenceKind,
+        PagePath, ProjectId, Tier, UserId, WorkspaceId,
     };
     use rusqlite::Connection;
     use std::io::Write;
@@ -4923,6 +5182,13 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.sqlite");
         let mut conn = Connection::open(&db_path).unwrap();
+        // A fixture needs no durability. SQLite's defaults (rollback journal,
+        // synchronous=FULL) fsync every transaction, and nextest runs ~120 of
+        // these in parallel, so the suite was disk-bound: 0.3s per test alone,
+        // 2s+ under load. Production sets WAL + NORMAL in `Store::open`; these
+        // tests exercise SQL, not the journal.
+        conn.pragma_update(None, "journal_mode", "MEMORY").unwrap();
+        conn.pragma_update(None, "synchronous", "OFF").unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::migrations::run(&mut conn).unwrap();
         let ws = get_or_create_workspace(&mut conn, "default").unwrap();
@@ -5014,11 +5280,90 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    /// Round-trip: recorded chunks come back ordered by index, and `clear`
+    /// empties them. A different fingerprint's rows are untouched (#621).
+    #[test]
+    fn bootstrap_chunk_progress_round_trips_and_clears() {
+        let (_tmp, conn, _ws, _proj) = fresh_db();
+
+        record_bootstrap_chunk(&conn, "fp-a", 1, r#"{"pages":[]}"#, "second chunk").unwrap();
+        record_bootstrap_chunk(&conn, "fp-a", 0, r#"{"pages":[]}"#, "first chunk").unwrap();
+        record_bootstrap_chunk(&conn, "fp-b", 0, r#"{"pages":[]}"#, "other run").unwrap();
+
+        let loaded = load_bootstrap_progress(&conn, "fp-a").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].chunk_index, 0);
+        assert_eq!(loaded[0].rationale, "first chunk");
+        assert_eq!(loaded[1].chunk_index, 1);
+        assert_eq!(loaded[1].rationale, "second chunk");
+
+        // Re-recording the same (fingerprint, chunk_index) replaces the row
+        // rather than duplicating it — `INSERT OR REPLACE` idempotency.
+        record_bootstrap_chunk(&conn, "fp-a", 0, r#"{"pages":[]}"#, "first chunk v2").unwrap();
+        let loaded = load_bootstrap_progress(&conn, "fp-a").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].rationale, "first chunk v2");
+
+        clear_bootstrap_progress(&conn, "fp-a").unwrap();
+        assert!(load_bootstrap_progress(&conn, "fp-a").unwrap().is_empty());
+        assert_eq!(
+            load_bootstrap_progress(&conn, "fp-b").unwrap().len(),
+            1,
+            "clearing one fingerprint must not touch another"
+        );
+    }
+
     /// The default for a project purge is the same logical delete `#387`
     /// documented for a session purge. Pinned so the CLI help, the admin route
     /// docs and `docs/lifecycle-ops.md` cannot drift away from the behaviour:
     /// if this starts failing, byte-level removal became the default and all
     /// three need updating together.
+    #[test]
+    fn purge_project_tombstones_the_scope_against_resurrection() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        seed_session(&mut conn, ws, proj, "canaryproj");
+
+        assert!(
+            !scope_is_purged(&conn, &ws, &proj).unwrap(),
+            "a live project is not tombstoned"
+        );
+
+        purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .unwrap();
+
+        assert!(
+            scope_is_purged(&conn, &ws, &proj).unwrap(),
+            "purge must tombstone the scope so reindex cannot resurrect it"
+        );
+        // A different, un-purged project in the same workspace is unaffected.
+        assert!(
+            !scope_is_purged(&conn, &ws, &ai_memory_core::ProjectId::new()).unwrap(),
+            "the tombstone is scoped to the purged project id only"
+        );
+    }
+
+    #[test]
+    fn delete_workspace_tombstones_the_whole_workspace() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap();
+
+        // The whole-workspace tombstone covers every project id in that ws,
+        // including ones whose rows are already gone via cascade.
+        assert!(scope_is_purged(&conn, &ws, &proj).unwrap());
+        assert!(scope_is_purged(&conn, &ws, &ai_memory_core::ProjectId::new()).unwrap());
+        // A different workspace is not affected by the sentinel.
+        assert!(!scope_is_purged(&conn, &ai_memory_core::WorkspaceId::new(), &proj).unwrap());
+    }
+
     #[test]
     fn purge_project_is_a_logical_delete_by_default() {
         let (tmp, mut conn, ws, proj) = fresh_db();
@@ -5281,7 +5626,7 @@ pub(crate) mod tests {
         assert_eq!(summary.pages_deleted, 1);
         assert_eq!(
             summary.removed_paths,
-            vec!["sessions/target.md".to_string()]
+            vec![PagePath::new("sessions/target.md").unwrap()]
         );
     }
 
@@ -5961,6 +6306,7 @@ pub(crate) mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 
@@ -6427,6 +6773,102 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(total, 1, "no duplicate row for unchanged content");
+    }
+
+    fn evidence_count(conn: &Connection, page_id: &PageId) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM page_evidence WHERE page_id = ?1",
+            params![page_id.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// P2 (docs/design-hindsight-borrowings.md §3): a page write's cited
+    /// evidence accrues in-transaction with the upsert. Reconsolidating the
+    /// same (unchanged) content from a different session still hits the
+    /// content short-circuit — same page id, no new version — but the new
+    /// session's citation lands, and the SAME session citing it again is a
+    /// no-op (`INSERT OR IGNORE` on the `(page_id, source_kind, source_id)`
+    /// PK), never inflating the count.
+    #[test]
+    fn reconsolidating_the_same_page_accrues_evidence_per_distinct_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/foo.md", "same body");
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(evidence_count(&conn, &id), 1);
+
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-b".into(),
+        }];
+        let id2 = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(id2, id, "unchanged content must not create a new version");
+        assert_eq!(evidence_count(&conn, &id), 2);
+
+        let id3 = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(id3, id);
+        assert_eq!(
+            evidence_count(&conn, &id),
+            2,
+            "re-citing the same session is a no-op"
+        );
+    }
+
+    /// A page written with no evidence stays at count 0 ("unknown"), and a
+    /// version created by a real content change (not the idempotent
+    /// short-circuit) starts its own, separate evidence trail.
+    #[test]
+    fn upsert_page_with_no_evidence_stays_at_zero_and_new_versions_start_fresh() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let id1 = upsert_page(&mut conn, &page(ws, proj, "notes/foo.md", "v1 body")).unwrap();
+        assert_eq!(evidence_count(&conn, &id1), 0);
+
+        let mut p2 = page(ws, proj, "notes/foo.md", "v2 body");
+        p2.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id2 = upsert_page(&mut conn, &p2).unwrap();
+        assert_ne!(id2, id1, "changed body supersedes to a new version");
+        assert_eq!(
+            evidence_count(&conn, &id1),
+            0,
+            "the old version is untouched"
+        );
+        assert_eq!(evidence_count(&conn, &id2), 1);
+    }
+
+    /// Purging a page must take its evidence with it (`ON DELETE CASCADE`,
+    /// V63) — evidence never outlives the page version it supports.
+    #[test]
+    fn deleting_a_page_cascades_its_evidence_rows() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/foo.md", "body");
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(evidence_count(&conn, &id), 1);
+
+        delete_page(
+            &mut conn,
+            ws,
+            proj,
+            &PagePath::new("notes/foo.md").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_count(&conn, &id),
+            0,
+            "ON DELETE CASCADE must drop evidence with the page"
+        );
     }
 
     /// OKF conformance happens at this choke point for every writer
@@ -6898,6 +7340,94 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(state, "accepted");
+    }
+
+    /// Pins the two-sided invariant with `is_ephemeral_session` in
+    /// ai-memory-hooks/src/router.rs: a session with only `session-start`,
+    /// `stop`, `session-end` (the #662 OpenCode internal-session shape) has
+    /// no positive-work observation and must end as `Ended`, not
+    /// `Substantive`.
+    #[test]
+    fn end_lifecycle_only_session_treats_stop_only_session_as_ended() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let receiver = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::Stop,
+                extension: None,
+                source_event: None,
+                title: "stop".into(),
+                body: String::new(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
+            LifecycleOnlyEndOutcome::Ended {
+                reopened_handoff: None
+            },
+            "a Stop-only session has no user-prompt/pre-tool-use/post-tool-use \
+             observation, so it must be classified ended, not substantive"
+        );
+    }
+
+    /// Companion to the Stop-only case above: a `user-prompt` observation
+    /// alone (no lifecycle bookends yet inserted beyond SessionStart) makes
+    /// the session substantive.
+    #[test]
+    fn end_lifecycle_only_session_treats_user_prompt_as_substantive() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let receiver = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "hello".into(),
+                body: "do the thing".into(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
+            LifecycleOnlyEndOutcome::Substantive
+        );
     }
 
     #[test]
@@ -8303,6 +8833,38 @@ pub(crate) mod tests {
                 Err(StoreError::NotFound(_))
             ),
             "a stale workspace/project pair must fail before wiki writes touch disk"
+        );
+    }
+
+    #[test]
+    fn ensure_project_workspace_separates_a_moved_project_from_a_missing_one() {
+        let (_tmp, conn, ws, proj) = fresh_db();
+        let other_ws = WorkspaceId::new();
+        let ghost = ProjectId::new();
+
+        // The project exists, but the caller carries a stale workspace: the
+        // message has to name where it actually lives, or the reader cannot
+        // tell a stale cache from a corrupt one.
+        let moved = ensure_project_workspace(&conn, &other_ws, &proj).unwrap_err();
+        let moved = moved.to_string();
+        assert!(
+            moved.contains(&ws.to_string()) && moved.contains(&other_ws.to_string()),
+            "a moved project must name both the real and the supplied workspace, got: {moved}"
+        );
+
+        // No row at all. Saying this "does not belong to workspace X" sends
+        // the reader hunting a scoping bug that is not there — the id is
+        // simply dangling.
+        let missing = ensure_project_workspace(&conn, &ws, &ghost)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("does not exist"),
+            "a dangling project id must be reported as missing, got: {missing}"
+        );
+        assert!(
+            !missing.contains("does not belong to workspace"),
+            "a dangling project id must not be described as a workspace mismatch, got: {missing}"
         );
     }
 

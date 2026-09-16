@@ -42,6 +42,11 @@ enum JsonMcpLocation {
     RootServers,
     /// Top-level `context_servers` key used by Zed's settings.json.
     RootContextServers,
+    /// Top-level snake_case `mcp_servers` key used by Muse Code's
+    /// settings.json. Distinct from `RootMcpServers` purely by casing —
+    /// Muse documents `mcp_servers`, and the camelCase spelling every
+    /// other client uses would be ignored.
+    RootMcpServersSnake,
 }
 
 /// Run the `install-mcp` subcommand.
@@ -65,6 +70,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Codex => render_codex(&args),
         McpClient::Grok => render_grok(&args)?,
         McpClient::OpenCode => render_opencode(&args)?,
+        McpClient::OpenCode2 => render_opencode2(&args)?,
         McpClient::Cursor => render_cursor(&args)?,
         McpClient::ClaudeDesktop => render_claude_desktop(&args)?,
         McpClient::GeminiCli => render_gemini_cli(&args)?,
@@ -81,6 +87,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Swival => render_swival(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
+        McpClient::Muse => render_muse(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -165,6 +172,15 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join(".config")
             .join("opencode")
             .join("opencode.json"),
+        // V2 reads the same global config file (`opencode.json(c)`); its
+        // `mcp.servers` key coexists with v1's `mcp` key in one strict-JSON
+        // file, so both binaries stay wired side by side. Users who keep
+        // comments in `opencode.jsonc` should pass it via `--config-file`
+        // (`mutate_json` refuses to rewrite non-strict JSON).
+        McpClient::OpenCode2 => home()?
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json"),
         McpClient::Cursor => home()?.join(".cursor").join("mcp.json"),
         McpClient::ClaudeDesktop => {
             #[cfg(target_os = "macos")]
@@ -240,6 +256,10 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             };
             zed_config_path_in(&config_dir, std::env::consts::OS)
         }
+        // Muse Code documents `~/.config/muse/settings.json`; it also reads
+        // $XDG_CONFIG_HOME for its skill roots, so --config-file covers
+        // non-default XDG setups (same policy as Zero above).
+        McpClient::Muse => home()?.join(".config").join("muse").join("settings.json"),
     })
 }
 
@@ -494,6 +514,9 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::CommandCode
         | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
+        // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
+        // Zero, and ZCode use.
+        McpClient::OpenCode2 => Some(JsonMcpLocation::NestedMcpServers),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses. ZCode nests its servers the same way.
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => {
@@ -501,6 +524,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         }
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
+        McpClient::Muse => Some(JsonMcpLocation::RootMcpServersSnake),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
     }
 }
@@ -509,9 +533,11 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     validate_args(args)?;
     match args.client {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
+        McpClient::OpenCode2 => build_mcp_entry_opencode2(args),
         McpClient::Openclaw => build_mcp_entry_openclaw(args),
         McpClient::Zero => build_mcp_entry_zero(args),
         McpClient::Zcode => build_mcp_entry_zcode(args),
+        McpClient::Muse => build_mcp_entry_muse(args),
         McpClient::Codex | McpClient::Grok => {
             bail!("internal: Codex/Grok MCP config is TOML, not JSON")
         }
@@ -570,6 +596,23 @@ fn upsert_json_mcp_entry(
                 .context("`context_servers` is present but not an object")?;
             servers.insert(args.name.clone(), entry);
         }
+        JsonMcpLocation::RootMcpServersSnake => {
+            let servers = root
+                .entry("mcp_servers")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`mcp_servers` is present but not an object")?;
+            servers.insert(args.name.clone(), entry);
+        }
+    }
+    // Muse Code fails *every* command at startup when settings.json omits
+    // `schema_version`, so creating the file without it would break the
+    // user's agent rather than just their memory server. Only fill it in
+    // when absent: an unrecognized value is Muse's own error to report,
+    // and a future schema 2 must not be silently downgraded here.
+    if matches!(args.client, McpClient::Muse) {
+        root.entry("schema_version")
+            .or_insert_with(|| serde_json::Value::from(1));
     }
     Ok(())
 }
@@ -592,6 +635,13 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
             }),
             JsonMcpLocation::RootContextServers => json!({
                 "context_servers": { args.name.as_str(): entry }
+            }),
+            // `schema_version` rides along: a hand-merged Muse settings.json
+            // without it fails every command at startup, so the printed
+            // snippet has to carry the key the same way --apply does.
+            JsonMcpLocation::RootMcpServersSnake => json!({
+                "schema_version": 1,
+                "mcp_servers": { args.name.as_str(): entry }
             }),
         };
     Ok(serde_json::to_string_pretty(&fragment)?)
@@ -761,6 +811,27 @@ fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> 
     Ok(serde_json::Value::Object(entry))
 }
 
+/// OpenCode 2.0 beta MCP entry: `type: "remote"` + `url` + optional
+/// `headers` under `mcp.servers`. V2 has no `enabled` field (servers
+/// connect unless `disabled: true`), and header-credentialed servers
+/// must set `oauth: false` so the beta does not attempt OAuth discovery
+/// against ai-memory's local endpoint
+/// (https://opencode.ai/v2/docs/mcp-servers).
+fn build_mcp_entry_opencode2(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value(args.auth_token.as_deref());
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("remote"));
+    entry.insert("url".into(), json!(server_url));
+    // `false`, not absence: without it the beta probes the endpoint for
+    // OAuth metadata on every connect.
+    entry.insert("oauth".into(), json!(false));
+    if let Some(b) = bearer {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    Ok(serde_json::Value::Object(entry))
+}
+
 fn build_mcp_entry_openclaw(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
     let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
@@ -802,6 +873,29 @@ fn build_mcp_entry_zcode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     if let Some(b) = bearer {
         entry.insert("headers".into(), json!({"Authorization": b}));
     }
+    Ok(serde_json::Value::Object(entry))
+}
+
+/// Muse Code MCP entry: `transport: "streamable_http"` + `url` + optional
+/// `headers` under `~/.config/muse/settings.json`'s `mcp_servers` map.
+///
+/// `mode` is written explicitly because Muse Code defaults it to
+/// `required`, and a required server that fails to start aborts the whole
+/// run. Memory is an augmentation, so an unreachable server should cost
+/// the user their recall, not their coding session. No `framing` key is
+/// emitted: a non-default `framing` on `streamable_http` fails Muse's own
+/// validation.
+fn build_mcp_entry_muse(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value(args.auth_token.as_deref());
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let mut entry = serde_json::Map::new();
+    entry.insert("transport".into(), json!("streamable_http"));
+    entry.insert("url".into(), json!(server_url));
+    if let Some(b) = bearer {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    entry.insert("enabled".into(), json!(true));
+    entry.insert("mode".into(), json!("optional"));
     Ok(serde_json::Value::Object(entry))
 }
 
@@ -1050,6 +1144,21 @@ fn render_opencode(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_opencode2(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# OpenCode 2.0 beta (`opencode2`) — merge into\n\
+         # ~/.config/opencode/opencode.json(c) under \"mcp\" → \"servers\":\n\
+         #\n\
+         # V2 nests servers under `mcp.servers` (v1 used top-level `mcp`)\n\
+         # and has no `enabled` field. Both keys coexist in the one file,\n\
+         # so v1 and the beta stay wired side by side. If your config is\n\
+         # `opencode.jsonc` with comments, re-run with\n\
+         # `--config-file ~/.config/opencode/opencode.jsonc`.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_cursor(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# Cursor — write to one of:\n\
@@ -1131,6 +1240,22 @@ fn render_zcode(args: &InstallMcpArgs) -> Result<String> {
          # enabled/timeoutMs make ZCode drop the server silently.\n\
          # ai-memory's default stateless /mcp endpoint needs no flavor\n\
          # marker; auth goes in the headers map.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_muse(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Muse Code (Meta) — merge into ~/.config/muse/settings.json\n\
+         # (or re-run this command with --apply), then start a new session.\n\
+         #\n\
+         # Keep \"schema_version\": 1 — without it every muse command fails\n\
+         # at startup with `malformed settings file`.\n\
+         #\n\
+         # mode is set to \"optional\" on purpose: Muse defaults it to\n\
+         # \"required\", which aborts the whole run when the server is\n\
+         # unreachable. Auth goes in the headers map.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
@@ -1330,6 +1455,102 @@ mod tests {
             config_file: None,
             session_aware: false,
         }
+    }
+
+    #[test]
+    fn muse_entry_uses_documented_streamable_http_shape() {
+        let entry = build_json_mcp_entry(&args_with_token(McpClient::Muse)).unwrap();
+
+        assert_eq!(entry["transport"], "streamable_http");
+        assert_eq!(entry["url"], "http://127.0.0.1:49374/mcp");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert_eq!(entry["enabled"], true);
+        // `required` is Muse's default and aborts the entire run when the
+        // memory server is unreachable.
+        assert_eq!(entry["mode"], "optional");
+        // A non-default `framing` on streamable_http fails Muse validation,
+        // so the entry must not carry the key at all.
+        assert!(entry.get("framing").is_none(), "{entry:#}");
+    }
+
+    #[test]
+    fn muse_upsert_adds_schema_version_and_preserves_siblings() {
+        let mut root = serde_json::Map::new();
+        root.insert("telemetry".into(), json!({"enabled": false}));
+        root.insert(
+            "mcp_servers".into(),
+            json!({"my-tools": {"transport": "stdio", "command": "my-mcp-server"}}),
+        );
+
+        upsert_json_mcp_entry(&mut root, &args_for(McpClient::Muse)).unwrap();
+
+        // Without this key every muse command fails at startup.
+        assert_eq!(root["schema_version"], 1);
+        assert_eq!(root["telemetry"]["enabled"], false);
+        assert_eq!(root["mcp_servers"]["my-tools"]["command"], "my-mcp-server");
+        assert_eq!(
+            root["mcp_servers"]["ai-memory"]["transport"],
+            "streamable_http"
+        );
+    }
+
+    #[test]
+    fn muse_upsert_never_rewrites_an_existing_schema_version() {
+        let mut root = serde_json::Map::new();
+        root.insert("schema_version".into(), json!(2));
+
+        upsert_json_mcp_entry(&mut root, &args_for(McpClient::Muse)).unwrap();
+
+        // Downgrading a future schema would break the user's settings file;
+        // an unrecognized value is Muse's own error to report.
+        assert_eq!(root["schema_version"], 2);
+    }
+
+    #[test]
+    fn muse_render_carries_schema_version_for_hand_merging() {
+        let rendered = render_muse(&args_for(McpClient::Muse)).unwrap();
+
+        assert!(rendered.contains("\"schema_version\": 1"), "{rendered}");
+        assert!(rendered.contains("\"mcp_servers\""), "{rendered}");
+        assert!(!rendered.contains("\"mcpServers\""), "{rendered}");
+    }
+
+    #[test]
+    fn opencode2_entry_uses_v2_servers_shape() {
+        // V2 nests under `mcp.servers`, drops v1's `enabled`, and disables
+        // OAuth discovery: ai-memory authenticates with a static header.
+        let entry = build_json_mcp_entry(&args_with_token(McpClient::OpenCode2)).unwrap();
+        assert_eq!(entry["type"], json!("remote"));
+        assert_eq!(entry["url"], json!("http://127.0.0.1:49374/mcp"));
+        assert_eq!(entry["oauth"], json!(false));
+        assert!(entry.get("enabled").is_none());
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            json!("Bearer test-token-deadbeef")
+        );
+
+        let mut root = serde_json::Map::new();
+        upsert_json_mcp_entry(&mut root, &args_with_token(McpClient::OpenCode2)).unwrap();
+        assert!(root["mcp"]["servers"]["ai-memory"].is_object());
+        assert!(root.get("mcpServers").is_none());
+
+        // v1 still lands under top-level `mcp`, so both stay wired.
+        let mut v1 = serde_json::Map::new();
+        upsert_json_mcp_entry(&mut v1, &args_with_token(McpClient::OpenCode)).unwrap();
+        assert!(v1["mcp"]["ai-memory"].is_object());
+        assert!(v1["mcp"].get("servers").is_none());
+    }
+
+    #[test]
+    fn opencode2_render_points_at_v2_key() {
+        let out = render_opencode2(&args_for(McpClient::OpenCode2)).unwrap();
+        assert!(out.contains("opencode2"));
+        assert!(out.contains("mcp"));
+        assert!(out.contains("servers"));
+        assert!(out.contains("http://127.0.0.1:49374/mcp"));
     }
 
     #[test]
@@ -1681,6 +1902,7 @@ mod tests {
             McpClient::Codex => render_codex(&args),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
+            McpClient::OpenCode2 => render_opencode2(&args).unwrap(),
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
@@ -1697,6 +1919,7 @@ mod tests {
             McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
+            McpClient::Muse => render_muse(&args).unwrap(),
         }
     }
 
@@ -1709,6 +1932,7 @@ mod tests {
             McpClient::Codex,
             McpClient::Grok,
             McpClient::OpenCode,
+            McpClient::OpenCode2,
             McpClient::Cursor,
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
@@ -1750,6 +1974,7 @@ mod tests {
             McpClient::Codex,
             McpClient::Grok,
             McpClient::OpenCode,
+            McpClient::OpenCode2,
             McpClient::Cursor,
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
@@ -1765,6 +1990,7 @@ mod tests {
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
+            McpClient::Muse,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -1783,6 +2009,7 @@ mod tests {
             McpClient::Codex => render_codex(&args),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
+            McpClient::OpenCode2 => render_opencode2(&args).unwrap(),
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
@@ -1799,6 +2026,7 @@ mod tests {
             McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
+            McpClient::Muse => render_muse(&args).unwrap(),
         }
     }
 
