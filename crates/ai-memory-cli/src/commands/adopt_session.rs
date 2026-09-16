@@ -155,6 +155,12 @@ pub(crate) async fn adopt(input: AdoptInput<'_>) -> Result<AdoptedRun> {
         cwd: repository.cwd,
         adopted_at: jiff::Timestamp::now().as_second(),
         ended: false,
+        home: None,
+        session_dir: None,
+        kept_by_launcher: false,
+        agent: None,
+        exit_code: None,
+        checkpoint: None,
     };
     adopted_state::save(input.data_dir, &state)?;
     Ok(state)

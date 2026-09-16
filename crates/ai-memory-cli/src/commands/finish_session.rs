@@ -41,11 +41,18 @@ pub(crate) enum Outcome {
 /// Ending beats age: an ended session has a complete transcript on disk, and
 /// recovering it is the whole reason the sweep exists.
 pub(crate) fn plan_for(run: &AdoptedRun, now: i64, max_age_secs: i64) -> Action {
-    if run.ended {
+    // A launcher-kept record is the exception to "ending beats age": the
+    // server refuses, by design, a lapsed run it never linked, and that
+    // verdict never changes — so past the cap the record is abandoned (with a
+    // warning naming the transcript) instead of being retried forever.
+    if run.ended && !run.kept_by_launcher {
         return Action::Close;
     }
     if now.saturating_sub(run.adopted_at) > max_age_secs {
         return Action::Drop;
+    }
+    if run.ended {
+        return Action::Close;
     }
     Action::Incremental
 }
@@ -84,6 +91,15 @@ pub(crate) async fn finalize_adopted_runs(data_dir: &Path) -> Vec<Outcome> {
     for run in pending {
         let action = plan_for(&run, now, MAX_AGE_SECS);
         if action == Action::Drop {
+            if run.kept_by_launcher {
+                eprintln!(
+                    "ai-memory hook-drain warning: giving up on the transcript of workstream '{}' (native session {}, {}): it could not be imported within {}h",
+                    run.workstream_name,
+                    run.native_session_id,
+                    run.cwd.display(),
+                    MAX_AGE_SECS / 3_600
+                );
+            }
             crate::commands::adopted_state::remove(data_dir, &run.native_session_id);
             outcomes.push(Outcome::Dropped);
             continue;
@@ -127,26 +143,35 @@ async fn import_one(
         Some(run.server_url.clone()),
         bearer.map(str::to_string),
     );
+    // A launcher-kept run recorded which harness it launched, where it looked
+    // for the transcript, and the exit code and checkpoint of the moment;
+    // a hook-adopted one did not and gets the process defaults.
+    let harness = run
+        .agent
+        .and_then(crate::commands::run::managed_harness_from_agent)
+        .unwrap_or(ai_memory_workstream::ManagedHarness::Claude);
     let transcript = crate::commands::run::export_after_flush(
-        ai_memory_workstream::ManagedHarness::Claude,
-        home,
+        harness,
+        run.home.as_deref().unwrap_or(home),
         &run.cwd,
-        None,
+        run.session_dir.as_deref(),
         Some(&run.native_session_id),
         None,
     )
     .await;
     // Best effort: a checkpoint we cannot read is metadata, not a reason to
     // drop the transcript it would have annotated.
-    let checkpoint = ai_memory_workstream::inspect_repository(&run.cwd)
-        .map(|identity| identity.checkpoint)
-        .unwrap_or_default();
+    let checkpoint = run.checkpoint.clone().unwrap_or_else(|| {
+        ai_memory_workstream::inspect_repository(&run.cwd)
+            .map(|identity| identity.checkpoint)
+            .unwrap_or_default()
+    });
     crate::commands::run::import_batches(
         &endpoint,
         &run.run_path,
         transcript,
         checkpoint,
-        None,
+        run.exit_code,
         close,
     )
     .await?;
@@ -180,6 +205,30 @@ mod tests {
     #[test]
     fn a_stale_unended_session_is_dropped() {
         let run = sample_run("nat-1");
+        assert_eq!(
+            plan_for(&run, run.adopted_at + MAX_AGE_SECS + 1, MAX_AGE_SECS),
+            Action::Drop
+        );
+    }
+
+    #[test]
+    fn a_fresh_launcher_kept_ledger_closes() {
+        let mut run = sample_run("nat-1");
+        run.ended = true;
+        run.kept_by_launcher = true;
+        assert_eq!(
+            plan_for(&run, run.adopted_at + 3_600, MAX_AGE_SECS),
+            Action::Close
+        );
+    }
+
+    #[test]
+    fn a_stale_launcher_kept_ledger_is_abandoned() {
+        // O servidor recusa pra sempre um run vencido que nunca foi linkado;
+        // insistir a cada boundary por semanas nao recupera nada.
+        let mut run = sample_run("nat-1");
+        run.ended = true;
+        run.kept_by_launcher = true;
         assert_eq!(
             plan_for(&run, run.adopted_at + MAX_AGE_SECS + 1, MAX_AGE_SECS),
             Action::Drop

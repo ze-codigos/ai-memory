@@ -25,10 +25,12 @@ use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
 
 use crate::cli::{RunArgs, RunHarnessChoice};
+use crate::commands::adopted_state::{self, AdoptedRun};
 use crate::commands::{path_util, resolve_scope};
 use crate::config::Config;
 use crate::http_client::{
-    ServerEndpoint, ServerResponseError, get_json, post_empty, post_json, post_json_no_content,
+    EXTRA_HEADERS_CMD_ENV, ServerEndpoint, ServerResponseError, get_json, post_empty, post_json,
+    post_json_no_content,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -410,6 +412,11 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         // every prompt to answer that.
         .env("AI_MEMORY_WORKSTREAM_NAME", &prepared.workstream_name)
         .env("AI_MEMORY_HOOK_URL", endpoint.build_url(""))
+        // The header-resolving command exists for THIS long-lived process.
+        // Hooks are children of the harness and live milliseconds: their
+        // wrapper hands them a fresh static header, and inheriting the
+        // command would fork a credential helper on every hook request.
+        .env_remove(EXTRA_HEADERS_CMD_ENV)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -522,19 +529,61 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
     let checkpoint = inspect_repository(&repository.cwd)
         .map(|identity| identity.checkpoint)
         .unwrap_or(repository.checkpoint);
-    let imported = acquired_try!(
-        import_batches(
-            &endpoint,
-            &run_path,
-            transcript,
-            checkpoint,
-            Some(exit_code),
-            // The launcher only reaches here after its child exited, so this
-            // import always closes the run.
-            true,
-        )
-        .await
-    );
+    let import = import_batches(
+        &endpoint,
+        &run_path,
+        transcript,
+        checkpoint.clone(),
+        Some(exit_code),
+        // The launcher only reaches here after its child exited, so this
+        // import always closes the run.
+        true,
+    )
+    .await;
+    let imported = match import {
+        Ok(imported) => imported,
+        Err(error) => {
+            interrupt_task.abort();
+            // The transcript is complete on disk; only the upload failed
+            // (expired edge credential, server down, DNS). Keep the run
+            // instead of cancelling it and let the detached drainer, which
+            // already finalises adopted sessions at every hook boundary,
+            // import and close it with whatever credential is live then. A
+            // definitive server rejection (4xx other than auth/backpressure)
+            // is not kept: the drainer would only hear it again.
+            if plan.mode == LaunchMode::Session
+                && finish_error_is_retryable(&error)
+                && let Some(native) = native_session_id.as_deref()
+            {
+                let kept = KeptLedger {
+                    prepared: &prepared,
+                    run_path: &run_path,
+                    endpoint: &endpoint,
+                    native_session_id: native,
+                    cwd: &repository.cwd,
+                    home: &home,
+                    session_dir: plan.session_dir.as_deref(),
+                    harness,
+                    exit_code,
+                    checkpoint: &checkpoint,
+                };
+                match keep_ledger_for_next_boundary(&config.data_dir, &kept) {
+                    Ok(()) => {
+                        eprintln!(
+                            "ai-memory: {error:#}\nai-memory: the transcript of workstream '{}' stays on disk; the next hook boundary with a valid credential imports it (the workstream lease frees itself within 90s)",
+                            prepared.workstream_name
+                        );
+                        return Ok(exit_code);
+                    }
+                    Err(save_error) => eprintln!(
+                        "ai-memory: could not keep the ledger for a later import: {save_error:#}"
+                    ),
+                }
+            }
+            cancel_managed_run_after_failure(&endpoint, &run_path).await;
+            return Err(error);
+        }
+    };
 
     if plan.mode == LaunchMode::Session
         && prepared.sync_through > prepared.sync_after
@@ -593,6 +642,66 @@ async fn send_managed_heartbeat_with_timeout(
         Err(_) => {}
     }
     result
+}
+
+/// Whether a failed final import is worth handing to the drainer. Transport
+/// failures, JSON-decoding failures and auth/redirect/backpressure/server
+/// statuses can change by the next boundary; any other 4xx is the server's
+/// settled verdict on this request and would only be repeated.
+fn finish_error_is_retryable(error: &anyhow::Error) -> bool {
+    let Some(response) = error.downcast_ref::<ServerResponseError>() else {
+        return true;
+    };
+    let status = response.status();
+    !status.is_client_error() || matches!(status.as_u16(), 401 | 403 | 407 | 408 | 425 | 429)
+}
+
+/// What the launcher knows about a run whose final import failed.
+struct KeptLedger<'a> {
+    prepared: &'a PrepareManagedRunResponse,
+    run_path: &'a str,
+    endpoint: &'a ServerEndpoint,
+    native_session_id: &'a str,
+    cwd: &'a Path,
+    home: &'a Path,
+    session_dir: Option<&'a Path>,
+    harness: ManagedHarness,
+    exit_code: i32,
+    checkpoint: &'a ai_memory_core::WorkstreamCheckpoint,
+}
+
+/// Persist a run whose transcript import failed after the harness exited, in
+/// the state the hook adoption path uses, so the detached drainer's
+/// [`crate::commands::finish_session::finalize_adopted_runs`] closes it at the
+/// next boundary. Built here, not by the caller, so the record is `ended` by
+/// construction: anything else would be imported incrementally and left
+/// open, waiting for a SessionEnd that already went by.
+fn keep_ledger_for_next_boundary(data_dir: &Path, kept: &KeptLedger<'_>) -> Result<()> {
+    let run = AdoptedRun {
+        run_id: kept.prepared.run_id,
+        run_path: kept.run_path.to_string(),
+        native_session_id: kept.native_session_id.to_string(),
+        workstream_name: kept.prepared.workstream_name.clone(),
+        provisional: false,
+        server_url: kept.endpoint.build_url(""),
+        cwd: kept.cwd.to_path_buf(),
+        adopted_at: jiff::Timestamp::now().as_second(),
+        ended: true,
+        // The drainer must look where the launcher looked, or a custom
+        // AI_MEMORY_HOME / CLAUDE_CONFIG_DIR turns "kept" into "closed empty".
+        home: Some(kept.home.to_path_buf()),
+        session_dir: kept.session_dir.map(Path::to_path_buf),
+        kept_by_launcher: true,
+        agent: Some(kept.harness.agent_kind()),
+        exit_code: Some(kept.exit_code),
+        checkpoint: Some(kept.checkpoint.clone()),
+    };
+    adopted_state::save(data_dir, &run).with_context(|| {
+        format!(
+            "saving the pending ledger state under {}",
+            data_dir.display()
+        )
+    })
 }
 
 async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &str) {
@@ -1380,7 +1489,7 @@ fn managed_harness_for_args(choice: RunHarnessChoice, native_args: &[OsString]) 
     }
 }
 
-const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> {
+pub(crate) const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> {
     match agent {
         AgentKind::ClaudeCode => Some(ManagedHarness::Claude),
         AgentKind::Codex => Some(ManagedHarness::Codex),
@@ -1411,6 +1520,137 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
+
+    // ----------------------------------------------------------------
+    // A failed finish keeps the ledger for the drainer (MEM-3)
+    // ----------------------------------------------------------------
+
+    fn prepared_for_tests() -> PrepareManagedRunResponse {
+        serde_json::from_value(serde_json::json!({
+            "workstream_id": WorkstreamId::new().to_string(),
+            "workstream_name": "ajuste-checkout",
+            "run_id": ManagedRunId::new().to_string(),
+            "sync_after": 0,
+            "sync_through": 0,
+        }))
+        .expect("minimal prepare response")
+    }
+
+    fn kept_for_tests<'a>(
+        prepared: &'a PrepareManagedRunResponse,
+        endpoint: &'a ServerEndpoint,
+        checkpoint: &'a ai_memory_core::WorkstreamCheckpoint,
+        native: &'a str,
+    ) -> KeptLedger<'a> {
+        KeptLedger {
+            prepared,
+            run_path: "/workstream/runs/abc",
+            endpoint,
+            native_session_id: native,
+            cwd: Path::new("/repo"),
+            home: Path::new("/custom/home"),
+            session_dir: Some(Path::new("/custom/home/.claude-work/projects")),
+            harness: ManagedHarness::Codex,
+            exit_code: 3,
+            checkpoint,
+        }
+    }
+
+    #[test]
+    fn a_kept_ledger_is_what_the_drainer_closes_at_the_next_boundary() {
+        // O `finish` falhou depois de o harness sair (token do Access vencido,
+        // servidor fora). O estado gravado tem de ser exatamente o que o
+        // drainer de sessoes adotadas importa E fecha: ended = true, com o
+        // harness, os caminhos, o rc e o checkpoint que o launcher conhecia.
+        let tmp = tempfile::tempdir().unwrap();
+        let prepared = prepared_for_tests();
+        let endpoint =
+            ServerEndpoint::from_pair(Some("https://memory.example/wiki/".to_string()), None);
+        let checkpoint = ai_memory_core::WorkstreamCheckpoint {
+            head: Some("abc123".into()),
+            ..Default::default()
+        };
+        keep_ledger_for_next_boundary(
+            tmp.path(),
+            &kept_for_tests(&prepared, &endpoint, &checkpoint, "nat-finish-1"),
+        )
+        .unwrap();
+
+        let stored = crate::commands::adopted_state::load(tmp.path(), "nat-finish-1").unwrap();
+        assert!(stored.ended, "only an ended record is imported AND closed");
+        assert!(stored.kept_by_launcher);
+        assert_eq!(stored.run_id, prepared.run_id);
+        assert_eq!(stored.run_path, "/workstream/runs/abc");
+        assert_eq!(stored.workstream_name, "ajuste-checkout");
+        assert_eq!(stored.server_url, "https://memory.example/wiki");
+        assert_eq!(stored.cwd, PathBuf::from("/repo"));
+        assert!(!stored.provisional);
+        assert_eq!(stored.home.as_deref(), Some(Path::new("/custom/home")));
+        assert_eq!(
+            stored.session_dir.as_deref(),
+            Some(Path::new("/custom/home/.claude-work/projects"))
+        );
+        assert_eq!(stored.agent, Some(AgentKind::Codex));
+        assert_eq!(stored.exit_code, Some(3));
+        assert_eq!(
+            stored.checkpoint.as_ref().and_then(|c| c.head.as_deref()),
+            Some("abc123")
+        );
+        assert_eq!(
+            crate::commands::finish_session::plan_for(&stored, stored.adopted_at + 60, 48 * 3_600),
+            crate::commands::finish_session::Action::Close
+        );
+        assert_eq!(crate::commands::adopted_state::list(tmp.path()).len(), 1);
+    }
+
+    #[test]
+    fn keeping_the_ledger_reports_an_unwritable_data_dir() {
+        // O chamador cai no caminho antigo (cancela o run, devolve o erro)
+        // quando nao consegue gravar — nunca pode fingir que guardou.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("adopted-runs"), b"not a directory").unwrap();
+        let prepared = prepared_for_tests();
+        let endpoint = ServerEndpoint::from_pair(None, None);
+        let checkpoint = ai_memory_core::WorkstreamCheckpoint::default();
+        let error = keep_ledger_for_next_boundary(
+            tmp.path(),
+            &kept_for_tests(&prepared, &endpoint, &checkpoint, "nat-finish-3"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("pending ledger"), "{error:#}");
+    }
+
+    #[test]
+    fn a_settled_server_rejection_is_not_kept_for_the_drainer() {
+        use reqwest::StatusCode;
+        let settled = |status: StatusCode| -> anyhow::Error {
+            ServerResponseError::for_tests(status, "nope".into()).into()
+        };
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(!finish_error_is_retryable(&settled(status)), "{status}");
+        }
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::from_u16(530).unwrap(),
+        ] {
+            assert!(finish_error_is_retryable(&settled(status)), "{status}");
+        }
+        assert!(finish_error_is_retryable(&anyhow!("dns error")));
+        assert!(finish_error_is_retryable(
+            &anyhow!("expected value at line 1 column 1").context("parsing JSON body")
+        ));
+    }
 
     /// `show` filters its harness menu with this, so a false positive would
     /// offer an agent that cannot start.

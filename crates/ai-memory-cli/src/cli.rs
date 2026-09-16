@@ -214,10 +214,20 @@ pub enum Command {
     Completions(CompletionsArgs),
 }
 
+/// Environment the launcher honours beyond the flags above. Listed in the
+/// help so a wrapper can detect support by grepping `run --help`.
+const RUN_AFTER_HELP: &str = "\
+Environment:
+  AI_MEMORY_HTTP_EXTRA_HEADERS      static `Name: value` lines stamped on every request
+  AI_MEMORY_HTTP_EXTRA_HEADERS_CMD  command printing such lines (shell-style quoting, not run
+                                    by a shell); re-run before a request when its output is
+                                    older than 60s, so a short-lived edge credential survives
+                                    a long session. Honoured by this launcher only.";
+
 /// Arguments for `run`. Wrapper-owned flags must precede `harness`; the
 /// trailing native argv is deliberately opaque to clap.
 #[derive(Debug, Args)]
-#[command(trailing_var_arg = true)]
+#[command(trailing_var_arg = true, after_help = RUN_AFTER_HELP)]
 pub struct RunArgs {
     /// Workspace containing the managed workstream. Defaults to the nearest
     /// `.ai-memory.toml` marker's `workspace`, else `default`.

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Thin-client requests (`run`, `status`, `finalize-session`, ...) never follow
+  a redirect; a 3xx is reported as such, naming the auth-proxy login wall and
+  `AI_MEMORY_SERVER_URL` as the two causes, instead of decoding a login page
+  as JSON. (#7)
+- When the final transcript import of `ai-memory run` fails for a retryable
+  reason, the run is kept instead of cancelled and an ended record is written
+  under `adopted-runs/`, which the hook drainer imports and closes at the next
+  boundary with the harness, home, session dir, exit code and checkpoint the
+  launcher knew. Such a record is abandoned after 48h. (#7)
+
 ### Fixed
 - Batch consolidation now emits `[[wikilinks]]` that actually resolve.
   The prompt asked for links but never showed the model which pages
@@ -62,6 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cover, so an agent learns a topic exists before it has to guess a
   search for it. Drawn from page tags with `import-*` provenance marks
   excluded; roughly 100 tokens, capped at 30 topics.
+- `AI_MEMORY_HTTP_EXTRA_HEADERS_CMD`: a command (shell-style quoting, run
+  without a shell) whose stdout is the same `Name: value` lines as
+  `AI_MEMORY_HTTP_EXTRA_HEADERS`, resolved by `ai-memory run` before a
+  request and memoised for 60s, so a short-lived edge credential (Cloudflare
+  Access, 24h) survives a session longer than itself. Hook and MCP-bridge
+  requests read the static lines only. Listed in `run --help`. (#7)
+
 
 ## [2.2.2] - 2026-09-15
 

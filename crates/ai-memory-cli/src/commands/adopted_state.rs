@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ai_memory_core::ManagedRunId;
+use ai_memory_core::{AgentKind, ManagedRunId, WorkstreamCheckpoint};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -25,6 +25,27 @@ pub(crate) struct AdoptedRun {
     /// SessionEnd sets this; the drainer closes only what is marked ended.
     #[serde(default)]
     pub ended: bool,
+    /// Where the launcher looked for the native transcript, when it knew
+    /// better than the defaults (`AI_MEMORY_HOME`, `CLAUDE_CONFIG_DIR`). A
+    /// hook-adopted session leaves both unset and the drainer uses the
+    /// process defaults, as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<PathBuf>,
+    /// Set by the launcher when its own final import failed. Such a record
+    /// closes the run with the launcher's exit code and checkpoint, for the
+    /// harness it launched, and is abandoned past the age cap: the server
+    /// refuses a lapsed run it never linked, and retrying that at every
+    /// boundary forever helps nobody.
+    #[serde(default)]
+    pub kept_by_launcher: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<WorkstreamCheckpoint>,
 }
 
 pub(crate) fn state_dir(data_dir: &Path) -> PathBuf {
@@ -103,6 +124,12 @@ pub(crate) fn sample_run(session: &str) -> AdoptedRun {
         cwd: PathBuf::from("/repo"),
         adopted_at: 1_700_000_000,
         ended: false,
+        home: None,
+        session_dir: None,
+        kept_by_launcher: false,
+        agent: None,
+        exit_code: None,
+        checkpoint: None,
     }
 }
 

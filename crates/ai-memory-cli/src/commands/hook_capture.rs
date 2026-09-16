@@ -343,9 +343,8 @@ fn marker_query_suffix_impl(
 /// With redirects off the 3xx surfaces as a non-2xx: the event stays spooled
 /// and the handoff fetch returns None.
 pub fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http_client::client_builder()
         .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

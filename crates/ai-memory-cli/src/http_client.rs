@@ -15,6 +15,8 @@ use std::io::{BufWriter, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
@@ -66,29 +68,219 @@ pub(crate) fn parse_header_pair(line: &str) -> Option<(HeaderName, HeaderValue)>
     Some((header_name, header_value))
 }
 
-/// Resolve the extra headers via an environment lookup (injectable for tests).
-pub(crate) fn extra_headers_from(
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Vec<(HeaderName, HeaderValue)> {
-    let Some(raw) = lookup(EXTRA_HEADERS_ENV) else {
-        return Vec::new();
+/// Env var naming a command that resolves extra headers AT REQUEST TIME.
+///
+/// [`EXTRA_HEADERS_ENV`] is a value frozen into the process environment at
+/// launch, which is fine for a hook that lives milliseconds and wrong for
+/// `ai-memory run`, which lives as long as the agent session: a Cloudflare
+/// Access token exported at 10:46 is expired by the `finish` at 14:29, the
+/// proxy answers 302 and the whole transcript import fails. The command named
+/// here (POSIX shell-style quoting so a path may contain spaces, but executed
+/// directly, never through a shell) prints the same `Name: value` lines to
+/// stdout and is re-run before a request whenever the cached output is older
+/// than [`HEADER_COMMAND_CACHE_TTL`]. Its headers override same-named static
+/// ones. Only [`ServerEndpoint::authenticate`] honours it — the long-lived
+/// launcher's path; hook and bridge requests read the static lines only.
+///
+/// Empty output, a failing command, or a command that does not finish within
+/// [`HEADER_COMMAND_TIMEOUT`] leave the static headers untouched — the request
+/// path must never fail over configuration.
+pub(crate) const EXTRA_HEADERS_CMD_ENV: &str = "AI_MEMORY_HTTP_EXTRA_HEADERS_CMD";
+
+/// How long one command output is reused. The managed heartbeat fires every
+/// 30s; forking a credential helper for each of those would be pure waste,
+/// while a minute-old token is as good as a fresh one against a 24h session.
+const HEADER_COMMAND_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Upper bound on one command execution. A helper stuck on the network must
+/// not hang the `finish` forever; past this the request goes out with the
+/// static headers and the server's answer says what happened.
+const HEADER_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Process-wide memo of the last header-command execution. One entry is
+/// enough: a process configures a single command (the env var is read from
+/// the process environment, which does not change).
+#[derive(Debug)]
+pub(crate) struct HeaderCommandCache {
+    entry: Option<HeaderCommandEntry>,
+}
+
+#[derive(Debug)]
+struct HeaderCommandEntry {
+    resolved_at: Instant,
+    output: String,
+}
+
+impl HeaderCommandCache {
+    pub(crate) const fn new() -> Self {
+        Self { entry: None }
+    }
+
+    /// Return the memoised output when it is younger than `ttl`, else run
+    /// `run`. Only a SUCCESS is memoised: `finish_with_retry` retries a failed
+    /// request within a second, and a memoised failure would hand every retry
+    /// the same stale static header. A broken helper therefore runs once per
+    /// request — in the launcher that is one heartbeat every 30s.
+    pub(crate) fn resolve(
+        &mut self,
+        now: Instant,
+        ttl: Duration,
+        run: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        if let Some(entry) = &self.entry
+            && now.saturating_duration_since(entry.resolved_at) < ttl
+        {
+            return Some(entry.output.clone());
+        }
+        let output = run()?;
+        self.entry = Some(HeaderCommandEntry {
+            resolved_at: now,
+            output: output.clone(),
+        });
+        Some(output)
+    }
+}
+
+/// How often a running header command is polled for completion.
+const HEADER_COMMAND_POLL: Duration = Duration::from_millis(50);
+
+/// Execute `command` (whitespace-split argv, no shell) and return its stdout.
+/// Warns and returns `None` on spawn failure, non-zero exit, or `timeout`. A
+/// child that outruns the timeout is killed and reaped — nothing outlives
+/// this call, so a hung helper costs one warning per cache TTL, not a leaked
+/// process per heartbeat.
+///
+/// Output is read only after the child exits, so a helper printing more than
+/// the pipe buffer (64 KiB on Linux) would block on write until the timeout
+/// kills it. A header line is a few hundred bytes; that is by design.
+pub(crate) fn execute_header_command(command: &str, timeout: Duration) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+
+    let Some(mut argv) = shlex::split(command).filter(|argv| !argv.is_empty()) else {
+        eprintln!(
+            "ai-memory warning: extra-header command {command:?} is empty or has unbalanced quotes; using the static headers"
+        );
+        return None;
     };
+    let program = argv.remove(0);
+    let spawned = Command::new(&program)
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("ai-memory warning: extra-header command {command:?} could not run: {error}");
+            return None;
+        }
+    };
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(HEADER_COMMAND_POLL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!(
+                    "ai-memory warning: extra-header command {command:?} did not finish within {timeout:?} and was killed; using the static headers"
+                );
+                return None;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!(
+                    "ai-memory warning: extra-header command {command:?} could not be waited on: {error}"
+                );
+                return None;
+            }
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if status.success() {
+        return Some(stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    eprintln!(
+        "ai-memory warning: extra-header command {command:?} exited with {status}: {}",
+        stderr.trim()
+    );
+    None
+}
+
+fn parse_header_lines(raw: &str) -> Vec<(HeaderName, HeaderValue)> {
     raw.split('\n').filter_map(parse_header_pair).collect()
 }
 
-/// Apply [`extra_headers_from`] to a request using the process environment.
-pub(crate) fn apply_extra_headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    apply_extra_headers_with(|k| std::env::var(k).ok(), req)
+/// The static extra headers only: [`EXTRA_HEADERS_ENV`] via `lookup`, the
+/// command channel ignored. What hooks and the MCP bridge use.
+pub(crate) fn static_extra_headers_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    extra_headers_from_with(lookup, |_| None)
 }
 
-/// Testable core of [`apply_extra_headers`]: resolve pairs via `lookup` and
-/// stamp them onto `req`.
-pub(crate) fn apply_extra_headers_with(
+/// Static lines from [`EXTRA_HEADERS_ENV`], then the output of
+/// [`EXTRA_HEADERS_CMD_ENV`] resolved through `runner`, the latter overriding
+/// the former name by name.
+pub(crate) fn extra_headers_from_with(
+    lookup: impl Fn(&str) -> Option<String>,
+    mut runner: impl FnMut(&str) -> Option<String>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let mut headers = lookup(EXTRA_HEADERS_ENV)
+        .map(|raw| parse_header_lines(&raw))
+        .unwrap_or_default();
+    let command = lookup(EXTRA_HEADERS_CMD_ENV)
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+    if let Some(command) = command
+        && let Some(output) = runner(&command)
+    {
+        for (name, value) in parse_header_lines(&output) {
+            headers.retain(|(existing, _)| *existing != name);
+            headers.push((name, value));
+        }
+    }
+    headers
+}
+
+/// Stamp the STATIC extra headers onto a hook request from the process
+/// environment. [`EXTRA_HEADERS_CMD_ENV`] is deliberately ignored here: a
+/// hook process lives milliseconds and its wrapper hands it a fresh static
+/// header, so forking a credential helper per hook request would be waste.
+/// The command channel belongs to the long-lived launcher, which reaches it
+/// through [`ServerEndpoint::authenticate`].
+pub(crate) fn apply_extra_headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    apply_static_extra_headers_with(|k| std::env::var(k).ok(), req)
+}
+
+/// Testable core of [`apply_extra_headers`]: static lines only.
+pub(crate) fn apply_static_extra_headers_with(
     lookup: impl Fn(&str) -> Option<String>,
     req: reqwest::RequestBuilder,
 ) -> reqwest::RequestBuilder {
+    apply_extra_headers_with_runner(lookup, |_| None, req)
+}
+
+/// Resolve every extra header (static lines plus the command channel through
+/// `runner`) via `lookup` and stamp them onto `req`.
+pub(crate) fn apply_extra_headers_with_runner(
+    lookup: impl Fn(&str) -> Option<String>,
+    runner: impl FnMut(&str) -> Option<String>,
+    req: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
     let mut req = req;
-    for (name, value) in extra_headers_from(lookup) {
+    for (name, value) in extra_headers_from_with(lookup, runner) {
         req = req.header(name, value);
     }
     req
@@ -104,6 +296,16 @@ pub(crate) struct ServerResponseError {
 }
 
 impl ServerResponseError {
+    #[cfg(test)]
+    pub(crate) fn for_tests(status: reqwest::StatusCode, body: String) -> Self {
+        Self {
+            method: reqwest::Method::POST,
+            path: "/workstream/runs/x/finish".to_owned(),
+            status,
+            body,
+        }
+    }
+
     #[must_use]
     pub(crate) const fn status(&self) -> reqwest::StatusCode {
         self.status
@@ -121,7 +323,18 @@ impl fmt::Display for ServerResponseError {
             formatter,
             "{} {}: server returned {}: {}",
             self.method, self.path, self.status, self.body
-        )
+        )?;
+        if self.status.is_redirection() {
+            // The API itself never redirects and the client never follows:
+            // a 3xx is either an edge auth proxy (Cloudflare Access) bouncing
+            // an expired credential to its login page, or a scheme/host
+            // redirect that AI_MEMORY_SERVER_URL should already point past.
+            write!(
+                formatter,
+                " (a redirect the client will not follow: an auth-proxy login wall — extra-header credential missing or expired — or AI_MEMORY_SERVER_URL pointing at a redirecting scheme/host)"
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -161,6 +374,29 @@ async fn require_success(
     Err(server_response_error(method, &url, status, body))
 }
 
+/// Client for the thin-client helpers below.
+///
+/// Redirects are NOT followed, mirroring `hook_capture::build_client`: the
+/// server API never redirects, so a 3xx can only be an auth wall. Following it
+/// turned an expired Cloudflare Access token into a `200 text/html` login page
+/// that `.json()` then rejected with "expected value at line 1 column 1" —
+/// the `finish` of every long `ai-memory run` died that way. With redirects
+/// off the 3xx reaches [`server_response_error`] and says what it is.
+pub(crate) fn build_client() -> reqwest::Client {
+    // `Client::new()` panics on the same TLS-backend failure this would
+    // report, so expecting here changes nothing about failure and keeps the
+    // redirect policy unconditional (a fallback to `new()` would follow them).
+    client_builder()
+        .build()
+        .expect("reqwest client with the default TLS backend")
+}
+
+/// The one place the "never follow a redirect" policy is spelled out. The
+/// hook client layers `no_proxy` on top; everything else builds from here.
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+}
+
 /// Resolved server target — origin URL + base-path prefix + optional bearer token.
 #[derive(Debug, Clone)]
 pub struct ServerEndpoint {
@@ -174,6 +410,10 @@ pub struct ServerEndpoint {
     /// Bearer token when present, else `None`.
     pub auth_token: Option<String>,
     url_configured: bool,
+    /// Memo of the [`EXTRA_HEADERS_CMD_ENV`] output, owned by the endpoint
+    /// (no process-wide state): the launcher's one endpoint serves every
+    /// request of the session; clones share it, a fresh endpoint starts cold.
+    header_command: Arc<Mutex<HeaderCommandCache>>,
 }
 
 impl ServerEndpoint {
@@ -262,6 +502,7 @@ impl ServerEndpoint {
             base_path,
             auth_token: token.filter(|s| !s.is_empty()),
             url_configured,
+            header_command: Arc::new(Mutex::new(HeaderCommandCache::new())),
         }
     }
 
@@ -310,10 +551,40 @@ impl ServerEndpoint {
         lookup: impl Fn(&str) -> Option<String>,
         req: reqwest::RequestBuilder,
     ) -> reqwest::RequestBuilder {
-        let req = apply_extra_headers_with(lookup, req);
+        let req = apply_extra_headers_with_runner(
+            lookup,
+            |command| self.run_header_command(command),
+            req,
+        );
         match &self.auth_token {
             Some(t) => req.bearer_auth(t),
             None => req,
+        }
+    }
+
+    /// Run the header command through this endpoint's memo. The lock is held
+    /// while the command runs; requests through one endpoint are sequential
+    /// (one heartbeat at a time, then the finish), so nothing waits on it.
+    ///
+    /// The command is a blocking wait of up to [`HEADER_COMMAND_TIMEOUT`]
+    /// issued from inside async request helpers. On a multi-thread runtime it
+    /// is wrapped in `block_in_place` so the worker keeps driving other
+    /// tasks; a current-thread runtime (tests) or no runtime just blocks.
+    fn run_header_command(&self, command: &str) -> Option<String> {
+        let resolve = || {
+            let mut cache = self
+                .header_command
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.resolve(Instant::now(), HEADER_COMMAND_CACHE_TTL, || {
+                execute_header_command(command, HEADER_COMMAND_TIMEOUT)
+            })
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(resolve)
+            }
+            _ => resolve(),
         }
     }
 }
@@ -348,7 +619,7 @@ pub async fn get_json<T: DeserializeOwned>(
     path: &str,
     query: &[(&str, &str)],
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = build_client();
     let url = endpoint.build_url(path);
     let mut req = client.get(&url);
     if !query.is_empty() {
@@ -374,7 +645,7 @@ pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
     path: &str,
     body: &B,
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = build_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.patch(&url).json(body));
     let resp = req
@@ -405,7 +676,7 @@ pub async fn post_json_no_content<B: Serialize>(
     path: &str,
     body: &B,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = build_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url).json(body));
     let resp = req
@@ -418,7 +689,7 @@ pub async fn post_json_no_content<B: Serialize>(
 
 /// POST an empty body and require a successful response.
 pub async fn post_empty(endpoint: &ServerEndpoint, path: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = build_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
     let resp = req
@@ -439,7 +710,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
     query: &[(&str, &str)],
     body: &B,
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = build_client();
     let url = build_url_with_query(endpoint, path, query)?;
     let req = client.post(&url);
     let req = endpoint.authenticate(req.json(body));
@@ -526,7 +797,7 @@ fn augment_connect_error(
 /// Returns an error when the connection fails, the response is non-2xx,
 /// or the body cannot be read or written.
 pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) -> Result<u64> {
-    let client = reqwest::Client::new();
+    let client = build_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
     let resp = req
@@ -609,7 +880,7 @@ mod tests {
                     .to_string(),
             )
         };
-        let headers = extra_headers_from(lookup);
+        let headers = static_extra_headers_from(lookup);
         assert_eq!(headers.len(), 2, "{headers:?}");
         assert_eq!(headers[0].0.as_str(), "cf-access-token");
         assert_eq!(headers[0].1.to_str().unwrap(), "jwt-1");
@@ -618,13 +889,334 @@ mod tests {
 
     #[test]
     fn extra_headers_from_returns_empty_when_env_absent() {
-        assert!(extra_headers_from(|_| None).is_empty());
+        assert!(static_extra_headers_from(|_| None).is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // Extra headers resolved by a command at request time (MEM-3)
+    // ----------------------------------------------------------------
+
+    fn env(
+        static_lines: Option<&'static str>,
+        command: Option<&'static str>,
+    ) -> impl Fn(&str) -> Option<String> {
+        move |key| match key {
+            EXTRA_HEADERS_ENV => static_lines.map(str::to_string),
+            EXTRA_HEADERS_CMD_ENV => command.map(str::to_string),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn command_headers_override_static_ones_by_name() {
+        // O `run` vive horas: o token estatico exportado no lancamento vence,
+        // o comando devolve o token vivo e tem de vencer o estatico.
+        let headers = extra_headers_from_with(
+            env(
+                Some("cf-access-token: stale\nx-custom: keep"),
+                Some("resolve"),
+            ),
+            |command| {
+                assert_eq!(command, "resolve");
+                Some("cf-access-token: fresh\n".to_string())
+            },
+        );
+        let as_pairs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            as_pairs,
+            vec![("x-custom", "keep"), ("cf-access-token", "fresh")]
+        );
+    }
+
+    #[test]
+    fn command_with_empty_output_keeps_the_static_headers() {
+        let headers =
+            extra_headers_from_with(env(Some("cf-access-token: stale"), Some("resolve")), |_| {
+                Some(String::new())
+            });
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].1.to_str().unwrap(), "stale");
+    }
+
+    #[test]
+    fn command_failure_keeps_the_static_headers() {
+        let headers =
+            extra_headers_from_with(env(Some("cf-access-token: stale"), Some("resolve")), |_| {
+                None
+            });
+        assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn blank_command_is_ignored() {
+        let calls = std::cell::Cell::new(0);
+        let _ = extra_headers_from_with(env(None, Some("   ")), |_| {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn header_command_cache_reuses_the_output_within_the_ttl() {
+        let mut cache = HeaderCommandCache::new();
+        let ttl = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let runs = std::cell::Cell::new(0);
+        let run = || {
+            runs.set(runs.get() + 1);
+            Some("cf-access-token: a".to_string())
+        };
+        assert_eq!(
+            cache.resolve(t0, ttl, run).as_deref(),
+            Some("cf-access-token: a")
+        );
+        assert_eq!(
+            cache
+                .resolve(t0 + Duration::from_secs(30), ttl, run)
+                .as_deref(),
+            Some("cf-access-token: a")
+        );
+        assert_eq!(
+            runs.get(),
+            1,
+            "a heartbeat every 30s must not fork the resolver every time"
+        );
+        let _ = cache.resolve(t0 + Duration::from_secs(61), ttl, run);
+        assert_eq!(runs.get(), 2, "past the TTL the command runs again");
+    }
+
+    #[test]
+    fn header_command_cache_does_not_memoise_a_failure() {
+        // O finish faz 3 tentativas em menos de 1s; uma falha transitoria do
+        // helper na 1a nao pode condenar as outras duas ao header estatico.
+        let mut cache = HeaderCommandCache::new();
+        let ttl = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let runs = std::cell::Cell::new(0);
+        let flaky = || {
+            runs.set(runs.get() + 1);
+            (runs.get() > 1).then(|| "cf-access-token: b".to_string())
+        };
+        assert!(cache.resolve(t0, ttl, flaky).is_none());
+        assert_eq!(
+            cache
+                .resolve(t0 + Duration::from_millis(250), ttl, flaky)
+                .as_deref(),
+            Some("cf-access-token: b")
+        );
+        assert_eq!(runs.get(), 2, "the retry re-runs the helper");
+        let _ = cache.resolve(t0 + Duration::from_millis(500), ttl, flaky);
+        assert_eq!(runs.get(), 2, "the success is memoised as usual");
+    }
+
+    #[test]
+    fn authenticate_honours_the_header_command_and_memoises_per_endpoint() {
+        // O launcher usa UM endpoint pra sessao inteira: o comando roda no
+        // 1o request e o memo serve os seguintes; outro endpoint comeca frio.
+        let client = reqwest::Client::new();
+        let endpoint = ServerEndpoint::from_pair(None, None);
+        let lookup = env(
+            Some("cf-access-token: stale"),
+            Some("/bin/echo cf-access-token: live"),
+        );
+        let stamped = |endpoint: &ServerEndpoint| {
+            endpoint
+                .authenticate_with(&lookup, client.get("http://localhost/x"))
+                .build()
+                .unwrap()
+                .headers()
+                .get("cf-access-token")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(stamped(&endpoint).as_deref(), Some("live"));
+        assert_eq!(stamped(&endpoint.clone()).as_deref(), Some("live"));
+        assert_eq!(
+            stamped(&ServerEndpoint::from_pair(None, None)).as_deref(),
+            Some("live")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_header_command_accepts_shell_style_quoting() {
+        // Caminho de plugin com espaco: o wrapper exporta com `printf %q`.
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("My Plugins").join("token-header");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf 'cf-access-token: %s\\n' \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let quoted = shlex::try_quote(helper.to_str().unwrap()).unwrap();
+        let out = execute_header_command(&format!("{quoted} spaced"), Duration::from_secs(5));
+        assert_eq!(
+            out.as_deref().map(str::trim),
+            Some("cf-access-token: spaced")
+        );
+        assert!(execute_header_command("'unbalanced", Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
+    fn hook_requests_ignore_the_header_command() {
+        // Hook vive milissegundos e recebe header estatico do wrapper; forkar
+        // o helper a cada POST de hook seria puro desperdicio.
+        let client = reqwest::Client::new();
+        let req = apply_static_extra_headers_with(
+            env(
+                Some("cf-access-token: static"),
+                Some("/bin/echo cf-access-token: cmd"),
+            ),
+            client.post("http://localhost/hook"),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            req.headers()
+                .get("cf-access-token")
+                .and_then(|v| v.to_str().ok()),
+            Some("static")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_header_command_runs_without_a_shell_and_captures_stdout() {
+        let out = execute_header_command("/bin/echo cf-access-token: live", Duration::from_secs(5));
+        assert_eq!(out.as_deref().map(str::trim), Some("cf-access-token: live"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_header_command_reports_a_failing_command_as_none() {
+        assert!(execute_header_command("/bin/false", Duration::from_secs(5)).is_none());
+        assert!(execute_header_command("/nonexistent/resolver", Duration::from_secs(5)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_header_command_kills_the_child_at_the_timeout() {
+        // Um helper pendurado (cloudflared num buraco negro de rede) nao pode
+        // deixar um processo orfao por heartbeat: o filho e' morto e colhido.
+        let marker = format!("ai-memory-mem3-{}", std::process::id());
+        let started = Instant::now();
+        assert!(
+            execute_header_command(
+                &format!("/bin/sleep 30 {marker}"),
+                Duration::from_millis(200)
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let survivors = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("ps -eo args | grep -c '[s]leep 30 {marker}'"),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&survivors.stdout).trim(),
+            "0",
+            "the timed-out child must not survive the call"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Auth-wall redirects surface as errors, never as a login page (MEM-3)
+    // ----------------------------------------------------------------
+
+    async fn serve_once(status: &'static str, extra: String, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn post_json_does_not_follow_an_auth_wall_redirect() {
+        // Regressao: o Cloudflare Access responde 302 pra um token vencido;
+        // seguindo o redirect o cliente recebia a pagina de login em 200 e
+        // morria com "expected value at line 1 column 1" ao decodificar JSON.
+        let login = serve_once(
+            "200 OK",
+            "Content-Type: text/html\r\n".to_string(),
+            "<html>Sign in</html>",
+        )
+        .await;
+        // A live login page behind the Location: following it would turn the
+        // 302 into this 200 text/html, which is the regression.
+        let origin = serve_once("302 Found", format!("Location: {login}/login\r\n"), "").await;
+        let endpoint = ServerEndpoint::from_pair(Some(origin), None);
+        let error = post_json::<_, serde_json::Value>(
+            &endpoint,
+            "/workstream/runs/x/finish",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("302"), "{text}");
+        assert!(!text.contains("parsing JSON"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_json_does_not_follow_an_auth_wall_redirect() {
+        let origin = serve_once(
+            "302 Found",
+            "Location: http://127.0.0.1:9/login\r\n".to_string(),
+            "",
+        )
+        .await;
+        let endpoint = ServerEndpoint::from_pair(Some(origin), None);
+        let error = get_json::<serde_json::Value>(&endpoint, "/handoff", &[])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("302"));
+    }
+
+    #[test]
+    fn a_redirect_error_names_both_causes() {
+        // Um 302 do Access e um 301 http->https recebem a mesma dica: o
+        // texto tem de apontar a credencial E a URL, nao so a credencial.
+        let error: anyhow::Error =
+            ServerResponseError::for_tests(reqwest::StatusCode::FOUND, String::new()).into();
+        let text = format!("{error:#}");
+        assert!(text.contains("302"), "{text}");
+        assert!(text.contains("expired"), "{text}");
+        assert!(text.contains("AI_MEMORY_SERVER_URL"), "{text}");
+    }
+
+    #[test]
+    fn a_plain_server_error_carries_no_credential_hint() {
+        let error: anyhow::Error =
+            ServerResponseError::for_tests(reqwest::StatusCode::BAD_GATEWAY, "boom".into()).into();
+        let text = format!("{error:#}");
+        assert!(text.contains("502"));
+        assert!(!text.contains("expired"), "{text}");
     }
 
     #[test]
     fn apply_extra_headers_with_stamps_the_request() {
         let client = reqwest::Client::new();
-        let req = apply_extra_headers_with(
+        let req = apply_static_extra_headers_with(
             |_| Some("cf-access-token: jwt-2".to_string()),
             client.get("http://localhost"),
         )
@@ -668,7 +1260,7 @@ mod tests {
     #[test]
     fn apply_extra_headers_with_leaves_request_unchanged_when_unset() {
         let client = reqwest::Client::new();
-        let req = apply_extra_headers_with(|_| None, client.get("http://localhost"))
+        let req = apply_static_extra_headers_with(|_| None, client.get("http://localhost"))
             .build()
             .unwrap();
         assert!(req.headers().get("cf-access-token").is_none());
