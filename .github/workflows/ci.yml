@@ -227,7 +227,12 @@ jobs:
           fetch-depth: 0
       - run: scripts/check-changelog-sections.sh
       - name: released sections stay frozen
-        run: scripts/check-changelog-frozen.sh "origin/${{ github.base_ref || github.event.repository.default_branch }}"
+        # ze-codigos fork: diff against the upstream mirror (`main`) rather
+        # than the PR base. A PR into `passabot/upstream-patches` that merges
+        # upstream legitimately rewrites released sections and the link
+        # references at the bottom; relative to `main` only the fork's own
+        # `[Unreleased]` entries remain, which is what this check is for.
+        run: scripts/check-changelog-frozen.sh origin/main
 
   # End-to-end docker smoke: packages the release-build binary and confirms
   # the image runs. Catches Dockerfile drift (missing COPY, bad ENTRYPOINT)
