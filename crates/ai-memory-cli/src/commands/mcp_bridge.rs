@@ -83,7 +83,7 @@ fn upstream_config(
     // env value for the same name). Both are edge-proxy credentials (e.g.
     // Cloudflare Access `cf-access-token`); resolved once at bridge startup,
     // so the wrapping tool should export a fresh value per launch.
-    for (name, value) in crate::http_client::extra_headers_from(|k| std::env::var(k).ok()) {
+    for (name, value) in crate::http_client::static_extra_headers_from(|k| std::env::var(k).ok()) {
         headers.insert(name, value);
     }
     for line in flag_headers {
