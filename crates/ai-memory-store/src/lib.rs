@@ -5050,6 +5050,7 @@ mod tests {
             available_agents: Vec::new(),
             selection: WorkstreamSelection::Current,
             lease_owner: "test:1".into(),
+            native_session_id: None,
         };
         let run = store
             .writer
@@ -5259,6 +5260,7 @@ mod tests {
             available_agents: Vec::new(),
             selection: WorkstreamSelection::Current,
             lease_owner: "test:1".into(),
+            native_session_id: None,
         };
         let first = store
             .writer
@@ -5318,6 +5320,7 @@ mod tests {
             available_agents: Vec::new(),
             selection: WorkstreamSelection::Current,
             lease_owner: owner.into(),
+            native_session_id: None,
         };
 
         let blank = store
@@ -5407,6 +5410,7 @@ mod tests {
             available_agents: Vec::new(),
             selection: WorkstreamSelection::Current,
             lease_owner: owner.into(),
+            native_session_id: None,
         };
         let claude = store
             .writer
@@ -5474,6 +5478,7 @@ mod tests {
                     available_agents: Vec::new(),
                     selection: WorkstreamSelection::Current,
                     lease_owner: workspace_name.into(),
+                    native_session_id: None,
                 })
                 .await
                 .unwrap();
@@ -5536,6 +5541,7 @@ mod tests {
             available_agents: Vec::new(),
             selection: WorkstreamSelection::Current,
             lease_owner: owner.into(),
+            native_session_id: None,
         }
     }
 
@@ -7170,6 +7176,240 @@ mod tests {
             "active"
         );
     }
+    fn adopted_prepare_input(
+        ws: WorkspaceId,
+        proj: ProjectId,
+        native: &str,
+        new_name: &str,
+    ) -> PrepareWorkstreamRun {
+        PrepareWorkstreamRun {
+            agent: AgentKind::ClaudeCode,
+            selection: WorkstreamSelection::New(new_name.into()),
+            native_session_id: Some(native.into()),
+            ..managed_prepare_input(ws, proj, "adopt:1")
+        }
+    }
+
+    fn managed_run_state(db_path: &std::path::Path, run_id: ManagedRunId) -> String {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT state FROM managed_runs WHERE id = ?1",
+            params![run_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The desktop app reopens a conversation after a Quit with the same
+    /// native session id and a fresh first prompt. Adoption asks for a NEW
+    /// workstream because it cannot know better; the server must recognise
+    /// the session and hand back the workstream it already has, linked, so
+    /// the replayed transcript deduplicates into one ledger instead of
+    /// fragmenting into `name` and `name-<suffix>`.
+    #[tokio::test]
+    async fn prepare_reopens_the_workstream_already_linked_to_the_native_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-reattach").await;
+        let first = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "teste adocao"))
+            .await
+            .unwrap();
+        assert!(!first.session_reattached);
+        assert_eq!(first.native_session_id.as_deref(), Some("nat-1"));
+        set_managed_run_lease(store.db_path(), first.run_id, 1);
+
+        let again = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "teste adocao"))
+            .await
+            .unwrap();
+        assert!(again.session_reattached);
+        assert_eq!(again.workstream_id, first.workstream_id);
+        assert_eq!(again.workstream_name, "teste adocao");
+        assert_ne!(again.run_id, first.run_id);
+        assert_eq!(again.native_session_id.as_deref(), Some("nat-1"));
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(again.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("nat-1")
+        );
+    }
+
+    /// A different native session with the same title is a different
+    /// conversation: it must get its own workstream (the duplicate-name
+    /// refusal the client answers with a suffix), never the first one.
+    #[tokio::test]
+    async fn prepare_does_not_reattach_a_different_native_session_by_title() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-title").await;
+        let first = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "mesmo titulo"))
+            .await
+            .unwrap();
+        set_managed_run_lease(store.db_path(), first.run_id, 1);
+
+        let other = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-2", "mesmo titulo"))
+            .await
+            .unwrap_err();
+        assert!(matches!(other, StoreError::Duplicate(_)), "{other:?}");
+        let suffixed = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(
+                ws,
+                proj,
+                "nat-2",
+                "mesmo titulo-nat2",
+            ))
+            .await
+            .unwrap();
+        assert!(!suffixed.session_reattached);
+        assert_ne!(suffixed.workstream_id, first.workstream_id);
+    }
+
+    /// The map is checkout-local: the same native session id seen from
+    /// another worktree does not reopen this worktree's workstream.
+    #[tokio::test]
+    async fn prepare_reattaches_only_within_the_same_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-checkout").await;
+        let first = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "trabalho"))
+            .await
+            .unwrap();
+        set_managed_run_lease(store.db_path(), first.run_id, 1);
+
+        let elsewhere = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                worktree_fingerprint: "outro-worktree".into(),
+                ..adopted_prepare_input(ws, proj, "nat-1", "trabalho")
+            })
+            .await
+            .unwrap();
+        assert!(!elsewhere.session_reattached);
+        assert_ne!(elsewhere.workstream_id, first.workstream_id);
+    }
+
+    /// One native session cannot be live twice. A still-active run of the
+    /// SAME session (a crash inside the 90s lease, a Quit whose drainer has
+    /// not closed the run yet) is superseded rather than reported busy, and
+    /// it is left `expired`, not cancelled, so its late transcript import
+    /// still passes the lapsed-lease path.
+    #[tokio::test]
+    async fn prepare_reattach_supersedes_an_active_run_of_the_same_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-supersede").await;
+        let first = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "trabalho"))
+            .await
+            .unwrap();
+
+        let again = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "trabalho"))
+            .await
+            .unwrap();
+        assert!(again.session_reattached);
+        assert_eq!(again.workstream_id, first.workstream_id);
+        assert_eq!(managed_run_state(store.db_path(), first.run_id), "expired");
+        assert_eq!(managed_run_state(store.db_path(), again.run_id), "active");
+    }
+
+    /// Another live session on the linked workstream (`claudew-resume` on
+    /// it, say) keeps it. The adopted session then gets what it asked for —
+    /// a new workstream — instead of a 409 it could only answer by fragmenting
+    /// under a suffix, or an error it would retry on every prompt.
+    #[tokio::test]
+    async fn prepare_reattach_yields_to_another_live_session_on_the_workstream() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-yield").await;
+        let first = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "trabalho"))
+            .await
+            .unwrap();
+        set_managed_run_lease(store.db_path(), first.run_id, 1);
+        let resumed = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                selection: WorkstreamSelection::Named("trabalho".into()),
+                native_session_id: None,
+                ..adopted_prepare_input(ws, proj, "nat-1", "trabalho")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .link_managed_run_session(resumed.run_id, AgentKind::ClaudeCode, "nat-2")
+            .await
+            .unwrap();
+
+        let fallen_through = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "trabalho de novo"))
+            .await
+            .unwrap();
+        assert!(!fallen_through.session_reattached);
+        assert_eq!(fallen_through.workstream_name, "trabalho de novo");
+        assert_ne!(fallen_through.workstream_id, first.workstream_id);
+        assert_eq!(managed_run_state(store.db_path(), resumed.run_id), "active");
+    }
+
+    /// An explicit `--workstream` is a choice; the map only replaces what the
+    /// caller did not choose.
+    #[tokio::test]
+    async fn prepare_named_selection_wins_over_the_native_session_map() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-named").await;
+        let first = store
+            .writer
+            .prepare_workstream_run(adopted_prepare_input(ws, proj, "nat-1", "linkado"))
+            .await
+            .unwrap();
+        set_managed_run_lease(store.db_path(), first.run_id, 1);
+        let chosen = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                native_session_id: None,
+                ..adopted_prepare_input(ws, proj, "nat-1", "escolhido")
+            })
+            .await
+            .unwrap();
+        set_managed_run_lease(store.db_path(), chosen.run_id, 1);
+
+        let named = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                selection: WorkstreamSelection::Named("escolhido".into()),
+                ..adopted_prepare_input(ws, proj, "nat-1", "ignorado")
+            })
+            .await
+            .unwrap();
+        assert!(!named.session_reattached);
+        assert_eq!(named.workstream_name, "escolhido");
+        // ...and the session is now linked there too, so the next adoption
+        // follows the choice.
+        assert_eq!(named.native_session_id.as_deref(), Some("nat-1"));
+    }
+
     /// Bi-temporal-lite (docs/temporal.md): entity-link windows follow
     /// page supersession, and `as_of` returns what the store knew at
     /// that instant — including versions that have since been replaced.

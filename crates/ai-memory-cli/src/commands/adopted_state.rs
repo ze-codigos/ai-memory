@@ -6,8 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-use ai_memory_core::{AgentKind, ManagedRunId, WorkstreamCheckpoint};
+use ai_memory_core::{AgentKind, ManagedRunId, WorkstreamCheckpoint, WorkstreamId};
 use serde::{Deserialize, Serialize};
+
+/// How long a session link is kept. A desktop conversation reopened weeks
+/// later is rare, and the server holds the same map without any cap; the
+/// cache only spares a round trip and covers servers that predate the map.
+const LINK_MAX_AGE_SECS: i64 = 30 * 24 * 3_600;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AdoptedRun {
@@ -50,6 +55,80 @@ pub(crate) struct AdoptedRun {
 
 pub(crate) fn state_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("adopted-runs")
+}
+
+/// Which workstream a native session was adopted into. Outlives the run:
+/// `remove` deletes the run record when the drainer closes it, and the next
+/// adoption of the same session (the desktop app reopening a conversation)
+/// needs to land in the same workstream, not a fresh `name-<suffix>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SessionLink {
+    pub native_session_id: String,
+    pub workstream_id: WorkstreamId,
+    pub workstream_name: String,
+    /// The link is checkout-local, like the server's map.
+    pub cwd: PathBuf,
+    pub server_url: String,
+    pub linked_at: i64,
+}
+
+/// A subdirectory, so `list` (which reads the run records at the top level)
+/// never tries to parse a link as a run.
+fn links_dir(data_dir: &Path) -> PathBuf {
+    state_dir(data_dir).join("sessions")
+}
+
+fn link_path(data_dir: &Path, native_session_id: &str) -> PathBuf {
+    links_dir(data_dir).join(file_name(native_session_id))
+}
+
+pub(crate) fn save_link(data_dir: &Path, link: &SessionLink) -> anyhow::Result<()> {
+    let dir = links_dir(data_dir);
+    std::fs::create_dir_all(&dir)?;
+    prune_links(&dir, link.linked_at);
+    let target = link_path(data_dir, &link.native_session_id);
+    let temp = target.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(link)?)?;
+    std::fs::rename(&temp, &target)?;
+    Ok(())
+}
+
+/// The link for this session in this checkout against this server, if any.
+/// A link that does not match either is not "wrong", it is another
+/// adoption's: ignore it rather than reopen the wrong workstream.
+pub(crate) fn load_link(
+    data_dir: &Path,
+    native_session_id: &str,
+    cwd: &Path,
+    server_url: &str,
+) -> Option<SessionLink> {
+    let raw = std::fs::read(link_path(data_dir, native_session_id)).ok()?;
+    let link: SessionLink = serde_json::from_slice(&raw).ok()?;
+    (link.native_session_id == native_session_id
+        && link.cwd == cwd
+        && link.server_url == server_url)
+        .then_some(link)
+}
+
+/// Best effort, on every save: a stale link is a wasted round trip, not a
+/// failure, so this never blocks the adoption that triggered it.
+fn prune_links(dir: &Path, now: i64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let stale = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<SessionLink>(&raw).ok())
+            .is_none_or(|link| now.saturating_sub(link.linked_at) > LINK_MAX_AGE_SECS);
+        if stale {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// The session id arrives from the environment and becomes a file name, so it
@@ -202,6 +281,91 @@ mod tests {
         std::fs::write(state_dir(tmp.path()).join("quebrado.json"), "{ nao json").unwrap();
         save(tmp.path(), &sample_run("nat-1")).unwrap();
         assert_eq!(list(tmp.path()).len(), 1);
+    }
+
+    fn sample_link(session: &str, linked_at: i64) -> SessionLink {
+        SessionLink {
+            native_session_id: session.into(),
+            workstream_id: WorkstreamId::new(),
+            workstream_name: "ajuste-checkout".into(),
+            cwd: PathBuf::from("/repo"),
+            server_url: "https://memory-test.example".into(),
+            linked_at,
+        }
+    }
+
+    #[test]
+    fn a_link_outlives_the_run_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = sample_link("nat-1", 1_700_000_000);
+        save(tmp.path(), &sample_run("nat-1")).unwrap();
+        save_link(tmp.path(), &link).unwrap();
+        remove(tmp.path(), "nat-1");
+        assert_eq!(load(tmp.path(), "nat-1"), None);
+        assert_eq!(
+            load_link(
+                tmp.path(),
+                "nat-1",
+                Path::new("/repo"),
+                "https://memory-test.example"
+            ),
+            Some(link)
+        );
+        // The links directory is not mistaken for run records.
+        assert!(list(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn a_link_is_checkout_and_server_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_link(tmp.path(), &sample_link("nat-1", 1_700_000_000)).unwrap();
+        assert!(
+            load_link(
+                tmp.path(),
+                "nat-1",
+                Path::new("/outro-repo"),
+                "https://memory-test.example"
+            )
+            .is_none()
+        );
+        assert!(
+            load_link(
+                tmp.path(),
+                "nat-1",
+                Path::new("/repo"),
+                "https://memory-prod.example"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn saving_a_link_prunes_the_stale_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_link(tmp.path(), &sample_link("velha", 1_700_000_000)).unwrap();
+        save_link(
+            tmp.path(),
+            &sample_link("nova", 1_700_000_000 + LINK_MAX_AGE_SECS + 1),
+        )
+        .unwrap();
+        assert!(
+            load_link(
+                tmp.path(),
+                "velha",
+                Path::new("/repo"),
+                "https://memory-test.example"
+            )
+            .is_none()
+        );
+        assert!(
+            load_link(
+                tmp.path(),
+                "nova",
+                Path::new("/repo"),
+                "https://memory-test.example"
+            )
+            .is_some()
+        );
     }
 
     #[test]

@@ -7314,6 +7314,7 @@ mod tests {
                 available_agents: Vec::new(),
                 selection: WorkstreamSelection::Current,
                 lease_owner: "test:collision".into(),
+                native_session_id: None,
             })
             .await
             .unwrap();
@@ -10259,6 +10260,7 @@ mod tests {
             available_agents: Vec::new(),
             selection: WorkstreamSelection::Current,
             lease_owner: "test:1".into(),
+            native_session_id: None,
         };
         // First run: nothing to replay, but it leaves a portable event behind.
         let first = state
@@ -10645,6 +10647,7 @@ mod tests {
                 available_agents: Vec::new(),
                 selection: WorkstreamSelection::Current,
                 lease_owner: "test-first".into(),
+                native_session_id: None,
             })
             .await
             .unwrap();
@@ -10685,6 +10688,7 @@ mod tests {
                 available_agents: Vec::new(),
                 selection: WorkstreamSelection::Current,
                 lease_owner: "test-kimi".into(),
+                native_session_id: None,
             })
             .await
             .unwrap();

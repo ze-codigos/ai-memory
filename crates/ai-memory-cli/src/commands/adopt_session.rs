@@ -12,7 +12,7 @@ use ai_memory_core::{
 use ai_memory_workstream::inspect_repository;
 use anyhow::{Context as _, Result};
 
-use crate::commands::adopted_state::{self, AdoptedRun};
+use crate::commands::adopted_state::{self, AdoptedRun, SessionLink};
 use crate::commands::session_name;
 use crate::config::DEFAULT_WORKSPACE;
 use crate::http_client::{ServerEndpoint, post_json, post_json_no_content};
@@ -49,6 +49,41 @@ pub(crate) fn should_adopt(
 pub(crate) fn with_suffix(name: &str, native_session_id: &str) -> String {
     let short: String = native_session_id.chars().take(8).collect();
     session_name::with_suffix_within_limit(name, &format!("-{short}"))
+}
+
+/// How the prepare selects a workstream, in the order they are tried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Attempt {
+    /// This session was adopted before, into this workstream: select it by
+    /// name. Works against a server without the native-session map; fails
+    /// (and falls through) when the workstream was renamed or is busy.
+    Cached(String),
+    /// A new workstream under the resolved name. A server with the map
+    /// answers with the linked workstream instead when it has one.
+    Fresh(String),
+    /// The resolved name is taken by another conversation.
+    Suffixed(String),
+}
+
+/// The selections to try. The suffix goes last on purpose: a same-title
+/// session that is NOT this one must end up under its own name, and only
+/// the server can tell those apart (by the native session id, never the
+/// title).
+pub(crate) fn attempts(
+    cached: Option<&SessionLink>,
+    resolved_name: &str,
+    native_session_id: &str,
+) -> Vec<Attempt> {
+    let mut attempts = Vec::with_capacity(3);
+    if let Some(link) = cached {
+        attempts.push(Attempt::Cached(link.workstream_name.clone()));
+    }
+    attempts.push(Attempt::Fresh(resolved_name.to_string()));
+    attempts.push(Attempt::Suffixed(with_suffix(
+        resolved_name,
+        native_session_id,
+    )));
+    attempts
 }
 
 /// Concrete workspace/project for the prepare body, mirroring the fallbacks the
@@ -98,7 +133,13 @@ pub(crate) async fn adopt(input: AdoptInput<'_>) -> Result<AdoptedRun> {
         input.bearer.map(str::to_string),
     );
 
-    let request = |name: String| PrepareManagedRunRequest {
+    // Never an unnamed selection: reusing "the current workstream" would
+    // interleave two conversations in one ledger (with no heartbeat, the
+    // first session's run lapses after 90s and the second would find it
+    // free). Identity comes from the native session id — sent on every
+    // attempt, so a server with the map reopens the session's own
+    // workstream and links the run in one transaction.
+    let request = |attempt: &Attempt| PrepareManagedRunRequest {
         workspace: workspace.clone(),
         project: project.clone(),
         cwd: repository.cwd.to_string_lossy().into_owned(),
@@ -107,33 +148,50 @@ pub(crate) async fn adopt(input: AdoptInput<'_>) -> Result<AdoptedRun> {
         agent: AgentKind::ClaudeCode,
         automatic_harness: false,
         available_agents: Vec::new(),
-        workstream: None,
-        // Always its own workstream. Reusing an existing one would interleave
-        // two conversations in one ledger: with no heartbeat, the first
-        // session's run lapses after 90s and the second would find the name
-        // free.
-        new_workstream: Some(name),
+        workstream: match attempt {
+            Attempt::Cached(name) => Some(name.clone()),
+            Attempt::Fresh(_) | Attempt::Suffixed(_) => None,
+        },
+        new_workstream: match attempt {
+            Attempt::Cached(_) => None,
+            Attempt::Fresh(name) | Attempt::Suffixed(name) => Some(name.clone()),
+        },
         lease_owner: crate::commands::run::lease_owner(),
+        native_session_id: Some(input.native_session_id.to_string()),
     };
 
-    let prepared: PrepareManagedRunResponse = match post_json(
-        &endpoint,
-        "/workstream/runs",
-        &request(resolved.name.clone()),
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        // A duplicate name is the one failure worth a second attempt; any
-        // other error would only repeat. One retry, then give up.
-        Err(_) => post_json(
+    let cached = adopted_state::load_link(
+        input.data_dir,
+        input.native_session_id,
+        &repository.cwd,
+        input.server_url,
+    );
+    let mut prepared: Option<(PrepareManagedRunResponse, Attempt)> = None;
+    let mut last_error = None;
+    for attempt in attempts(cached.as_ref(), &resolved.name, input.native_session_id) {
+        match post_json::<_, PrepareManagedRunResponse>(
             &endpoint,
             "/workstream/runs",
-            &request(with_suffix(&resolved.name, input.native_session_id)),
+            &request(&attempt),
         )
         .await
-        .context("opening a workstream for the adopted session")?,
+        {
+            Ok(response) => {
+                prepared = Some((response, attempt));
+                break;
+            }
+            // A taken or renamed name is the failure the next attempt
+            // exists for; any other error would only repeat, but telling
+            // them apart costs a round trip the next attempt makes anyway.
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let Some((prepared, attempt)) = prepared else {
+        return Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("no selection to try"))
+            .context("opening a workstream for the adopted session"));
     };
+    let reattached = prepared.session_reattached || matches!(attempt, Attempt::Cached(_));
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
 
     // Without this the run keeps a NULL native_session_id, and the lapsed-lease
@@ -149,15 +207,35 @@ pub(crate) async fn adopt(input: AdoptInput<'_>) -> Result<AdoptedRun> {
     .await
     .context("linking the native session to the adopted run")?;
 
+    let now = jiff::Timestamp::now().as_second();
+    // The link outlives the run record on purpose: see `SessionLink`. Its
+    // failure is not the adoption's — the server keeps the same map.
+    if let Err(error) = adopted_state::save_link(
+        input.data_dir,
+        &SessionLink {
+            native_session_id: input.native_session_id.to_string(),
+            workstream_id: prepared.workstream_id,
+            workstream_name: prepared.workstream_name.clone(),
+            cwd: repository.cwd.clone(),
+            server_url: input.server_url.to_string(),
+            linked_at: now,
+        },
+    ) {
+        eprintln!(
+            "ai-memory hook warning: adopted session linked on the server but the local link could not be written: {error:#}"
+        );
+    }
     let state = AdoptedRun {
         run_id: prepared.run_id,
         run_path,
         native_session_id: input.native_session_id.to_string(),
         workstream_name: prepared.workstream_name,
-        provisional: resolved.provisional,
+        // A reopened workstream already has its name; only a workstream this
+        // adoption created can still be waiting for a better one.
+        provisional: resolved.provisional && !reattached,
         server_url: input.server_url.to_string(),
         cwd: repository.cwd,
-        adopted_at: jiff::Timestamp::now().as_second(),
+        adopted_at: now,
         ended: false,
         home: None,
         session_dir: None,
@@ -205,6 +283,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         adopted_state::save(tmp.path(), &sample_run("nat-1")).unwrap();
         assert!(should_adopt(tmp.path(), "nat-2", None));
+    }
+
+    #[test]
+    fn attempts_try_the_cached_workstream_then_fresh_then_suffixed() {
+        let link = SessionLink {
+            native_session_id: "0c892539-b62d-4475".into(),
+            workstream_id: ai_memory_core::WorkstreamId::new(),
+            workstream_name: "2026-09-17-teste".into(),
+            cwd: std::path::PathBuf::from("/repo"),
+            server_url: "https://memory-test.example".into(),
+            linked_at: 0,
+        };
+        assert_eq!(
+            attempts(Some(&link), "2026-09-17-outro", "0c892539-b62d-4475"),
+            vec![
+                Attempt::Cached("2026-09-17-teste".into()),
+                Attempt::Fresh("2026-09-17-outro".into()),
+                Attempt::Suffixed("2026-09-17-outro-0c892539".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn attempts_without_a_link_start_fresh() {
+        assert_eq!(
+            attempts(None, "ajuste", "0c892539-b62d-4475"),
+            vec![
+                Attempt::Fresh("ajuste".into()),
+                Attempt::Suffixed("ajuste-0c892539".into()),
+            ]
+        );
     }
 
     #[test]
