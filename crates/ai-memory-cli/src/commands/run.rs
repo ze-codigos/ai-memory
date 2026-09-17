@@ -547,8 +547,8 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
             // The transcript is complete on disk; only the upload failed
             // (expired edge credential, server down, DNS). Keep the run
             // instead of cancelling it and let the detached drainer, which
-            // already finalises adopted sessions at every hook boundary,
-            // import and close it with whatever credential is live then. A
+            // runs at every hook boundary, import and close it with whatever
+            // credential is live then. A
             // definitive server rejection (4xx other than auth/backpressure)
             // is not kept: the drainer would only hear it again.
             if plan.mode == LaunchMode::Session
@@ -1303,12 +1303,11 @@ pub(crate) async fn export_after_flush(
 
 /// Send a transcript to the server in batches.
 ///
-/// `close` says whether this import ends the run. The launcher always closes:
-/// it only ever imports after its child exited. Reconciliation of an adopted
-/// session does not — it cannot tell a dead session from an idle one, so it
-/// imports incrementally and leaves the run open for the real SessionEnd. An
-/// incremental pass also does not advance the durable source cursor, so the
-/// next one re-reads from the start and relies on event-id dedup.
+/// `close` says whether this import ends the run. Every caller closes today:
+/// the launcher and the drainer both import only after the child exited. An
+/// open import (`close = false`) leaves the run open and does not advance the
+/// durable source cursor, so a later pass re-reads from the start and relies
+/// on event-id dedup.
 pub(crate) async fn import_batches(
     endpoint: &ServerEndpoint,
     run_path: &str,

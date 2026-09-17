@@ -490,8 +490,9 @@ pub(crate) fn heartbeat(conn: &mut Connection, run_id: ManagedRunId) -> StoreRes
 /// Release an active managed-run lease without importing any events.
 ///
 /// Distinct from `expired`: a lapsed lease only means nobody renewed it, and
-/// a late transcript for that run is still legitimate (an adopted session has
-/// no parent process to heartbeat, so it always finishes with a lapsed lease).
+/// a late transcript for that run is still legitimate (a ledger the launcher
+/// kept for a later import has nobody heartbeating, so it always finishes
+/// with a lapsed lease).
 /// `cancelled` is a deliberate discard, and `finish_run` must keep refusing it
 /// even when the caller can prove which native session it owns. Sharing one
 /// state made those two indistinguishable.
@@ -692,9 +693,9 @@ pub(crate) fn finish_run(
     }
     // A lapsed lease is not a reason to refuse a transcript. The lease exists
     // to keep two live sessions off one workstream; it says nothing about
-    // whether an import that arrives afterwards is legitimate. Sessions
-    // adopted by a hook have no parent process to heartbeat, so they ALWAYS
-    // arrive here expired — as does anything reconciled after a crash.
+    // whether an import that arrives afterwards is legitimate. A ledger the
+    // launcher kept for a later import has nobody heartbeating, so it ALWAYS
+    // arrives here expired — as does anything reconciled after a crash.
     //
     // This does not loosen identity. The per-event guards below (agent and
     // native_session_id) are what keep one session's events out of another's

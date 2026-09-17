@@ -337,9 +337,9 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         }
         Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
     }
-    // Adopted sessions: close the ones that ended, import the rest
-    // incrementally. After the spool on purpose — observations first, ledger
-    // second — and it reuses the bearer the drain above already warmed.
+    // Kept ledgers: close what the launcher could not. After the spool on
+    // purpose — observations first, ledger second — and it reuses the bearer
+    // the drain above already warmed.
     let _ = crate::commands::finish_session::finalize_adopted_runs(&dd).await;
     Ok(())
 }
@@ -2845,6 +2845,12 @@ mod tests {
         let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
         let mut args = kimi_hook_args("user-prompt", &base);
         args.agent = "claude-code".into();
+        // The first-prompt rename reads AI_MEMORY_WORKSTREAM_NAME from the
+        // process environment, which a `cargo test` run from inside a
+        // managed session inherits. Marking the session renamed keeps that
+        // path out of a test about the handoff fetch.
+        crate::commands::placeholder_rename::mark_renamed(tmp.path(), "claude-session", "x")
+            .unwrap();
         let mut stdout = Vec::new();
         run_with_payload(
             Some(tmp.path().to_path_buf()),

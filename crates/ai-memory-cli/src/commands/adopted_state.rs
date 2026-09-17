@@ -104,7 +104,7 @@ pub(crate) fn list(data_dir: &Path) -> Vec<AdoptedRun> {
         .collect()
 }
 
-/// Shared with the adoption and finalisation tests, which both need a state to
+/// Shared with the finalisation and launcher tests, which need a record to
 /// act on. Lives outside `mod tests` so those modules can import it.
 #[cfg(test)]
 pub(crate) fn sample_run(session: &str) -> AdoptedRun {

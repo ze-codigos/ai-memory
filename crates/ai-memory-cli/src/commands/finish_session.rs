@@ -7,55 +7,66 @@
 //! is pending. Putting the import here keeps transcript export and the batched
 //! POSTs out of the hook's latency, and gets retries for free.
 //!
-//! A record marked ended closes its run. Anything else gets an INCREMENTAL
-//! import that leaves the run open — idempotent by event id, and therefore
-//! safe against a session that is still alive.
+//! Every record the launcher writes is `ended` by construction, so the only
+//! outcomes are "close it" and "give up". A record that is NOT ended was
+//! written by a binary that still adopted sessions from the hook (0.12–0.17);
+//! nothing marks such a record ended any more, so it is abandoned at once,
+//! with a warning, rather than re-exported at every boundary forever.
 
 use std::path::Path;
 
 use crate::commands::adopted_state::AdoptedRun;
 
-/// A state older than this is abandoned rather than imported. Long enough to
-/// survive a weekend, short enough that a genuinely dead session does not sit
-/// in the directory forever.
+/// A record older than this is abandoned rather than imported. Long enough to
+/// survive a weekend, short enough that a ledger the server keeps refusing
+/// does not sit in the directory forever.
 const MAX_AGE_SECS: i64 = 48 * 3_600;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Action {
-    /// SessionEnd was seen: import and close.
+    /// Import and close.
     Close,
-    /// Still open, or unknown: import what exists and leave the run open.
-    Incremental,
-    /// Too old to be worth importing; drop the state.
+    /// Not worth importing; drop the record.
     Drop,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Closed,
-    Incremental,
     Dropped,
     /// Transient failure — state kept so the next boundary retries.
     Kept,
 }
 
-/// Ending beats age: an ended session has a complete transcript on disk, and
-/// recovering it is the whole reason the sweep exists.
+/// Why a record is dropped, for the warning: the two reasons call for
+/// different reactions from whoever reads the log.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DropReason {
+    /// Past the age cap: the server kept refusing (or was never reachable).
+    TooOld,
+    /// Written by a hook-adoption binary; nothing can end it now.
+    Legacy,
+}
+
+/// The server refuses, by design, a lapsed run it never linked, and that
+/// verdict never changes — so past the cap the record is abandoned (with a
+/// warning naming the transcript) instead of being retried forever.
 pub(crate) fn plan_for(run: &AdoptedRun, now: i64, max_age_secs: i64) -> Action {
-    // A launcher-kept record is the exception to "ending beats age": the
-    // server refuses, by design, a lapsed run it never linked, and that
-    // verdict never changes — so past the cap the record is abandoned (with a
-    // warning naming the transcript) instead of being retried forever.
-    if run.ended && !run.kept_by_launcher {
-        return Action::Close;
+    if !run.ended {
+        return Action::Drop;
     }
     if now.saturating_sub(run.adopted_at) > max_age_secs {
         return Action::Drop;
     }
+    Action::Close
+}
+
+pub(crate) fn drop_reason(run: &AdoptedRun) -> DropReason {
     if run.ended {
-        return Action::Close;
+        DropReason::TooOld
+    } else {
+        DropReason::Legacy
     }
-    Action::Incremental
 }
 
 /// Whether retrying could ever succeed.
@@ -90,29 +101,32 @@ pub(crate) async fn finalize_adopted_runs(data_dir: &Path) -> Vec<Outcome> {
 
     let mut outcomes = Vec::with_capacity(pending.len());
     for run in pending {
-        let action = plan_for(&run, now, MAX_AGE_SECS);
-        if action == Action::Drop {
-            if run.kept_by_launcher {
-                eprintln!(
+        if plan_for(&run, now, MAX_AGE_SECS) == Action::Drop {
+            match drop_reason(&run) {
+                DropReason::TooOld => eprintln!(
                     "ai-memory hook-drain warning: giving up on the transcript of workstream '{}' (native session {}, {}): it could not be imported within {}h",
                     run.workstream_name,
                     run.native_session_id,
                     run.cwd.display(),
                     MAX_AGE_SECS / 3_600
-                );
+                ),
+                DropReason::Legacy => eprintln!(
+                    "ai-memory hook-drain warning: dropping the record of workstream '{}' (native session {}, {}): it was written by a version that adopted sessions from the hook, and nothing can close it now; the server run lapses by itself",
+                    run.workstream_name,
+                    run.native_session_id,
+                    run.cwd.display(),
+                ),
             }
             crate::commands::adopted_state::remove(data_dir, &run.native_session_id);
             outcomes.push(Outcome::Dropped);
             continue;
         }
-        let close = action == Action::Close;
         // One broken run must not stop the others from being finalised.
-        let outcome = match import_one(&run, close, &home, bearer.as_deref()).await {
-            Ok(()) if close => {
+        let outcome = match import_one(&run, &home, bearer.as_deref()).await {
+            Ok(()) => {
                 crate::commands::adopted_state::remove(data_dir, &run.native_session_id);
                 Outcome::Closed
             }
-            Ok(()) => Outcome::Incremental,
             Err(error) if is_permanent(&error) => {
                 eprintln!(
                     "ai-memory hook-drain warning: adopted run {} dropped, the server will not accept it: {error:#}",
@@ -134,19 +148,14 @@ pub(crate) async fn finalize_adopted_runs(data_dir: &Path) -> Vec<Outcome> {
     outcomes
 }
 
-async fn import_one(
-    run: &AdoptedRun,
-    close: bool,
-    home: &Path,
-    bearer: Option<&str>,
-) -> anyhow::Result<()> {
+async fn import_one(run: &AdoptedRun, home: &Path, bearer: Option<&str>) -> anyhow::Result<()> {
     let endpoint = crate::http_client::ServerEndpoint::from_pair(
         Some(run.server_url.clone()),
         bearer.map(str::to_string),
     );
-    // A launcher-kept run recorded which harness it launched, where it looked
-    // for the transcript, and the exit code and checkpoint of the moment;
-    // a hook-adopted one did not and gets the process defaults.
+    // The launcher recorded which harness it launched, where it looked for
+    // the transcript, and the exit code and checkpoint of the moment; a record
+    // without them gets the process defaults.
     let harness = run
         .agent
         .and_then(crate::commands::run::managed_harness_from_agent)
@@ -173,7 +182,7 @@ async fn import_one(
         transcript,
         checkpoint,
         run.exit_code,
-        close,
+        true,
     )
     .await?;
     Ok(())
@@ -185,35 +194,7 @@ mod tests {
     use crate::commands::adopted_state::sample_run;
 
     #[test]
-    fn an_ended_session_closes() {
-        let mut run = sample_run("nat-1");
-        run.ended = true;
-        assert_eq!(
-            plan_for(&run, run.adopted_at + 60, MAX_AGE_SECS),
-            Action::Close
-        );
-    }
-
-    #[test]
-    fn a_live_session_imports_incrementally() {
-        let run = sample_run("nat-1");
-        assert_eq!(
-            plan_for(&run, run.adopted_at + 3_600, MAX_AGE_SECS),
-            Action::Incremental
-        );
-    }
-
-    #[test]
-    fn a_stale_unended_session_is_dropped() {
-        let run = sample_run("nat-1");
-        assert_eq!(
-            plan_for(&run, run.adopted_at + MAX_AGE_SECS + 1, MAX_AGE_SECS),
-            Action::Drop
-        );
-    }
-
-    #[test]
-    fn a_fresh_launcher_kept_ledger_closes() {
+    fn a_fresh_kept_ledger_closes() {
         let mut run = sample_run("nat-1");
         run.ended = true;
         run.kept_by_launcher = true;
@@ -224,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_launcher_kept_ledger_is_abandoned() {
+    fn a_stale_kept_ledger_is_abandoned() {
         // O servidor recusa pra sempre um run vencido que nunca foi linkado;
         // insistir a cada boundary por semanas nao recupera nada.
         let mut run = sample_run("nat-1");
@@ -234,17 +215,36 @@ mod tests {
             plan_for(&run, run.adopted_at + MAX_AGE_SECS + 1, MAX_AGE_SECS),
             Action::Drop
         );
+        assert_eq!(drop_reason(&run), DropReason::TooOld);
     }
 
     #[test]
-    fn a_stale_but_ended_session_still_closes() {
-        // Ending beats age: the transcript is complete and on disk, and this
-        // is exactly the crash-recovery case the sweep exists for.
+    fn a_legacy_unended_record_is_dropped_at_once() {
+        // Written by a binary that adopted sessions from the hook; nothing
+        // marks it ended any more, so importing it incrementally forever
+        // would only re-export the transcript at every boundary.
+        let run = sample_run("nat-1");
+        assert_eq!(
+            plan_for(&run, run.adopted_at + 60, MAX_AGE_SECS),
+            Action::Drop
+        );
+        assert_eq!(drop_reason(&run), DropReason::Legacy);
+    }
+
+    #[test]
+    fn a_legacy_ended_record_still_closes_within_the_cap() {
+        // A 0.12-0.17 record that saw its SessionEnd has a complete
+        // transcript on disk; it gets the same chance as a kept ledger, and
+        // the same cap.
         let mut run = sample_run("nat-1");
         run.ended = true;
         assert_eq!(
-            plan_for(&run, run.adopted_at + MAX_AGE_SECS + 1, MAX_AGE_SECS),
+            plan_for(&run, run.adopted_at + 3_600, MAX_AGE_SECS),
             Action::Close
+        );
+        assert_eq!(
+            plan_for(&run, run.adopted_at + MAX_AGE_SECS + 1, MAX_AGE_SECS),
+            Action::Drop
         );
     }
 

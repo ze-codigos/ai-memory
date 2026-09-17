@@ -113,7 +113,11 @@ fn already_renamed(data_dir: &Path, native_session_id: &str) -> bool {
 
 /// The marker holds the new name: useful when reading the state directory by
 /// hand, and it costs nothing.
-fn mark_renamed(data_dir: &Path, native_session_id: &str, new_name: &str) -> std::io::Result<()> {
+pub(crate) fn mark_renamed(
+    data_dir: &Path,
+    native_session_id: &str,
+    new_name: &str,
+) -> std::io::Result<()> {
     write_marker(
         &state_marker(data_dir, "renamed", native_session_id),
         new_name,

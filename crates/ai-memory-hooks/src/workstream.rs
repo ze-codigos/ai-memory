@@ -675,11 +675,12 @@ async fn finish_run(
             Err(failure) => store_error_response(failure),
         };
     }
-    // A lapsed lease is not a closed run. Sessions adopted by a lifecycle hook
-    // have no parent process to renew the lease, so they ALWAYS arrive here
-    // expired — as does anything reconciled after a crash. The lease keeps two
-    // live sessions off one workstream; it says nothing about whether an
-    // import that arrives afterwards is legitimate.
+    // A lapsed lease is not a closed run. A ledger the launcher could not
+    // import when its child exited is retried by the hook drainer later, with
+    // nobody left to renew the lease, so it ALWAYS arrives here expired — as
+    // does anything reconciled after a crash. The lease keeps two live
+    // sessions off one workstream; it says nothing about whether an import
+    // that arrives afterwards is legitimate.
     //
     // The identity check is what keeps this safe, and it is stricter than the
     // active path below: there the caller's id merely fills in for a missing
