@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `POST /workstream/runs` accepts the caller's `native_session_id`. When a
+  workstream of the same checkout is already linked to that session, the
+  server reopens it (superseding a still-active run of the same session,
+  yielding to one of another) instead of the requested selection, links the
+  session to the new run in the same transaction, and says so with
+  `session_reattached` (or `session_link_busy` when it yielded). An explicit
+  `workstream` still wins. Claude Code adoption sends the id on every
+  attempt (the suffixed retry now only follows a 409), so a desktop
+  conversation reopened after a Quit lands in its own workstream (the
+  replayed transcript deduplicates by event id) rather than fragmenting
+  into `name-<suffix>`. Identity is the native session, never the title: a
+  same-title session that is not the same conversation still gets its own
+  workstream. A checkout-local `adopted-runs/sessions/<id>.json` link
+  outlives the run and only detects a split — when the server does not hand
+  the session's workstream back (older server, or another live session on
+  it) the model is told once, at adoption, with both names and the cause.
+  (#9)
+- `finalize-session` also does what the SessionEnd hook does for a session
+  a hook adopted: it marks the adopted run ended and starts the detached
+  drainer, so a desktop session the user never quits can be closed by hand
+  (`--session-id <native id>`); the report lists such sessions under
+  `adopted_closing`. (#9)
 - The Claude Code user-prompt hook renames a launcher placeholder workstream
   (`novo-<n>`, as `passabot-memory run` opens one per session) by itself on the
   session's first prompt, selecting it by that placeholder name so a rename

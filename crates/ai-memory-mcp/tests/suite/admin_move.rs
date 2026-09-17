@@ -217,6 +217,7 @@ async fn move_project_true_move_into_fresh_dest() {
             available_agents: vec![AgentKind::Codex],
             selection: WorkstreamSelection::Current,
             lease_owner: "test".into(),
+            native_session_id: None,
         })
         .await
         .unwrap();
@@ -970,6 +971,7 @@ async fn copy_purge_force_never_deletes_a_live_managed_workstream() {
             available_agents: vec![AgentKind::Codex],
             selection: WorkstreamSelection::Current,
             lease_owner: "test".into(),
+            native_session_id: None,
         })
         .await
         .unwrap();
@@ -1893,6 +1895,7 @@ async fn delete_workspace_force_removes_everything() {
             available_agents: vec![AgentKind::Codex],
             selection: WorkstreamSelection::Current,
             lease_owner: "test".into(),
+            native_session_id: None,
         })
         .await
         .unwrap();

@@ -148,6 +148,13 @@ pub struct PrepareManagedRunRequest {
     pub new_workstream: Option<String>,
     /// Diagnostic owner label (host and process id), not an authorization key.
     pub lease_owner: String,
+    /// Harness-native session the caller already has — a session adopted by a
+    /// hook, never a fresh launch. When a workstream of the same checkout is
+    /// already linked to it, the server reopens that workstream instead of the
+    /// selection above (an explicit `workstream` still wins) and links the
+    /// session to the new run in the same transaction. Old servers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
 }
 
 /// Result of preparing a managed invocation.
@@ -177,6 +184,17 @@ pub struct PrepareManagedRunResponse {
     /// session. Old servers omit this field, which safely defaults to fresh.
     #[serde(default)]
     pub may_adopt_existing_session: bool,
+    /// The request's `native_session_id` was already linked to a workstream
+    /// of this checkout, and that workstream was reopened in place of the
+    /// requested selection. Old servers omit this field; false means the
+    /// selection was honoured as sent.
+    #[serde(default)]
+    pub session_reattached: bool,
+    /// The map had a workstream for `native_session_id`, but another live
+    /// session holds it, so the requested selection was honoured instead.
+    /// Old servers omit this field.
+    #[serde(default)]
+    pub session_link_busy: bool,
 }
 
 /// One-time startup context for harnesses without a SessionStart hook.

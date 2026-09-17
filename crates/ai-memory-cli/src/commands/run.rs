@@ -140,6 +140,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         workstream: args.workstream,
         new_workstream: args.new_workstream,
         lease_owner: lease_owner(),
+        native_session_id: None,
     };
     let interrupted_before_spawn = Arc::new(AtomicBool::new(false));
     let interrupt_task = tokio::spawn(capture_interrupts(Arc::clone(&interrupted_before_spawn)));
@@ -1845,6 +1846,8 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
+                        session_reattached: false,
+                        session_link_busy: false,
                     })
                     .into_response()
                 }
@@ -1866,6 +1869,7 @@ mod tests {
             workstream: None,
             new_workstream: None,
             lease_owner: "workstation:43".into(),
+            native_session_id: None,
         };
 
         let prepared = prepare_managed_run_with_retry(

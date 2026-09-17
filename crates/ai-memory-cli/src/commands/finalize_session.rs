@@ -44,6 +44,9 @@ struct FinalizeSessionReport {
     project: String,
     agent: String,
     finalized: Vec<String>,
+    /// Sessions a hook had adopted whose ledger the drainer now closes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    adopted_closing: Vec<String>,
 }
 
 /// Run the `finalize-session` subcommand.
@@ -67,7 +70,20 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     )
     .await?;
     if sessions.is_empty() {
-        return print_report(args, workspace, project, agent, Vec::new());
+        let requested = args.session_id.map(|sid| sid.to_string());
+        // The server never listed it (never in scope, or closed already), but
+        // an adopted ledger may still be waiting: closing it is the point.
+        let adopted_closing = mark_adopted_ended(&config.data_dir, requested.as_deref());
+        if !adopted_closing.is_empty() {
+            let token = std::env::var(super::hook_spool::LIVE_TOKEN_ENV).ok();
+            if let Err(error) = super::hook_drain_process::spawn(&config.data_dir, token.as_deref())
+            {
+                eprintln!(
+                    "ai-memory finalize-session warning: could not start the drainer; the adopted ledger closes at the next hook boundary: {error}"
+                );
+            }
+        }
+        return print_report(args, workspace, project, agent, Vec::new(), adopted_closing);
     }
 
     let client = build_client();
@@ -94,7 +110,57 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     // agent session would inherit the closed id.
     super::hook::clear_session_id(&config.data_dir, agent);
 
-    print_report(args, workspace, project, agent, finalized)
+    // A session a hook adopted (the desktop app, a bare `claude`) has a run
+    // whose ledger only closes on SessionEnd — which an app the user never
+    // quits never sends. This IS that SessionEnd, so do what the hook would:
+    // mark the run ended and hand it to the detached drainer.
+    let requested = args.session_id.map(|sid| sid.to_string());
+    let adopted_closing = mark_adopted_ended(
+        &config.data_dir,
+        requested.iter().chain(finalized.iter()).map(String::as_str),
+    );
+    if !adopted_closing.is_empty() {
+        let token = std::env::var(super::hook_spool::LIVE_TOKEN_ENV).ok();
+        if let Err(error) = super::hook_drain_process::spawn(&config.data_dir, token.as_deref()) {
+            // The state is marked; the next hook boundary of any session
+            // spawns the drainer and closes it then.
+            eprintln!(
+                "ai-memory finalize-session warning: could not start the drainer; the adopted ledger closes at the next hook boundary: {error}"
+            );
+        }
+    }
+
+    print_report(args, workspace, project, agent, finalized, adopted_closing)
+}
+
+/// Mark the adopted run of each session ended, as the SessionEnd hook would.
+/// Idempotent: a run already marked (or already closed and removed) is left
+/// alone. Returns the sessions whose ledger is now pending a close, deduped,
+/// in the order given.
+pub(crate) fn mark_adopted_ended<'a>(
+    data_dir: &std::path::Path,
+    sessions: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut marked: Vec<String> = Vec::new();
+    for session in sessions {
+        if marked.iter().any(|done| done == session) {
+            continue;
+        }
+        let Some(mut state) = super::adopted_state::load(data_dir, session) else {
+            continue;
+        };
+        if !state.ended {
+            state.ended = true;
+            if let Err(error) = super::adopted_state::save(data_dir, &state) {
+                eprintln!(
+                    "ai-memory finalize-session warning: could not mark the adopted session {session} ended; its ledger waits for a real SessionEnd: {error:#}"
+                );
+                continue;
+            }
+        }
+        marked.push(session.to_string());
+    }
+    marked
 }
 
 /// List open sessions for the scope + agent via the server. An unknown
@@ -143,16 +209,20 @@ fn print_report(
     project: String,
     agent: AgentKind,
     finalized: Vec<String>,
+    adopted_closing: Vec<String>,
 ) -> Result<()> {
     let report = FinalizeSessionReport {
         workspace,
         project,
         agent: agent.as_str().to_string(),
         finalized,
+        adopted_closing,
     };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if report.finalized.is_empty() {
+        return Ok(());
+    }
+    if report.finalized.is_empty() {
         println!(
             "No open {} sessions matched {}/{}",
             report.agent, report.workspace, report.project
@@ -166,6 +236,15 @@ fn print_report(
             report.project
         );
         for session_id in &report.finalized {
+            println!("  - {session_id}");
+        }
+    }
+    if !report.adopted_closing.is_empty() {
+        println!(
+            "Closing the adopted ledger of {} session(s) in the background",
+            report.adopted_closing.len()
+        );
+        for session_id in &report.adopted_closing {
             println!("  - {session_id}");
         }
     }
@@ -257,6 +336,43 @@ mod tests {
     use ai_memory_core::{NewSession, SessionId};
     use ai_memory_store::Store;
     use tempfile::TempDir;
+
+    use crate::commands::adopted_state::{self, sample_run};
+
+    /// `/passabot-memory:exit` on a desktop session: the synthetic
+    /// SessionEnd must also do what the hook's SessionEnd does for an
+    /// adopted run, or the ledger never closes.
+    #[test]
+    fn marks_the_adopted_run_of_the_named_session_ended() {
+        let tmp = TempDir::new().unwrap();
+        adopted_state::save(tmp.path(), &sample_run("nat-1")).unwrap();
+        adopted_state::save(tmp.path(), &sample_run("nat-2")).unwrap();
+
+        let marked = mark_adopted_ended(tmp.path(), ["nat-1", "nat-1"]);
+
+        assert_eq!(marked, vec!["nat-1".to_string()]);
+        assert!(adopted_state::load(tmp.path(), "nat-1").unwrap().ended);
+        assert!(!adopted_state::load(tmp.path(), "nat-2").unwrap().ended);
+    }
+
+    #[test]
+    fn a_session_without_an_adopted_run_is_not_reported() {
+        let tmp = TempDir::new().unwrap();
+        assert!(mark_adopted_ended(tmp.path(), ["nunca-adotada"]).is_empty());
+    }
+
+    #[test]
+    fn an_already_ended_run_is_reported_but_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let mut run = sample_run("nat-1");
+        run.ended = true;
+        adopted_state::save(tmp.path(), &run).unwrap();
+        assert_eq!(
+            mark_adopted_ended(tmp.path(), ["nat-1"]),
+            vec!["nat-1".to_string()]
+        );
+        assert_eq!(adopted_state::load(tmp.path(), "nat-1"), Some(run));
+    }
 
     #[tokio::test]
     async fn selects_latest_scoped_session_for_requested_agent_by_default() {
