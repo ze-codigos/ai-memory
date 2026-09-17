@@ -568,7 +568,6 @@ async fn purge_project_removes_raw_workstream_segments() {
             available_agents: vec![AgentKind::Codex],
             selection: WorkstreamSelection::Current,
             lease_owner: "test".into(),
-            native_session_id: None,
         })
         .await
         .unwrap();

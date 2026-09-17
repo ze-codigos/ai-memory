@@ -140,7 +140,6 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         workstream: args.workstream,
         new_workstream: args.new_workstream,
         lease_owner: lease_owner(),
-        native_session_id: None,
     };
     let interrupted_before_spawn = Arc::new(AtomicBool::new(false));
     let interrupt_task = tokio::spawn(capture_interrupts(Arc::clone(&interrupted_before_spawn)));
@@ -548,8 +547,8 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
             // The transcript is complete on disk; only the upload failed
             // (expired edge credential, server down, DNS). Keep the run
             // instead of cancelling it and let the detached drainer, which
-            // already finalises adopted sessions at every hook boundary,
-            // import and close it with whatever credential is live then. A
+            // runs at every hook boundary, import and close it with whatever
+            // credential is live then. A
             // definitive server rejection (4xx other than auth/backpressure)
             // is not kept: the drainer would only hear it again.
             if plan.mode == LaunchMode::Session
@@ -671,8 +670,8 @@ struct KeptLedger<'a> {
     checkpoint: &'a ai_memory_core::WorkstreamCheckpoint,
 }
 
-/// Persist a run whose transcript import failed after the harness exited, in
-/// the state the hook adoption path uses, so the detached drainer's
+/// Persist a run whose transcript import failed after the harness exited, so
+/// the detached hook drainer's
 /// [`crate::commands::finish_session::finalize_adopted_runs`] closes it at the
 /// next boundary. Built here, not by the caller, so the record is `ended` by
 /// construction: anything else would be imported incrementally and left
@@ -683,7 +682,6 @@ fn keep_ledger_for_next_boundary(data_dir: &Path, kept: &KeptLedger<'_>) -> Resu
         run_path: kept.run_path.to_string(),
         native_session_id: kept.native_session_id.to_string(),
         workstream_name: kept.prepared.workstream_name.clone(),
-        provisional: false,
         server_url: kept.endpoint.build_url(""),
         cwd: kept.cwd.to_path_buf(),
         adopted_at: jiff::Timestamp::now().as_second(),
@@ -1305,12 +1303,11 @@ pub(crate) async fn export_after_flush(
 
 /// Send a transcript to the server in batches.
 ///
-/// `close` says whether this import ends the run. The launcher always closes:
-/// it only ever imports after its child exited. Reconciliation of an adopted
-/// session does not — it cannot tell a dead session from an idle one, so it
-/// imports incrementally and leaves the run open for the real SessionEnd. An
-/// incremental pass also does not advance the durable source cursor, so the
-/// next one re-reads from the start and relies on event-id dedup.
+/// `close` says whether this import ends the run. Every caller closes today:
+/// the launcher and the drainer both import only after the child exited. An
+/// open import (`close = false`) leaves the run open and does not advance the
+/// durable source cursor, so a later pass re-reads from the start and relies
+/// on event-id dedup.
 pub(crate) async fn import_batches(
     endpoint: &ServerEndpoint,
     run_path: &str,
@@ -1577,7 +1574,10 @@ mod tests {
         )
         .unwrap();
 
-        let stored = crate::commands::adopted_state::load(tmp.path(), "nat-finish-1").unwrap();
+        let listed = crate::commands::adopted_state::list(tmp.path());
+        assert_eq!(listed.len(), 1);
+        let stored = &listed[0];
+        assert_eq!(stored.native_session_id, "nat-finish-1");
         assert!(stored.ended, "only an ended record is imported AND closed");
         assert!(stored.kept_by_launcher);
         assert_eq!(stored.run_id, prepared.run_id);
@@ -1585,7 +1585,6 @@ mod tests {
         assert_eq!(stored.workstream_name, "ajuste-checkout");
         assert_eq!(stored.server_url, "https://memory.example/wiki");
         assert_eq!(stored.cwd, PathBuf::from("/repo"));
-        assert!(!stored.provisional);
         assert_eq!(stored.home.as_deref(), Some(Path::new("/custom/home")));
         assert_eq!(
             stored.session_dir.as_deref(),
@@ -1598,10 +1597,9 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(
-            crate::commands::finish_session::plan_for(&stored, stored.adopted_at + 60, 48 * 3_600),
+            crate::commands::finish_session::plan_for(stored, stored.adopted_at + 60, 48 * 3_600),
             crate::commands::finish_session::Action::Close
         );
-        assert_eq!(crate::commands::adopted_state::list(tmp.path()).len(), 1);
     }
 
     #[test]
@@ -1846,8 +1844,6 @@ mod tests {
                         sync_after: 0,
                         sync_through: 0,
                         may_adopt_existing_session: false,
-                        session_reattached: false,
-                        session_link_busy: false,
                     })
                     .into_response()
                 }
@@ -1869,7 +1865,6 @@ mod tests {
             workstream: None,
             new_workstream: None,
             lease_owner: "workstation:43".into(),
-            native_session_id: None,
         };
 
         let prepared = prepare_managed_run_with_retry(

@@ -8051,7 +8051,6 @@ pub(crate) mod tests {
                 available_agents: vec![AgentKind::Codex],
                 selection: crate::WorkstreamSelection::Current,
                 lease_owner: "test".into(),
-                native_session_id: None,
             },
         )
         .unwrap();
@@ -9951,7 +9950,6 @@ pub(crate) mod tests {
                 available_agents: Vec::new(),
                 selection: crate::workstream::WorkstreamSelection::Current,
                 lease_owner: "test".to_string(),
-                native_session_id: None,
             },
         )
         .expect("opening a managed run should succeed")

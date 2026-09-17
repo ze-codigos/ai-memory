@@ -1,9 +1,9 @@
-//! Naming for a workstream adopted from a session the launcher did not start.
+//! Naming for a launcher placeholder workstream, from the session's first
+//! prompt.
 //!
 //! The desktop app titles a session from its first turn, so the good name only
-//! exists once the user has spoken. When there is no app title — a bare
-//! `claude`, an IDE extension — a slug of that first prompt stands in, flagged
-//! `provisional` so the hook can ask for a better one.
+//! exists once the user has spoken. When there is no app title — a terminal
+//! `claudew` — a slug of that first prompt stands in, flagged `provisional`.
 //!
 //! Never fails: a workstream cannot be opened without a name, and the standing
 //! policy is that memory never blocks the developer.

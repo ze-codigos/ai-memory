@@ -53,11 +53,6 @@ pub struct PrepareWorkstreamRun {
     pub selection: WorkstreamSelection,
     /// Diagnostic lease owner.
     pub lease_owner: String,
-    /// Harness-native session the caller already has (an adopted session).
-    /// A workstream of the same checkout linked to it is reopened instead of
-    /// the selection, unless the selection is an explicit name; the session
-    /// is linked to the new run either way.
-    pub native_session_id: Option<String>,
 }
 
 /// Store-level result for a prepared managed run.
@@ -82,12 +77,6 @@ pub struct PreparedWorkstreamRun {
     /// Whether no harness has established this workstream yet, allowing the
     /// launcher to offer checkout-local native session adoption.
     pub may_adopt_existing_session: bool,
-    /// The workstream came from the native-session map, not the selection.
-    pub session_reattached: bool,
-    /// The map had a workstream for the session, but another live session
-    /// holds it, so the selection was honoured instead. The caller can tell
-    /// the user why their conversation now has a second workstream.
-    pub session_link_busy: bool,
 }
 
 /// Store-level finish input after the raw segment has been made durable.
@@ -248,21 +237,7 @@ pub(crate) fn prepare_run(
         params![now],
     )?;
 
-    let native_session = input
-        .native_session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty());
-    let linked = match native_session {
-        Some(session) => linked_workstream_for_session(&tx, input, session, now)?,
-        None => SessionLink::Unlinked,
-    };
-    let session_reattached = matches!(linked, SessionLink::Reattached(..));
-    let session_link_busy = matches!(linked, SessionLink::Busy);
-    let (workstream_id, workstream_name) = match linked {
-        SessionLink::Reattached(id, name) => (id, name),
-        SessionLink::Busy | SessionLink::Unlinked => select_workstream(&tx, input, now)?,
-    };
+    let (workstream_id, workstream_name) = select_workstream(&tx, input, now)?;
     let busy: Option<(String, i64)> = tx
         .query_row(
             "SELECT lease_owner, lease_expires_at FROM managed_runs \
@@ -290,25 +265,6 @@ pub(crate) fn prepare_run(
     } else {
         input.agent
     };
-    // "Established" is about what the workstream held BEFORE this call: read
-    // it before linking, or the link below would make every adopted
-    // workstream look established the moment it is created.
-    let established: i64 = tx.query_row(
-        "SELECT CASE WHEN \
-             EXISTS(SELECT 1 FROM workstream_native_sessions WHERE workstream_id = ?1) \
-             OR EXISTS(SELECT 1 FROM workstream_events \
-                       WHERE workstream_id = ?1 \
-                         AND kind IN ('message', 'tool_call', 'tool_result', 'compaction')) \
-             THEN 1 ELSE 0 END",
-        params![workstream_id.as_bytes()],
-        |row| row.get(0),
-    )?;
-    // Link before reading the current session back, so the run opens on the
-    // caller's session with its cursors — the separate `link` call the
-    // client still makes for older servers then finds nothing to change.
-    if let Some(session) = native_session {
-        link_session_in_transaction(&tx, workstream_id.as_bytes(), agent, session, 0, now)?;
-    }
     let native: Option<(String, Option<String>, i64)> = tx
         .query_row(
             "SELECT native_session_id, source_cursor, delivery_cursor \
@@ -322,6 +278,16 @@ pub(crate) fn prepare_run(
         .map_or((None, None, 0), |(session, cursor, delivery)| {
             (Some(session), cursor, delivery)
         });
+    let established: i64 = tx.query_row(
+        "SELECT CASE WHEN \
+             EXISTS(SELECT 1 FROM workstream_native_sessions WHERE workstream_id = ?1) \
+             OR EXISTS(SELECT 1 FROM workstream_events \
+                       WHERE workstream_id = ?1 \
+                         AND kind IN ('message', 'tool_call', 'tool_result', 'compaction')) \
+             THEN 1 ELSE 0 END",
+        params![workstream_id.as_bytes()],
+        |row| row.get(0),
+    )?;
 
     let run_id = ManagedRunId::new();
     tx.execute(
@@ -357,132 +323,7 @@ pub(crate) fn prepare_run(
         sync_after,
         sync_through: latest_sequence,
         may_adopt_existing_session: established == 0,
-        session_reattached,
-        session_link_busy,
     })
-}
-
-/// What the native-session map said about the caller's session.
-enum SessionLink {
-    /// Linked to this workstream of the checkout, and free to reopen.
-    Reattached(WorkstreamId, String),
-    /// Linked, but another live session holds that workstream.
-    Busy,
-    /// Not linked in this checkout (or the caller chose a name).
-    Unlinked,
-}
-
-/// The workstream of this checkout already linked to the caller's native
-/// session, when the caller left the choice open (`Current`/`New`).
-///
-/// Identity, not title: two conversations with the same desktop title are two
-/// workstreams, and the same conversation reopened after a Quit is one. The
-/// newest selection wins when a session was fragmented before this existed.
-///
-/// A live run of the SAME session on that workstream is superseded (left
-/// `expired`, so its late import still passes the lapsed-lease check): one
-/// native session is never live twice. A live run of ANOTHER session keeps
-/// the workstream, and the caller gets its selection instead — a 409 here
-/// could only be answered by fragmenting under a suffix.
-fn linked_workstream_for_session(
-    tx: &Transaction<'_>,
-    input: &PrepareWorkstreamRun,
-    native_session_id: &str,
-    now: i64,
-) -> StoreResult<SessionLink> {
-    if matches!(input.selection, WorkstreamSelection::Named(_)) {
-        return Ok(SessionLink::Unlinked);
-    }
-    let linked = tx
-        .query_row(
-            "SELECT w.id, w.name FROM workstream_native_sessions native \
-             JOIN workstreams w ON w.id = native.workstream_id \
-             WHERE w.workspace_id = ?1 AND w.project_id = ?2 \
-               AND w.repo_fingerprint = ?3 AND w.worktree_fingerprint = ?4 \
-               AND native.agent_kind = ?5 AND native.native_session_id = ?6 \
-             ORDER BY w.selected_at DESC, w.id DESC LIMIT 1",
-            params![
-                input.workspace_id.as_bytes(),
-                input.project_id.as_bytes(),
-                input.repo_fingerprint,
-                input.worktree_fingerprint,
-                input.agent.as_str(),
-                native_session_id,
-            ],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let Some((id, name)) = linked else {
-        return Ok(SessionLink::Unlinked);
-    };
-    let active: Option<(Vec<u8>, Option<String>)> = tx
-        .query_row(
-            "SELECT id, native_session_id FROM managed_runs \
-             WHERE workstream_id = ?1 AND state = 'active'",
-            params![id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    match active {
-        Some((run_id, session)) if session.as_deref() == Some(native_session_id) => {
-            tx.execute(
-                "UPDATE managed_runs SET state = 'expired', ended_at = ?1, lease_expires_at = ?1 \
-                 WHERE id = ?2",
-                params![now, run_id],
-            )?;
-        }
-        Some(_) => return Ok(SessionLink::Busy),
-        None => {}
-    }
-    Ok(SessionLink::Reattached(
-        WorkstreamId::from_slice(&id)?,
-        name,
-    ))
-}
-
-/// Make `native_session_id` the current session of `agent` on the workstream.
-/// Returns the delivery cursor the run should start from: what this session
-/// already received, else `fresh_delivery`.
-fn link_session_in_transaction(
-    tx: &Transaction<'_>,
-    workstream: &[u8],
-    agent: AgentKind,
-    native_session_id: &str,
-    fresh_delivery: i64,
-    now: i64,
-) -> StoreResult<i64> {
-    tx.execute(
-        "UPDATE workstream_native_sessions SET is_current = 0, updated_at = ?1 \
-         WHERE workstream_id = ?2 AND agent_kind = ?3 AND native_session_id <> ?4",
-        params![now, workstream, agent.as_str(), native_session_id],
-    )?;
-    let prior_delivery = tx
-        .query_row(
-            "SELECT delivery_cursor FROM workstream_native_sessions \
-             WHERE workstream_id = ?1 AND agent_kind = ?2 AND native_session_id = ?3",
-            params![workstream, agent.as_str(), native_session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    let initial_delivery = prior_delivery.unwrap_or(fresh_delivery);
-    tx.execute(
-        "INSERT INTO workstream_native_sessions( \
-             workstream_id, agent_kind, native_session_id, is_current, delivery_cursor, \
-             created_at, updated_at \
-         ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5) \
-         ON CONFLICT(workstream_id, agent_kind, native_session_id) DO UPDATE SET \
-             is_current = 1, \
-             delivery_cursor = MAX(workstream_native_sessions.delivery_cursor, excluded.delivery_cursor), \
-             updated_at = excluded.updated_at",
-        params![
-            workstream,
-            agent.as_str(),
-            native_session_id,
-            initial_delivery,
-            now,
-        ],
-    )?;
-    Ok(initial_delivery)
 }
 
 fn newest_available_agent(
@@ -649,8 +490,9 @@ pub(crate) fn heartbeat(conn: &mut Connection, run_id: ManagedRunId) -> StoreRes
 /// Release an active managed-run lease without importing any events.
 ///
 /// Distinct from `expired`: a lapsed lease only means nobody renewed it, and
-/// a late transcript for that run is still legitimate (an adopted session has
-/// no parent process to heartbeat, so it always finishes with a lapsed lease).
+/// a late transcript for that run is still legitimate (a ledger the launcher
+/// kept for a later import has nobody heartbeating, so it always finishes
+/// with a lapsed lease).
 /// `cancelled` is a deliberate discard, and `finish_run` must keep refusing it
 /// even when the caller can prove which native session it owns. Sharing one
 /// state made those two indistinguishable.
@@ -707,18 +549,38 @@ pub(crate) fn link_native_session(
         return Ok(false);
     }
     let workstream = run.workstream;
-    let fresh_delivery = if run.context_delivered {
-        run.sync_through
-    } else {
-        0
-    };
-    let initial_delivery = link_session_in_transaction(
-        &tx,
-        &workstream,
-        agent,
-        native_session_id,
-        fresh_delivery,
-        now,
+    let sync_through = run.sync_through;
+    let delivered = run.context_delivered;
+    tx.execute(
+        "UPDATE workstream_native_sessions SET is_current = 0, updated_at = ?1 \
+         WHERE workstream_id = ?2 AND agent_kind = ?3 AND native_session_id <> ?4",
+        params![now, workstream, agent.as_str(), native_session_id],
+    )?;
+    let prior_delivery = tx
+        .query_row(
+            "SELECT delivery_cursor FROM workstream_native_sessions \
+             WHERE workstream_id = ?1 AND agent_kind = ?2 AND native_session_id = ?3",
+            params![workstream, agent.as_str(), native_session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let initial_delivery = prior_delivery.unwrap_or(if delivered { sync_through } else { 0 });
+    tx.execute(
+        "INSERT INTO workstream_native_sessions( \
+             workstream_id, agent_kind, native_session_id, is_current, delivery_cursor, \
+             created_at, updated_at \
+         ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5) \
+         ON CONFLICT(workstream_id, agent_kind, native_session_id) DO UPDATE SET \
+             is_current = 1, \
+             delivery_cursor = MAX(workstream_native_sessions.delivery_cursor, excluded.delivery_cursor), \
+             updated_at = excluded.updated_at",
+        params![
+            workstream,
+            agent.as_str(),
+            native_session_id,
+            initial_delivery,
+            now,
+        ],
     )?;
     tx.execute(
         "UPDATE managed_runs SET native_session_id = ?1, sync_after = ?2 WHERE id = ?3",
@@ -831,9 +693,9 @@ pub(crate) fn finish_run(
     }
     // A lapsed lease is not a reason to refuse a transcript. The lease exists
     // to keep two live sessions off one workstream; it says nothing about
-    // whether an import that arrives afterwards is legitimate. Sessions
-    // adopted by a hook have no parent process to heartbeat, so they ALWAYS
-    // arrive here expired — as does anything reconciled after a crash.
+    // whether an import that arrives afterwards is legitimate. A ledger the
+    // launcher kept for a later import has nobody heartbeating, so it ALWAYS
+    // arrives here expired — as does anything reconciled after a crash.
     //
     // This does not loosen identity. The per-event guards below (agent and
     // native_session_id) are what keep one session's events out of another's

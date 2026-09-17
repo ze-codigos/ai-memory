@@ -27,7 +27,6 @@ use crate::cli::HookArgs;
 
 use sha2::{Digest as _, Sha256};
 
-use super::adopt_session;
 use super::adopted_state;
 use super::hook_capture::{
     build_client, canonical_context, capture_policy, extract_cwd, get_handoff, marker_query_suffix,
@@ -338,9 +337,9 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         }
         Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
     }
-    // Adopted sessions: close the ones that ended, import the rest
-    // incrementally. After the spool on purpose — observations first, ledger
-    // second — and it reuses the bearer the drain above already warmed.
+    // Kept ledgers: close what the launcher could not. After the spool on
+    // purpose — observations first, ledger second — and it reuses the bearer
+    // the drain above already warmed.
     let _ = crate::commands::finish_session::finalize_adopted_runs(&dd).await;
     Ok(())
 }
@@ -470,51 +469,6 @@ fn write_success_response<W: std::io::Write>(
 /// Name of the workstream the launcher opened, exported into the harness so
 /// this hook can tell a placeholder from a name someone chose.
 const WORKSTREAM_NAME_ENV: &str = "AI_MEMORY_WORKSTREAM_NAME";
-/// How long adoption may hold up the first prompt.
-///
-/// The launcher can block forever waiting on the server — it has nothing else
-/// to do. A hook cannot: it sits between the user pressing enter and the model
-/// answering. Two POSTs against a healthy server are milliseconds; past this
-/// bound the session simply goes unadopted and the hook says so.
-const ADOPT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Marker saying this session already reported an adoption failure.
-///
-/// Adoption is retried on every prompt — a server that was down may be back —
-/// but the warning is not. Without this, an unreachable server would inject
-/// the same paragraph into every single turn, and a warning that cries wolf on
-/// every prompt trains both the developer and the model to ignore the one that
-/// eventually matters.
-fn adoption_warned_marker(data_dir: &Path, native_session_id: &str) -> PathBuf {
-    data_dir.join("hook-state").join(format!(
-        "adopt-warned-{:x}",
-        Sha256::digest(native_session_id.as_bytes())
-    ))
-}
-
-/// Whether this session still owes the user an adoption warning. Marks it as
-/// spent in the same call.
-fn claim_adoption_warning(data_dir: &Path, native_session_id: &str) -> bool {
-    let marker = adoption_warned_marker(data_dir, native_session_id);
-    if marker.exists() {
-        return false;
-    }
-    if let Some(parent) = marker.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    // A marker we cannot write means we warn again next prompt: noisy, but
-    // never silent about a session whose ledger is not being recorded.
-    fs::write(&marker, b"").is_ok()
-}
-
-fn adoption_failed_warning(reason: &str) -> String {
-    format!(
-        "⚠️ Esta sessão não pôde ser adotada em workstream gerenciado ({reason}). \
-         Os hooks seguem capturando prompt e tool calls, mas o transcript desta \
-         sessão não virará ledger. Avise o usuário na primeira resposta."
-    )
-}
-
 fn user_prompt_context_envelope(agent: AgentKind, text: String) -> serde_json::Value {
     if agent == AgentKind::AntigravityCli {
         serde_json::json!({ "injectSteps": [{ "ephemeralMessage": text }] })
@@ -896,73 +850,29 @@ where
         return Ok(());
     }
 
-    // A session that started outside `ai-memory run` has no AI_MEMORY_RUN_ID
-    // and its transcript would never reach a ledger. Adopt it on the first
-    // prompt rather than at session-start: the desktop app titles a session
-    // from its first turn, so that is the earliest moment a real name exists.
-    // In-process, so the prompt never becomes a process argument.
+    // A launcher-managed Claude Code session still on its `novo-` placeholder
+    // is renamed on its first prompt: the desktop title or a slug of the
+    // prompt only exist once the user has spoken. In-process, so the prompt
+    // never becomes a process argument. A session opened outside
+    // `ai-memory run` has no placeholder and nothing happens here — the
+    // ledger is opt-in through the launcher, as upstream intends.
     let mut prompt_context: Option<String> = None;
     if hook_event == HookEvent::UserPrompt
         && agent_kind == AgentKind::ClaudeCode
         && let Some(native) = canonical_session_id.as_deref()
     {
-        let managed_env = std::env::var(MANAGED_RUN_ENV).ok();
         let workstream_env = std::env::var(WORKSTREAM_NAME_ENV).ok();
-        let cwd = policy_cwd
-            .as_deref()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from);
-        let host = std::env::var("CLAUDE_CODE_HOST_SESSION_ID").ok();
-        let prompt = json
-            .get("prompt")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if adopt_session::should_adopt(&dd, native, managed_env.as_deref()) {
-            let client = build_client();
-            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
-            let adoption = tokio::time::timeout(
-                ADOPT_TIMEOUT,
-                adopt_session::adopt(adopt_session::AdoptInput {
-                    data_dir: &dd,
-                    server_url: base,
-                    bearer: bearer.as_deref(),
-                    cwd: &cwd,
-                    native_session_id: native,
-                    host_session_id: host.as_deref(),
-                    first_prompt: prompt,
-                }),
-            )
-            .await;
-            // An adopted session is named by this hook at adoption (app
-            // title or prompt slug, date-prefixed); there is nothing to ask
-            // the model for.
-            let failure = match adoption {
-                Ok(Ok(notice)) => {
-                    // Adoption happens once per session, so this is said
-                    // once by construction.
-                    prompt_context = notice;
-                    None
-                }
-                Ok(Err(error)) => Some(format!("{error:#}")),
-                Err(_) => Some("o servidor da memória não respondeu a tempo".to_string()),
-            };
-            // Retry every prompt, but say so only once: see
-            // `adoption_warned_marker`.
-            if let Some(reason) = failure {
-                eprintln!("ai-memory hook warning: adoption failed: {reason}");
-                if claim_adoption_warning(&dd, native) {
-                    prompt_context = Some(adoption_failed_warning(&reason));
-                }
-            }
-        } else if placeholder_rename::wants_placeholder_rename(
-            adopted_state::load(&dd, native).is_some(),
-            workstream_env.as_deref(),
-            &dd,
-            native,
-        ) && let Some(placeholder) = workstream_env.as_deref()
+        if placeholder_rename::wants_placeholder_rename(workstream_env.as_deref(), &dd, native)
+            && let Some(placeholder) = workstream_env.as_deref()
         {
-            // A launcher-managed session still on its `novo-` placeholder:
-            // this prompt is the first, and the earliest moment a real name
-            // exists.
+            let cwd = policy_cwd
+                .as_deref()
+                .map_or_else(|| PathBuf::from("."), PathBuf::from);
+            let host = std::env::var("CLAUDE_CODE_HOST_SESSION_ID").ok();
+            let prompt = json
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let config_dir = dirs::config_dir();
@@ -983,29 +893,15 @@ where
         }
     }
 
-    // SessionEnd only MARKS the state; the detached drainer this very event
-    // spawns below is what imports and closes it. Exporting a transcript and
-    // posting it in batches must not sit in the shutdown path.
-    if args.event == "session-end"
-        && let Some(native) = canonical_session_id.as_deref()
-        && let Some(mut state) = adopted_state::load(&dd, native)
-    {
-        state.ended = true;
-        if let Err(error) = adopted_state::save(&dd, &state) {
-            eprintln!(
-                "ai-memory hook warning: could not mark the adopted session ended; its ledger waits for the next boundary: {error:#}"
-            );
-        }
-    }
-
-    // Reconcile sessions that died without a SessionEnd. Detached, never
-    // inline: session start has to stay snappy. `should_spawn_background_drainer`
-    // is false for session-start, so the two branches never compete for the
-    // single-use spawner.
+    // A ledger the launcher could not import when its child exited (see
+    // `run::keep_ledger_for_next_boundary`) waits under `adopted-runs/` for
+    // the next drainer. Detached, never inline: session start has to stay
+    // snappy. `should_spawn_background_drainer` is false for session-start,
+    // so the two branches never compete for the single-use spawner.
     if args.event == "session-start" && !adopted_state::list(&dd).is_empty() {
         if let Err(err) = spawn_background_drainer(&dd, effective_token) {
             eprintln!(
-                "ai-memory hook warning: could not start the drainer for pending adopted sessions: {err}"
+                "ai-memory hook warning: could not start the drainer for the kept ledgers: {err}"
             );
         }
         write_prompt_or_success(stdout, agent_kind, hook_event, prompt_context)?;
@@ -1038,7 +934,7 @@ where
     Ok(())
 }
 
-/// Emit the adoption/rename context when there is one, otherwise the usual
+/// Emit the rename context when there is one, otherwise the usual
 /// empty success envelope. Claude Code merges `additionalContext` into the
 /// turn; the shell plugin appends its own memory-state line to whatever this
 /// prints rather than replacing it.
@@ -1272,20 +1168,6 @@ mod tests {
     }
 
     #[test]
-    fn an_adoption_warning_is_claimed_only_once_per_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(claim_adoption_warning(tmp.path(), "nat-1"));
-        assert!(
-            !claim_adoption_warning(tmp.path(), "nat-1"),
-            "a server that stays down must not warn on every prompt"
-        );
-        assert!(
-            claim_adoption_warning(tmp.path(), "nat-2"),
-            "the claim is per session, not per machine"
-        );
-    }
-
-    #[test]
     fn prompt_context_targets_user_prompt_submit() {
         let envelope = user_prompt_context_envelope(AgentKind::ClaudeCode, "oi".into());
         assert_eq!(
@@ -1307,7 +1189,7 @@ mod tests {
         assert!(should_spawn_background_drainer("stop"));
         assert!(should_spawn_background_drainer("pre-compact"));
 
-        // session-start staying false is load-bearing now: the adopted-session
+        // session-start staying false is load-bearing: the kept-ledger
         // reconciliation branch spawns the drainer itself and returns early.
         // If this flipped, the FnOnce spawner would be moved twice and the
         // code would stop compiling.
@@ -2963,16 +2845,12 @@ mod tests {
         let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
         let mut args = kimi_hook_args("user-prompt", &base);
         args.agent = "claude-code".into();
-        // Pre-adopt: this test is about the handoff fetch, and a claude-code
-        // user-prompt now also tries to adopt an unmanaged session, which
-        // against this stub server would fail and print a warning instead of
-        // the empty object. Giving the session a run keeps that path out of
-        // the way without weakening what is being asserted.
-        crate::commands::adopted_state::save(
-            tmp.path(),
-            &crate::commands::adopted_state::sample_run("claude-session"),
-        )
-        .unwrap();
+        // The first-prompt rename reads AI_MEMORY_WORKSTREAM_NAME from the
+        // process environment, which a `cargo test` run from inside a
+        // managed session inherits. Marking the session renamed keeps that
+        // path out of a test about the handoff fetch.
+        crate::commands::placeholder_rename::mark_renamed(tmp.path(), "claude-session", "x")
+            .unwrap();
         let mut stdout = Vec::new();
         run_with_payload(
             Some(tmp.path().to_path_buf()),
