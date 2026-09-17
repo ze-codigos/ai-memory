@@ -141,20 +141,34 @@ fn find_file(root: &Path, wanted: &str, depth: usize) -> Option<PathBuf> {
     None
 }
 
-/// The workstream's name. Always returns something valid.
+/// `YYYY-MM-DD-<name>`, so a listing sorts by day and a name that was only a
+/// prompt slug still says when the work happened. Applied once, at the moment
+/// the workstream gets its real name; a name the developer typed is never
+/// prefixed.
+pub(crate) fn with_date_prefix(name: &str, today: jiff::civil::Date) -> String {
+    truncate_name(&format!("{today}-{name}"))
+}
+
+/// The local calendar day, which is what a developer scanning the list means.
+pub(crate) fn today() -> jiff::civil::Date {
+    jiff::Zoned::now().date()
+}
+
+/// The workstream's name, date-prefixed. Always returns something valid.
 pub(crate) fn resolve_name(
     host_session_id: Option<&str>,
     config_dir: &Path,
     first_prompt: &str,
+    today: jiff::civil::Date,
 ) -> ResolvedName {
     if let Some(name) = host_session_id.and_then(|id| desktop_title(id, config_dir)) {
         return ResolvedName {
-            name,
+            name: with_date_prefix(&name, today),
             provisional: false,
         };
     }
     ResolvedName {
-        name: slugify_prompt(first_prompt),
+        name: with_date_prefix(&slugify_prompt(first_prompt), today),
         provisional: true,
     }
 }
@@ -233,20 +247,40 @@ mod tests {
         );
     }
 
+    fn today() -> jiff::civil::Date {
+        jiff::civil::date(2026, 9, 17)
+    }
+
     #[test]
     fn resolve_prefers_desktop_title_and_is_not_provisional() {
         let tmp = tempfile::tempdir().unwrap();
         app_session(tmp.path(), "local_abc", r#"{"title":"Ajuste no checkout"}"#);
-        let r = resolve_name(Some("local_abc"), tmp.path(), "qualquer prompt");
-        assert_eq!(r.name, "Ajuste no checkout");
+        let r = resolve_name(Some("local_abc"), tmp.path(), "qualquer prompt", today());
+        assert_eq!(r.name, "2026-09-17-Ajuste no checkout");
         assert!(!r.provisional);
     }
 
     #[test]
     fn resolve_slug_is_provisional() {
         let tmp = tempfile::tempdir().unwrap();
-        let r = resolve_name(None, tmp.path(), "Corrigir o timeout do nexus");
-        assert_eq!(r.name, "corrigir-o-timeout");
+        let r = resolve_name(None, tmp.path(), "Corrigir o timeout do nexus", today());
+        assert_eq!(r.name, "2026-09-17-corrigir-o-timeout");
         assert!(r.provisional);
+    }
+
+    #[test]
+    fn dated_name_pads_month_and_day() {
+        assert_eq!(
+            with_date_prefix("ajuste", jiff::civil::date(2026, 1, 5)),
+            "2026-01-05-ajuste"
+        );
+    }
+
+    #[test]
+    fn dated_name_stays_within_the_server_limit() {
+        let long = "x".repeat(200);
+        let dated = with_date_prefix(&long, today());
+        assert!(dated.len() <= 128);
+        assert!(dated.starts_with("2026-09-17-"));
     }
 }

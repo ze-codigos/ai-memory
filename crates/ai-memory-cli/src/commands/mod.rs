@@ -46,6 +46,7 @@ pub mod move_session;
 pub mod openclaw_plugin;
 pub mod path_util;
 pub mod pending_writes;
+pub mod placeholder_rename;
 pub mod project_registry;
 pub mod purge_project;
 pub mod purge_session;
