@@ -100,7 +100,9 @@ pub(crate) fn fragmentation_notice(previous: &str, current: &str, busy: bool) ->
         "o servidor da memória não reconhece a sessão nativa (versão anterior ao mapa de sessões)"
     };
     format!(
-        "⚠️ Esta conversa já tinha o workstream '{previous}' e foi adotada agora em          '{current}': {why}. O ledger desta sessão fica dividido entre os dois.          Avise o usuário na primeira resposta; nada a fazer no código."
+        "⚠️ Esta conversa já tinha o workstream '{previous}' e foi adotada agora em \
+         '{current}': {why}. O ledger desta sessão fica dividido entre os dois. \
+         Avise o usuário na primeira resposta; nada a fazer no código."
     )
 }
 

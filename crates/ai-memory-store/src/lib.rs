@@ -7218,6 +7218,9 @@ mod tests {
             .unwrap();
         assert!(!first.session_reattached);
         assert_eq!(first.native_session_id.as_deref(), Some("nat-1"));
+        // Linking the caller's own session must not make a workstream this
+        // very call created look established.
+        assert!(first.may_adopt_existing_session);
         set_managed_run_lease(store.db_path(), first.run_id, 1);
 
         let again = store

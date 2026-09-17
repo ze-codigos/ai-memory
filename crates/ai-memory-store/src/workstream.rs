@@ -290,6 +290,19 @@ pub(crate) fn prepare_run(
     } else {
         input.agent
     };
+    // "Established" is about what the workstream held BEFORE this call: read
+    // it before linking, or the link below would make every adopted
+    // workstream look established the moment it is created.
+    let established: i64 = tx.query_row(
+        "SELECT CASE WHEN \
+             EXISTS(SELECT 1 FROM workstream_native_sessions WHERE workstream_id = ?1) \
+             OR EXISTS(SELECT 1 FROM workstream_events \
+                       WHERE workstream_id = ?1 \
+                         AND kind IN ('message', 'tool_call', 'tool_result', 'compaction')) \
+             THEN 1 ELSE 0 END",
+        params![workstream_id.as_bytes()],
+        |row| row.get(0),
+    )?;
     // Link before reading the current session back, so the run opens on the
     // caller's session with its cursors — the separate `link` call the
     // client still makes for older servers then finds nothing to change.
@@ -309,16 +322,6 @@ pub(crate) fn prepare_run(
         .map_or((None, None, 0), |(session, cursor, delivery)| {
             (Some(session), cursor, delivery)
         });
-    let established: i64 = tx.query_row(
-        "SELECT CASE WHEN \
-             EXISTS(SELECT 1 FROM workstream_native_sessions WHERE workstream_id = ?1) \
-             OR EXISTS(SELECT 1 FROM workstream_events \
-                       WHERE workstream_id = ?1 \
-                         AND kind IN ('message', 'tool_call', 'tool_result', 'compaction')) \
-             THEN 1 ELSE 0 END",
-        params![workstream_id.as_bytes()],
-        |row| row.get(0),
-    )?;
 
     let run_id = ManagedRunId::new();
     tx.execute(
