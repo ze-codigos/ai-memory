@@ -936,12 +936,7 @@ where
             // title or prompt slug, date-prefixed); there is nothing to ask
             // the model for.
             let failure = match adoption {
-                Ok(Ok(notice)) => {
-                    // Adoption happens once per session, so this is said
-                    // once by construction.
-                    prompt_context = notice;
-                    None
-                }
+                Ok(Ok(_)) => None,
                 Ok(Err(error)) => Some(format!("{error:#}")),
                 Err(_) => Some("o servidor da memória não respondeu a tempo".to_string()),
             };

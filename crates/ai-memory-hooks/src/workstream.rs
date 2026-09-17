@@ -128,18 +128,6 @@ async fn prepare_run(
     if request.cwd.len() > MAX_CWD_BYTES {
         return error(StatusCode::BAD_REQUEST, "managed run cwd is too long");
     }
-    let native_session_id = request
-        .native_session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned);
-    if native_session_id
-        .as_deref()
-        .is_some_and(|id| id.len() > MAX_NATIVE_SESSION_ID_BYTES)
-    {
-        return error(StatusCode::BAD_REQUEST, "native session id is too long");
-    }
     if request.workstream.is_some() && request.new_workstream.is_some() {
         return error(
             StatusCode::BAD_REQUEST,
@@ -236,7 +224,6 @@ async fn prepare_run(
             available_agents: request.available_agents,
             selection,
             lease_owner: request.lease_owner,
-            native_session_id,
         })
         .await;
     match prepared {
@@ -250,8 +237,6 @@ async fn prepare_run(
             sync_after: prepared.sync_after,
             sync_through: prepared.sync_through,
             may_adopt_existing_session: prepared.may_adopt_existing_session,
-            session_reattached: prepared.session_reattached,
-            session_link_busy: prepared.session_link_busy,
         })
         .into_response(),
         Err(failure) => store_error_response(failure),
@@ -994,7 +979,6 @@ mod tests {
             available_agents: Vec::new(),
             selection: WorkstreamSelection::Current,
             lease_owner: owner.into(),
-            native_session_id: None,
         }
     }
 
@@ -1237,7 +1221,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "automatic".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1250,71 +1233,6 @@ mod tests {
             Some("claude-current")
         );
         assert!(!prepared.may_adopt_existing_session);
-    }
-
-    fn adopted_request(native: &str, name: &str) -> PrepareManagedRunRequest {
-        PrepareManagedRunRequest {
-            workspace: "default".into(),
-            project: "managed".into(),
-            cwd: "/repo".into(),
-            repo_fingerprint: "repo".into(),
-            worktree_fingerprint: "worktree".into(),
-            agent: AgentKind::ClaudeCode,
-            automatic_harness: false,
-            available_agents: Vec::new(),
-            workstream: None,
-            new_workstream: Some(name.into()),
-            lease_owner: "adopt".into(),
-            native_session_id: Some(native.into()),
-        }
-    }
-
-    /// The wire contract for adoption: `native_session_id` on the prepare
-    /// links the session and, on a second prepare from the same session,
-    /// reopens the workstream and says so; an over-long id is a 400 before
-    /// anything is stored.
-    #[tokio::test]
-    async fn prepare_reattaches_an_adopted_native_session_over_the_wire() {
-        let temp = TempDir::new().unwrap();
-        let store = Store::open(temp.path()).unwrap();
-        let state = test_state(&store, temp.path());
-        seed_scope(&store).await;
-
-        let response = prepare_run(
-            State(state.clone()),
-            None,
-            Json(adopted_request("84f6bf8c", "Teste adoção 1")),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let first: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
-        assert!(!first.session_reattached);
-        assert_eq!(first.native_session_id.as_deref(), Some("84f6bf8c"));
-
-        let response = prepare_run(
-            State(state.clone()),
-            None,
-            Json(adopted_request("84f6bf8c", "Teste adoção 1")),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let again: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
-        assert!(again.session_reattached);
-        assert_eq!(again.workstream_id, first.workstream_id);
-        assert_ne!(again.run_id, first.run_id);
-
-        let too_long = prepare_run(
-            State(state),
-            None,
-            Json(adopted_request(
-                &"x".repeat(MAX_NATIVE_SESSION_ID_BYTES + 1),
-                "outra",
-            )),
-        )
-        .await;
-        assert_eq!(too_long.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1338,7 +1256,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "explicit".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1376,7 +1293,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "automatic".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1404,7 +1320,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "explicit".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1441,7 +1356,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "automatic".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1469,7 +1383,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "explicit".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1506,7 +1419,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "automatic".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1534,7 +1446,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "explicit".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1571,7 +1482,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "automatic".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1602,7 +1512,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "explicit".into(),
-                native_session_id: None,
             }),
         )
         .await;
@@ -1639,7 +1548,6 @@ mod tests {
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "automatic".into(),
-                native_session_id: None,
             }),
         )
         .await;
