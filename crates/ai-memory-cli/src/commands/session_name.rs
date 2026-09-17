@@ -141,20 +141,53 @@ fn find_file(root: &Path, wanted: &str, depth: usize) -> Option<PathBuf> {
     None
 }
 
-/// The workstream's name. Always returns something valid.
+/// `<name><suffix>` with the name cut so the whole stays within the limit:
+/// truncating after appending would drop the suffix, which is the part that
+/// made the name unique.
+pub(crate) fn with_suffix_within_limit(name: &str, suffix: &str) -> String {
+    let room = NAME_MAX.saturating_sub(suffix.len());
+    let mut cut = room.min(name.len());
+    while cut > 0 && !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &name[..cut])
+}
+
+/// `YYYY-MM-DD-<name>`, so a listing sorts by day and a name that was only a
+/// prompt slug still says when the work happened. Applied once, at the moment
+/// the workstream gets its real name; a name the developer typed is never
+/// prefixed.
+pub(crate) fn with_date_prefix(name: &str, today: jiff::civil::Date) -> String {
+    truncate_name(&format!("{today}-{name}"))
+}
+
+/// The local calendar day, which is what a developer scanning the list means.
+pub(crate) fn today() -> jiff::civil::Date {
+    jiff::Zoned::now().date()
+}
+
+/// The workstream's name, date-prefixed. Always returns something valid.
+///
+/// `config_dir` is the platform config root; without one there is nowhere
+/// the app could have written a title, and searching anything else (the
+/// checkout, say) would be a directory walk inside the hook's time budget.
 pub(crate) fn resolve_name(
     host_session_id: Option<&str>,
-    config_dir: &Path,
+    config_dir: Option<&Path>,
     first_prompt: &str,
+    today: jiff::civil::Date,
 ) -> ResolvedName {
-    if let Some(name) = host_session_id.and_then(|id| desktop_title(id, config_dir)) {
+    if let Some(name) = host_session_id
+        .zip(config_dir)
+        .and_then(|(id, dir)| desktop_title(id, dir))
+    {
         return ResolvedName {
-            name,
+            name: with_date_prefix(&name, today),
             provisional: false,
         };
     }
     ResolvedName {
-        name: slugify_prompt(first_prompt),
+        name: with_date_prefix(&slugify_prompt(first_prompt), today),
         provisional: true,
     }
 }
@@ -233,20 +266,76 @@ mod tests {
         );
     }
 
+    fn today() -> jiff::civil::Date {
+        jiff::civil::date(2026, 9, 17)
+    }
+
     #[test]
     fn resolve_prefers_desktop_title_and_is_not_provisional() {
         let tmp = tempfile::tempdir().unwrap();
         app_session(tmp.path(), "local_abc", r#"{"title":"Ajuste no checkout"}"#);
-        let r = resolve_name(Some("local_abc"), tmp.path(), "qualquer prompt");
-        assert_eq!(r.name, "Ajuste no checkout");
+        let r = resolve_name(
+            Some("local_abc"),
+            Some(tmp.path()),
+            "qualquer prompt",
+            today(),
+        );
+        assert_eq!(r.name, "2026-09-17-Ajuste no checkout");
         assert!(!r.provisional);
     }
 
     #[test]
     fn resolve_slug_is_provisional() {
         let tmp = tempfile::tempdir().unwrap();
-        let r = resolve_name(None, tmp.path(), "Corrigir o timeout do nexus");
-        assert_eq!(r.name, "corrigir-o-timeout");
+        let r = resolve_name(
+            None,
+            Some(tmp.path()),
+            "Corrigir o timeout do nexus",
+            today(),
+        );
+        assert_eq!(r.name, "2026-09-17-corrigir-o-timeout");
         assert!(r.provisional);
+    }
+
+    #[test]
+    fn without_a_config_dir_the_title_lookup_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        app_session(tmp.path(), "local_abc", r#"{"title":"Ajuste no checkout"}"#);
+        let r = resolve_name(
+            Some("local_abc"),
+            None,
+            "Corrigir o timeout do nexus",
+            today(),
+        );
+        assert_eq!(r.name, "2026-09-17-corrigir-o-timeout");
+        assert!(r.provisional);
+    }
+
+    #[test]
+    fn a_suffix_never_falls_off_the_end() {
+        let long = "x".repeat(200);
+        let suffixed = with_suffix_within_limit(&long, "-abcd1234");
+        assert!(suffixed.len() <= 128);
+        assert!(suffixed.ends_with("-abcd1234"));
+        assert_eq!(
+            with_suffix_within_limit("curto", "-abcd1234"),
+            "curto-abcd1234"
+        );
+    }
+
+    #[test]
+    fn dated_name_pads_month_and_day() {
+        assert_eq!(
+            with_date_prefix("ajuste", jiff::civil::date(2026, 1, 5)),
+            "2026-01-05-ajuste"
+        );
+    }
+
+    #[test]
+    fn dated_name_stays_within_the_server_limit() {
+        let long = "x".repeat(200);
+        let dated = with_date_prefix(&long, today());
+        assert!(dated.len() <= 128);
+        assert!(dated.starts_with("2026-09-17-"));
     }
 }

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The Claude Code user-prompt hook renames a launcher placeholder workstream
+  (`novo-<n>`, as `passabot-memory run` opens one per session) by itself on the
+  session's first prompt, selecting it by that placeholder name so a rename
+  done by hand in the meantime is never overwritten: desktop title when the
+  app has one, otherwise a three-word slug of the prompt, both prefixed
+  `YYYY-MM-DD-`. A taken name is retried once with a session suffix; a
+  failure is retried on every prompt with the first prompt's slug, and the
+  model is told once, with the reason, to run `rename-workstream
+  --workstream-id` as the fallback. Adopted sessions get the same date
+  prefix at adoption, and the per-prompt rename nudge for a provisional slug
+  is gone: the slug is the name. (#8)
 - Thin-client requests (`run`, `status`, `finalize-session`, ...) never follow
   a redirect; a 3xx is reported as such, naming the auth-proxy login wall and
   `AI_MEMORY_SERVER_URL` as the two causes, instead of decoding a login page

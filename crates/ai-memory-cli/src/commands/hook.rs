@@ -37,6 +37,8 @@ use super::hook_capture::{
 use super::hook_drain_process;
 use super::hook_spool;
 use super::path_util::strip_windows_verbatim_prefix;
+use super::placeholder_rename;
+use super::session_name;
 
 // All drain/handoff timings default to the current short values and can be
 // overridden by whole-minute env vars for very high-latency or large-backlog
@@ -468,8 +470,6 @@ fn write_success_response<W: std::io::Write>(
 /// Name of the workstream the launcher opened, exported into the harness so
 /// this hook can tell a placeholder from a name someone chose.
 const WORKSTREAM_NAME_ENV: &str = "AI_MEMORY_WORKSTREAM_NAME";
-/// What `run_ws_auto` emits before anything better is known.
-const PLACEHOLDER_PREFIX: &str = "novo-";
 /// How long adoption may hold up the first prompt.
 ///
 /// The launcher can block forever waiting on the server — it has nothing else
@@ -477,27 +477,6 @@ const PLACEHOLDER_PREFIX: &str = "novo-";
 /// answering. Two POSTs against a healthy server are milliseconds; past this
 /// bound the session simply goes unadopted and the hook says so.
 const ADOPT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Whether the model should be asked to rename this workstream.
-///
-/// Two ways to end up provisional: a session adopted with a prompt slug
-/// because no app title existed yet, or a `claudew` launch that took the
-/// placeholder name.
-pub(crate) fn wants_rename_nudge(provisional: bool, workstream_env: Option<&str>) -> bool {
-    provisional || workstream_env.is_some_and(|name| name.starts_with(PLACEHOLDER_PREFIX))
-}
-
-fn rename_nudge(current_name: &str) -> String {
-    format!(
-        "[nomear workstream] Este workstream ainda tem nome provisório \
-         ('{current_name}'). Escolha um nome curto do trabalho atual e rode \
-         agora, silenciosamente, como parte do seu trabalho:\n\n    \
-         ai-memory rename-workstream --from '{current_name}' --to '<nome>'\n\n\
-         Convenção (scope:slug, kebab-case, ~12-18 chars): toca 1 serviço -> \
-         <servico>:<slug>; vários serviços de 1 produto -> <produto>:<slug>; \
-         vários produtos -> <slug>."
-    )
-}
 
 /// Marker saying this session already reported an adoption failure.
 ///
@@ -929,17 +908,17 @@ where
     {
         let managed_env = std::env::var(MANAGED_RUN_ENV).ok();
         let workstream_env = std::env::var(WORKSTREAM_NAME_ENV).ok();
+        let cwd = policy_cwd
+            .as_deref()
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        let host = std::env::var("CLAUDE_CODE_HOST_SESSION_ID").ok();
+        let prompt = json
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         if adopt_session::should_adopt(&dd, native, managed_env.as_deref()) {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
-            let cwd = policy_cwd
-                .as_deref()
-                .map_or_else(|| PathBuf::from("."), PathBuf::from);
-            let host = std::env::var("CLAUDE_CODE_HOST_SESSION_ID").ok();
-            let prompt = json
-                .get("prompt")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
             let adoption = tokio::time::timeout(
                 ADOPT_TIMEOUT,
                 adopt_session::adopt(adopt_session::AdoptInput {
@@ -953,13 +932,11 @@ where
                 }),
             )
             .await;
+            // An adopted session is named by this hook at adoption (app
+            // title or prompt slug, date-prefixed); there is nothing to ask
+            // the model for.
             let failure = match adoption {
-                Ok(Ok(state)) => {
-                    prompt_context = state
-                        .provisional
-                        .then(|| rename_nudge(&state.workstream_name));
-                    None
-                }
+                Ok(Ok(_)) => None,
                 Ok(Err(error)) => Some(format!("{error:#}")),
                 Err(_) => Some("o servidor da memória não respondeu a tempo".to_string()),
             };
@@ -971,14 +948,33 @@ where
                     prompt_context = Some(adoption_failed_warning(&reason));
                 }
             }
-        } else if let Some(state) = adopted_state::load(&dd, native) {
-            prompt_context = wants_rename_nudge(state.provisional, None)
-                .then(|| rename_nudge(&state.workstream_name));
-        } else {
-            prompt_context = workstream_env
-                .as_deref()
-                .filter(|name| wants_rename_nudge(false, Some(name)))
-                .map(rename_nudge);
+        } else if placeholder_rename::wants_placeholder_rename(
+            adopted_state::load(&dd, native).is_some(),
+            workstream_env.as_deref(),
+            &dd,
+            native,
+        ) && let Some(placeholder) = workstream_env.as_deref()
+        {
+            // A launcher-managed session still on its `novo-` placeholder:
+            // this prompt is the first, and the earliest moment a real name
+            // exists.
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let config_dir = dirs::config_dir();
+            prompt_context =
+                placeholder_rename::managed_prompt_context(placeholder_rename::RenameInput {
+                    data_dir: &dd,
+                    server_url: base,
+                    bearer: bearer.as_deref(),
+                    cwd: &cwd,
+                    config_dir: config_dir.as_deref(),
+                    native_session_id: native,
+                    host_session_id: host.as_deref(),
+                    first_prompt: prompt,
+                    placeholder,
+                    today: session_name::today(),
+                })
+                .await;
         }
     }
 
@@ -1282,29 +1278,6 @@ mod tests {
             claim_adoption_warning(tmp.path(), "nat-2"),
             "the claim is per session, not per machine"
         );
-    }
-
-    #[test]
-    fn a_provisional_adopted_name_asks_for_a_rename() {
-        assert!(wants_rename_nudge(true, None));
-    }
-
-    #[test]
-    fn a_launcher_placeholder_asks_for_a_rename() {
-        assert!(wants_rename_nudge(false, Some("novo-491181")));
-    }
-
-    #[test]
-    fn a_chosen_name_is_left_alone() {
-        assert!(!wants_rename_nudge(false, Some("nexus:bus-cancel")));
-        assert!(!wants_rename_nudge(false, None));
-    }
-
-    #[test]
-    fn the_rename_nudge_names_the_current_workstream() {
-        let nudge = rename_nudge("novo-491181");
-        assert!(nudge.contains("rename-workstream"));
-        assert!(nudge.contains("novo-491181"));
     }
 
     #[test]

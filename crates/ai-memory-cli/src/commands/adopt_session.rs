@@ -46,9 +46,9 @@ pub(crate) fn should_adopt(
 
 /// Disambiguate a name the server already has. The desktop app titles sessions
 /// from their content, so two sessions on the same task collide easily.
-fn with_suffix(name: &str, native_session_id: &str) -> String {
+pub(crate) fn with_suffix(name: &str, native_session_id: &str) -> String {
     let short: String = native_session_id.chars().take(8).collect();
-    format!("{name}-{short}")
+    session_name::with_suffix_within_limit(name, &format!("-{short}"))
 }
 
 /// Concrete workspace/project for the prepare body, mirroring the fallbacks the
@@ -85,9 +85,13 @@ pub(crate) fn adopt_scope(cwd: &Path) -> (String, String) {
 
 pub(crate) async fn adopt(input: AdoptInput<'_>) -> Result<AdoptedRun> {
     let repository = inspect_repository(input.cwd)?;
-    let config_dir = dirs::config_dir().unwrap_or_else(|| input.cwd.to_path_buf());
-    let resolved =
-        session_name::resolve_name(input.host_session_id, &config_dir, input.first_prompt);
+    let config_dir = dirs::config_dir();
+    let resolved = session_name::resolve_name(
+        input.host_session_id,
+        config_dir.as_deref(),
+        input.first_prompt,
+        session_name::today(),
+    );
     let (workspace, project) = adopt_scope(&repository.cwd);
     let endpoint = ServerEndpoint::from_pair(
         Some(input.server_url.to_string()),
