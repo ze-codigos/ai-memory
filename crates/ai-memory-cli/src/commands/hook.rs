@@ -948,44 +948,33 @@ where
                     prompt_context = Some(adoption_failed_warning(&reason));
                 }
             }
-        } else if adopted_state::load(&dd, native).is_none()
-            && let Some(name) = workstream_env.as_deref()
-            && placeholder_rename::needs_rename(&dd, native, name)
+        } else if placeholder_rename::wants_placeholder_rename(
+            adopted_state::load(&dd, native).is_some(),
+            workstream_env.as_deref(),
+            &dd,
+            native,
+        ) && let Some(placeholder) = workstream_env.as_deref()
         {
             // A launcher-managed session still on its `novo-` placeholder:
             // this prompt is the first, and the earliest moment a real name
-            // exists. Renamed by id, which `run` exported next to the name.
-            let workstream_id = std::env::var(placeholder_rename::WORKSTREAM_ID_ENV)
-                .ok()
-                .and_then(|raw| raw.parse::<ai_memory_core::WorkstreamId>().ok());
-            prompt_context = match workstream_id {
-                Some(workstream_id) => {
-                    let client = build_client();
-                    let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
-                    placeholder_rename::managed_prompt_context(
-                        name,
-                        placeholder_rename::RenameInput {
-                            data_dir: &dd,
-                            server_url: base,
-                            bearer: bearer.as_deref(),
-                            cwd: &cwd,
-                            native_session_id: native,
-                            host_session_id: host.as_deref(),
-                            first_prompt: prompt,
-                            workstream_id,
-                            today: session_name::today(),
-                        },
-                    )
-                    .await
-                }
-                None => {
-                    eprintln!(
-                        "ai-memory hook warning: {} is missing or invalid; the placeholder workstream '{name}' keeps its name",
-                        placeholder_rename::WORKSTREAM_ID_ENV
-                    );
-                    Some(placeholder_rename::rename_nudge(name))
-                }
-            };
+            // exists.
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let config_dir = dirs::config_dir();
+            prompt_context =
+                placeholder_rename::managed_prompt_context(placeholder_rename::RenameInput {
+                    data_dir: &dd,
+                    server_url: base,
+                    bearer: bearer.as_deref(),
+                    cwd: &cwd,
+                    config_dir: config_dir.as_deref(),
+                    native_session_id: native,
+                    host_session_id: host.as_deref(),
+                    first_prompt: prompt,
+                    placeholder,
+                    today: session_name::today(),
+                })
+                .await;
         }
     }
 

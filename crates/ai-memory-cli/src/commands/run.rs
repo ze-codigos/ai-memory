@@ -407,9 +407,9 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
             prepared.workstream_id.to_string(),
         )
         // The name, not just the id: the user-prompt hook compares it against
-        // the placeholder prefix to decide whether to ask the model for a real
-        // one. With only the id it would have to round-trip to the server on
-        // every prompt to answer that.
+        // the launcher's placeholder prefix to decide whether to rename the
+        // workstream after the first prompt. With only the id it would have
+        // to round-trip to the server on every prompt to answer that.
         .env("AI_MEMORY_WORKSTREAM_NAME", &prepared.workstream_name)
         .env("AI_MEMORY_HOOK_URL", endpoint.build_url(""))
         // The header-resolving command exists for THIS long-lived process.
