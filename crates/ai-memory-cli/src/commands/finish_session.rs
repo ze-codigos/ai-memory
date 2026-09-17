@@ -1,14 +1,15 @@
-//! Finalisation of adopted sessions, run by the detached spool drainer.
+//! Finalisation of kept ledgers (`adopted_state`), run by the detached spool
+//! drainer: a managed run whose final import failed when the launcher's child
+//! exited is closed here instead of being lost.
 //!
 //! The drainer already fires on every boundary the harness reaches
-//! (`session-end`, `stop`, `pre-compact`) and on `session-start` when adopted
-//! state is pending. Putting the import here keeps transcript export and the
-//! batched POSTs out of the hook's latency, and gets retries for free.
+//! (`session-end`, `stop`, `pre-compact`) and on `session-start` when a record
+//! is pending. Putting the import here keeps transcript export and the batched
+//! POSTs out of the hook's latency, and gets retries for free.
 //!
-//! A session marked ended closes its run. Anything else gets an INCREMENTAL
+//! A record marked ended closes its run. Anything else gets an INCREMENTAL
 //! import that leaves the run open — idempotent by event id, and therefore
-//! safe to run against a session that turns out to still be alive. That is why
-//! nothing here has to decide whether a process died.
+//! safe against a session that is still alive.
 
 use std::path::Path;
 

@@ -670,8 +670,8 @@ struct KeptLedger<'a> {
     checkpoint: &'a ai_memory_core::WorkstreamCheckpoint,
 }
 
-/// Persist a run whose transcript import failed after the harness exited, in
-/// the state the hook adoption path uses, so the detached drainer's
+/// Persist a run whose transcript import failed after the harness exited, so
+/// the detached hook drainer's
 /// [`crate::commands::finish_session::finalize_adopted_runs`] closes it at the
 /// next boundary. Built here, not by the caller, so the record is `ended` by
 /// construction: anything else would be imported incrementally and left
@@ -682,7 +682,6 @@ fn keep_ledger_for_next_boundary(data_dir: &Path, kept: &KeptLedger<'_>) -> Resu
         run_path: kept.run_path.to_string(),
         native_session_id: kept.native_session_id.to_string(),
         workstream_name: kept.prepared.workstream_name.clone(),
-        provisional: false,
         server_url: kept.endpoint.build_url(""),
         cwd: kept.cwd.to_path_buf(),
         adopted_at: jiff::Timestamp::now().as_second(),
@@ -1576,7 +1575,10 @@ mod tests {
         )
         .unwrap();
 
-        let stored = crate::commands::adopted_state::load(tmp.path(), "nat-finish-1").unwrap();
+        let listed = crate::commands::adopted_state::list(tmp.path());
+        assert_eq!(listed.len(), 1);
+        let stored = &listed[0];
+        assert_eq!(stored.native_session_id, "nat-finish-1");
         assert!(stored.ended, "only an ended record is imported AND closed");
         assert!(stored.kept_by_launcher);
         assert_eq!(stored.run_id, prepared.run_id);
@@ -1584,7 +1586,6 @@ mod tests {
         assert_eq!(stored.workstream_name, "ajuste-checkout");
         assert_eq!(stored.server_url, "https://memory.example/wiki");
         assert_eq!(stored.cwd, PathBuf::from("/repo"));
-        assert!(!stored.provisional);
         assert_eq!(stored.home.as_deref(), Some(Path::new("/custom/home")));
         assert_eq!(
             stored.session_dir.as_deref(),
@@ -1597,10 +1598,9 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(
-            crate::commands::finish_session::plan_for(&stored, stored.adopted_at + 60, 48 * 3_600),
+            crate::commands::finish_session::plan_for(stored, stored.adopted_at + 60, 48 * 3_600),
             crate::commands::finish_session::Action::Close
         );
-        assert_eq!(crate::commands::adopted_state::list(tmp.path()).len(), 1);
     }
 
     #[test]

@@ -1,8 +1,9 @@
-//! Local state for an adopted session: the run a hook opened on its behalf.
-//!
-//! On disk rather than in the environment because a hook is a child process —
-//! it cannot stamp `AI_MEMORY_RUN_ID` onto the harness that is already
-//! running. Keyed by the native session id, which every hook payload carries.
+//! Local state for a managed run whose ledger the launcher could not import
+//! when its child exited (a server outage, an Access token that expired
+//! mid-session): the record the detached hook drainer closes at the next
+//! boundary. Keyed by the native session id, which every hook payload
+//! carries. The directory name (`adopted-runs/`) predates this narrower role
+//! and is kept so records written by earlier binaries are still found.
 
 use std::path::{Path, PathBuf};
 
@@ -16,19 +17,17 @@ pub(crate) struct AdoptedRun {
     pub run_path: String,
     pub native_session_id: String,
     pub workstream_name: String,
-    /// Named from a prompt slug; the hook asks the model to rename it.
-    pub provisional: bool,
     /// The drainer finalises this run and has no `HookArgs` to read a URL from.
     pub server_url: String,
     pub cwd: PathBuf,
     pub adopted_at: i64,
-    /// SessionEnd sets this; the drainer closes only what is marked ended.
+    /// The drainer closes only what is marked ended; a record without it is
+    /// imported incrementally and left open.
     #[serde(default)]
     pub ended: bool,
     /// Where the launcher looked for the native transcript, when it knew
-    /// better than the defaults (`AI_MEMORY_HOME`, `CLAUDE_CONFIG_DIR`). A
-    /// hook-adopted session leaves both unset and the drainer uses the
-    /// process defaults, as it always did.
+    /// better than the defaults (`AI_MEMORY_HOME`, `CLAUDE_CONFIG_DIR`);
+    /// unset, the drainer uses the process defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,11 +84,6 @@ pub(crate) fn save(data_dir: &Path, run: &AdoptedRun) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn load(data_dir: &Path, native_session_id: &str) -> Option<AdoptedRun> {
-    let raw = std::fs::read(path_for(data_dir, native_session_id)).ok()?;
-    serde_json::from_slice(&raw).ok()
-}
-
 /// Best-effort: a state that cannot be deleted is retried on the next
 /// boundary, and failing the hook over it would be worse than the retry.
 pub(crate) fn remove(data_dir: &Path, native_session_id: &str) {
@@ -119,7 +113,6 @@ pub(crate) fn sample_run(session: &str) -> AdoptedRun {
         run_path: "/workstream/runs/abc".into(),
         native_session_id: session.into(),
         workstream_name: "ajuste-checkout".into(),
-        provisional: false,
         server_url: "https://memory-test.example".into(),
         cwd: PathBuf::from("/repo"),
         adopted_at: 1_700_000_000,
@@ -138,17 +131,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn save_then_load_roundtrip() {
+    fn save_then_list_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let run = sample_run("nat-1");
         save(tmp.path(), &run).unwrap();
-        assert_eq!(load(tmp.path(), "nat-1"), Some(run));
-    }
-
-    #[test]
-    fn load_absent_is_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(load(tmp.path(), "nao-existe"), None);
+        assert_eq!(list(tmp.path()), vec![run]);
     }
 
     #[test]
@@ -158,8 +145,9 @@ mod tests {
         let mut ended = sample_run("nat-1");
         ended.ended = true;
         save(tmp.path(), &ended).unwrap();
-        assert!(load(tmp.path(), "nat-1").unwrap().ended);
-        assert_eq!(list(tmp.path()).len(), 1);
+        let listed = list(tmp.path());
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].ended);
     }
 
     #[test]
@@ -167,7 +155,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         save(tmp.path(), &sample_run("nat-1")).unwrap();
         remove(tmp.path(), "nat-1");
-        assert_eq!(load(tmp.path(), "nat-1"), None);
+        assert!(list(tmp.path()).is_empty());
     }
 
     #[test]
@@ -212,6 +200,6 @@ mod tests {
         save(tmp.path(), &run).unwrap();
 
         assert!(!tmp.path().join("fuga.json").exists());
-        assert!(load(tmp.path(), "../../fuga").is_some());
+        assert_eq!(list(tmp.path()).len(), 1);
     }
 }

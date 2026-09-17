@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- The Claude Code hook no longer adopts a session that started outside
+  `ai-memory run` into a managed workstream, and `POST /workstream/runs` no
+  longer reopens a workstream by the caller's `native_session_id` (#9
+  reverted). The ledger is opt-in through the launcher, as upstream intends:
+  a plain `claude` keeps its hooks and nothing else. The `adopted-runs/`
+  records stay for the one thing the launcher still needs them for — a run
+  whose final import failed after the child exited, closed by the drainer at
+  the next boundary. (#10)
+
 ### Changed
 - The Claude Code user-prompt hook renames a launcher placeholder workstream
   (`novo-<n>`, as `passabot-memory run` opens one per session) by itself on the
@@ -16,9 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `YYYY-MM-DD-`. A taken name is retried once with a session suffix; a
   failure is retried on every prompt with the first prompt's slug, and the
   model is told once, with the reason, to run `rename-workstream
-  --workstream-id` as the fallback. Adopted sessions get the same date
-  prefix at adoption, and the per-prompt rename nudge for a provisional slug
-  is gone: the slug is the name. (#8)
+  --workstream-id` as the fallback. The per-prompt rename nudge for a
+  provisional slug is gone: the slug is the name. (#8)
 - Thin-client requests (`run`, `status`, `finalize-session`, ...) never follow
   a redirect; a 3xx is reported as such, naming the auth-proxy login wall and
   `AI_MEMORY_SERVER_URL` as the two causes, instead of decoding a login page

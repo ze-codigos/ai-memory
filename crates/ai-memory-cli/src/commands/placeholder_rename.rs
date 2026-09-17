@@ -8,7 +8,7 @@
 //!
 //! Never blocks the prompt. A failure is retried on every prompt, but the
 //! developer hears about it once: the model gets the reason and the manual
-//! command a single time per session, the same way adoption warns.
+//! command a single time per session.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,16 +18,18 @@ use ai_memory_workstream::inspect_repository;
 use anyhow::{Context as _, Result};
 use sha2::{Digest as _, Sha256};
 
-use crate::commands::adopt_session::{adopt_scope, with_suffix};
 use crate::commands::session_name;
+use crate::config::DEFAULT_WORKSPACE;
 use crate::http_client::{ServerEndpoint, ServerResponseError, post_json};
+use crate::marker::{find_marker, parse_toml_key, repo_root_project};
 
 /// What `run_ws_auto` in the shell launcher emits before anything better is
 /// known: the prefix followed by a checksum, digits only.
 const PLACEHOLDER_PREFIX: &str = "novo-";
-/// How long the rename may hold up the first prompt. Same reasoning as
-/// adoption: a hook sits between the user pressing enter and the model
-/// answering, and one POST against a healthy server is milliseconds.
+/// How long the rename may hold up the first prompt. The launcher can block
+/// forever waiting on the server; a hook cannot: it sits between the user
+/// pressing enter and the model answering, and one POST against a healthy
+/// server is milliseconds.
 const RENAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Whether a workstream name is the launcher's placeholder. Digits only after
@@ -39,20 +41,56 @@ fn is_placeholder(name: &str) -> bool {
 }
 
 /// Whether this prompt should rename the workstream: a launcher-managed
-/// session (an adopted one was named by the hook at adoption) whose exported
-/// name is still the placeholder and which this session has not renamed yet.
-/// The environment carries the placeholder for the whole session, so the
-/// marker is the only way to tell the first prompt from the rest.
+/// session whose exported name is still the placeholder and which this
+/// session has not renamed yet. The environment carries the placeholder for
+/// the whole session, so the marker is the only way to tell the first prompt
+/// from the rest.
 pub(crate) fn wants_placeholder_rename(
-    adopted: bool,
     workstream_env: Option<&str>,
     data_dir: &Path,
     native_session_id: &str,
 ) -> bool {
-    !adopted
-        && workstream_env.is_some_and(|name| {
-            is_placeholder(name) && !already_renamed(data_dir, native_session_id)
+    workstream_env
+        .is_some_and(|name| is_placeholder(name) && !already_renamed(data_dir, native_session_id))
+}
+
+/// Disambiguate a name the server already has. The desktop app titles sessions
+/// from their content, so two sessions on the same task collide easily.
+pub(crate) fn with_suffix(name: &str, native_session_id: &str) -> String {
+    let short: String = native_session_id.chars().take(8).collect();
+    session_name::with_suffix_within_limit(name, &format!("-{short}"))
+}
+
+/// Concrete workspace/project for the rename body, mirroring the fallbacks the
+/// server applies to hook events: marker first, then the repo-root strategy,
+/// then the directory name. The hook path normally lets the server decide, but
+/// the rename needs both named outright.
+pub(crate) fn rename_scope(cwd: &Path) -> (String, String) {
+    let cwd_str = cwd.to_string_lossy();
+    let marker = find_marker(&cwd_str);
+    let workspace = marker
+        .as_ref()
+        .and_then(|path| parse_toml_key(path, "workspace"))
+        .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string());
+    let declared = marker
+        .as_ref()
+        .and_then(|path| parse_toml_key(path, "project"));
+    let strategy = marker
+        .as_ref()
+        .and_then(|path| parse_toml_key(path, "project_strategy"));
+    let project = declared
+        .or_else(|| {
+            matches!(strategy.as_deref(), Some("repo-root" | "repo_root"))
+                .then(|| repo_root_project(&cwd_str))
+                .flatten()
         })
+        .or_else(|| {
+            cwd.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "default".to_string());
+    (workspace, project)
 }
 
 fn state_marker(data_dir: &Path, kind: &str, native_session_id: &str) -> PathBuf {
@@ -96,7 +134,7 @@ fn record_renamed(data_dir: &Path, native_session_id: &str, new_name: &str) {
 
 /// Whether this session still owes the developer a rename warning. Marks it
 /// as spent in the same call — the rename itself keeps being retried, only the
-/// paragraph in the turn is rate-limited (see `claim_adoption_warning`).
+/// paragraph in the turn is rate-limited.
 fn claim_rename_warning(data_dir: &Path, native_session_id: &str) -> bool {
     let marker = state_marker(data_dir, "rename-warned", native_session_id);
     if marker.exists() {
@@ -206,7 +244,7 @@ pub(crate) async fn rename_placeholder(input: RenameInput<'_>) -> Result<String>
     } else {
         resolved.name
     };
-    let (workspace, project) = adopt_scope(&repository.cwd);
+    let (workspace, project) = rename_scope(&repository.cwd);
     let endpoint = ServerEndpoint::from_pair(
         Some(input.server_url.to_string()),
         input.bearer.map(str::to_string),
@@ -282,25 +320,18 @@ mod tests {
     fn only_an_unrenamed_launcher_placeholder_wants_a_rename() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(wants_placeholder_rename(
-            false,
             Some("novo-1"),
             tmp.path(),
             "nat-1"
         ));
-        assert!(
-            !wants_placeholder_rename(true, Some("novo-1"), tmp.path(), "nat-1"),
-            "an adopted session was named by the hook already"
-        );
         assert!(!wants_placeholder_rename(
-            false,
             Some("nexus:x"),
             tmp.path(),
             "nat-1"
         ));
-        assert!(!wants_placeholder_rename(false, None, tmp.path(), "nat-1"));
+        assert!(!wants_placeholder_rename(None, tmp.path(), "nat-1"));
         mark_renamed(tmp.path(), "nat-1", "2026-09-17-x").unwrap();
         assert!(!wants_placeholder_rename(
-            false,
             Some("novo-1"),
             tmp.path(),
             "nat-1"
