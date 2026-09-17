@@ -190,6 +190,11 @@ pub struct PrepareManagedRunResponse {
     /// selection was honoured as sent.
     #[serde(default)]
     pub session_reattached: bool,
+    /// The map had a workstream for `native_session_id`, but another live
+    /// session holds it, so the requested selection was honoured instead.
+    /// Old servers omit this field.
+    #[serde(default)]
+    pub session_link_busy: bool,
 }
 
 /// One-time startup context for harnesses without a SessionStart hook.

@@ -251,6 +251,7 @@ async fn prepare_run(
             sync_through: prepared.sync_through,
             may_adopt_existing_session: prepared.may_adopt_existing_session,
             session_reattached: prepared.session_reattached,
+            session_link_busy: prepared.session_link_busy,
         })
         .into_response(),
         Err(failure) => store_error_response(failure),

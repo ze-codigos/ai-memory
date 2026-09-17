@@ -1847,6 +1847,7 @@ mod tests {
                         sync_through: 0,
                         may_adopt_existing_session: false,
                         session_reattached: false,
+                        session_link_busy: false,
                     })
                     .into_response()
                 }

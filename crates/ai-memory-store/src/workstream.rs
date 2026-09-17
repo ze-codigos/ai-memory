@@ -84,6 +84,10 @@ pub struct PreparedWorkstreamRun {
     pub may_adopt_existing_session: bool,
     /// The workstream came from the native-session map, not the selection.
     pub session_reattached: bool,
+    /// The map had a workstream for the session, but another live session
+    /// holds it, so the selection was honoured instead. The caller can tell
+    /// the user why their conversation now has a second workstream.
+    pub session_link_busy: bool,
 }
 
 /// Store-level finish input after the raw segment has been made durable.
@@ -249,14 +253,15 @@ pub(crate) fn prepare_run(
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty());
-    let reattached = match native_session {
+    let linked = match native_session {
         Some(session) => linked_workstream_for_session(&tx, input, session, now)?,
-        None => None,
+        None => SessionLink::Unlinked,
     };
-    let session_reattached = reattached.is_some();
-    let (workstream_id, workstream_name) = match reattached {
-        Some(found) => found,
-        None => select_workstream(&tx, input, now)?,
+    let session_reattached = matches!(linked, SessionLink::Reattached(..));
+    let session_link_busy = matches!(linked, SessionLink::Busy);
+    let (workstream_id, workstream_name) = match linked {
+        SessionLink::Reattached(id, name) => (id, name),
+        SessionLink::Busy | SessionLink::Unlinked => select_workstream(&tx, input, now)?,
     };
     let busy: Option<(String, i64)> = tx
         .query_row(
@@ -350,7 +355,18 @@ pub(crate) fn prepare_run(
         sync_through: latest_sequence,
         may_adopt_existing_session: established == 0,
         session_reattached,
+        session_link_busy,
     })
+}
+
+/// What the native-session map said about the caller's session.
+enum SessionLink {
+    /// Linked to this workstream of the checkout, and free to reopen.
+    Reattached(WorkstreamId, String),
+    /// Linked, but another live session holds that workstream.
+    Busy,
+    /// Not linked in this checkout (or the caller chose a name).
+    Unlinked,
 }
 
 /// The workstream of this checkout already linked to the caller's native
@@ -370,9 +386,9 @@ fn linked_workstream_for_session(
     input: &PrepareWorkstreamRun,
     native_session_id: &str,
     now: i64,
-) -> StoreResult<Option<(WorkstreamId, String)>> {
+) -> StoreResult<SessionLink> {
     if matches!(input.selection, WorkstreamSelection::Named(_)) {
-        return Ok(None);
+        return Ok(SessionLink::Unlinked);
     }
     let linked = tx
         .query_row(
@@ -394,7 +410,7 @@ fn linked_workstream_for_session(
         )
         .optional()?;
     let Some((id, name)) = linked else {
-        return Ok(None);
+        return Ok(SessionLink::Unlinked);
     };
     let active: Option<(Vec<u8>, Option<String>)> = tx
         .query_row(
@@ -412,10 +428,13 @@ fn linked_workstream_for_session(
                 params![now, run_id],
             )?;
         }
-        Some(_) => return Ok(None),
+        Some(_) => return Ok(SessionLink::Busy),
         None => {}
     }
-    Ok(Some((WorkstreamId::from_slice(&id)?, name)))
+    Ok(SessionLink::Reattached(
+        WorkstreamId::from_slice(&id)?,
+        name,
+    ))
 }
 
 /// Make `native_session_id` the current session of `agent` on the workstream.

@@ -7226,6 +7226,7 @@ mod tests {
             .await
             .unwrap();
         assert!(again.session_reattached);
+        assert!(!again.session_link_busy);
         assert_eq!(again.workstream_id, first.workstream_id);
         assert_eq!(again.workstream_name, "teste adocao");
         assert_ne!(again.run_id, first.run_id);
@@ -7367,6 +7368,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!fallen_through.session_reattached);
+        assert!(fallen_through.session_link_busy);
         assert_eq!(fallen_through.workstream_name, "trabalho de novo");
         assert_ne!(fallen_through.workstream_id, first.workstream_id);
         assert_eq!(managed_run_state(store.db_path(), resumed.run_id), "active");

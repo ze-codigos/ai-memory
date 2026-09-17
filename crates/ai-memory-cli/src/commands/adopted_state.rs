@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// How long a session link is kept. A desktop conversation reopened weeks
 /// later is rare, and the server holds the same map without any cap; the
-/// cache only spares a round trip and covers servers that predate the map.
+/// link only detects fragmentation, it never decides where a session goes.
 const LINK_MAX_AGE_SECS: i64 = 30 * 24 * 3_600;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,7 +60,9 @@ pub(crate) fn state_dir(data_dir: &Path) -> PathBuf {
 /// Which workstream a native session was adopted into. Outlives the run:
 /// `remove` deletes the run record when the drainer closes it, and the next
 /// adoption of the same session (the desktop app reopening a conversation)
-/// needs to land in the same workstream, not a fresh `name-<suffix>`.
+/// compares where the server put it with where it was — the server's map
+/// decides, this only notices a split. Never used to select by name: a
+/// name can be freed by a rename and taken by another conversation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SessionLink {
     pub native_session_id: String,
@@ -110,8 +112,11 @@ pub(crate) fn load_link(
         .then_some(link)
 }
 
-/// Best effort, on every save: a stale link is a wasted round trip, not a
-/// failure, so this never blocks the adoption that triggered it.
+/// Best effort, on every save, and by age only: a link this binary cannot
+/// parse may belong to a newer one on the same machine (the wrapper probes
+/// two install paths), and deleting it would erase the newer binary's
+/// memory. A stale link is a missed notice, not a failure, so this never
+/// blocks the adoption that triggered it.
 fn prune_links(dir: &Path, now: i64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -121,11 +126,11 @@ fn prune_links(dir: &Path, now: i64) {
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let stale = std::fs::read(&path)
+        let expired = std::fs::read(&path)
             .ok()
             .and_then(|raw| serde_json::from_slice::<SessionLink>(&raw).ok())
-            .is_none_or(|link| now.saturating_sub(link.linked_at) > LINK_MAX_AGE_SECS);
-        if stale {
+            .is_some_and(|link| now.saturating_sub(link.linked_at) > LINK_MAX_AGE_SECS);
+        if expired {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -337,6 +342,17 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn pruning_leaves_a_link_it_cannot_parse_alone() {
+        // A newer binary on the same machine may have written it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(links_dir(tmp.path())).unwrap();
+        let foreign = links_dir(tmp.path()).join("de-outro-binario.json");
+        std::fs::write(&foreign, "{\"campo_novo\": 1}").unwrap();
+        save_link(tmp.path(), &sample_link("nova", 1_700_000_000)).unwrap();
+        assert!(foreign.exists());
     }
 
     #[test]
