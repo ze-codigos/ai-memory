@@ -16,13 +16,21 @@ name: passabot-release
 # fires.
 #
 # Targets: linux x86_64 (also covers WSL2), linux aarch64, macos aarch64,
-# macos x86_64. Windows-native is unsupported by policy (WSL2 is the
-# supported path), so no Windows artifact.
+# macos x86_64 and windows x86_64 (MEM-11: the plugin runs natively on
+# Windows through Git Bash; the Claude Desktop app does not load plugins in
+# WSL sessions, so the native binary is the only way there).
+#
+# MEM-11 (temporary, remove before the PR merges): pushes to the feature
+# branch build ONLY the windows job so the .exe can be fetched as a workflow
+# artifact (`gh run download`) without cutting a tag. workflow_dispatch is not
+# an option because it needs the workflow on the default branch.
 
 on:
   push:
     tags:
       - "passabot-v*"
+    branches:
+      - "feat/MEM-11-windows-nativo"
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +41,7 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.artifact }}
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -96,9 +105,68 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.tar.gz.sha256
 
+  windows:
+    name: ai-memory-windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.95
+        with:
+          toolchain: "1.95"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build release binary
+        env:
+          TAILWIND_SKIP: "1"
+        run: cargo build --release -p ai-memory-cli
+
+      # CLI-only zip: ai-memory.exe + checksum (sha256sum format, like the
+      # tarballs). The passabot-memory install.ps1 consumes this asset.
+      - name: Create release zip
+        shell: pwsh
+        env:
+          RELEASE_ARTIFACT: ai-memory-windows-x86_64
+        run: |
+          $ErrorActionPreference = "Stop"
+          $artifact = $env:RELEASE_ARTIFACT
+          $stage = "dist/$artifact"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/ai-memory.exe "$stage/ai-memory.exe"
+          $zip = "$artifact.zip"
+          Get-ChildItem $stage | Compress-Archive -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
+
+      - name: Smoke test release zip
+        shell: pwsh
+        env:
+          RELEASE_ARTIFACT: ai-memory-windows-x86_64
+        run: |
+          $ErrorActionPreference = "Stop"
+          $artifact = $env:RELEASE_ARTIFACT
+          $zip = "$artifact.zip"
+          $smoke = "dist/smoke-$artifact"
+          Expand-Archive $zip -DestinationPath $smoke -Force
+          & "$smoke/ai-memory.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "ai-memory.exe --version failed" }
+          $checksum = Get-Content "$zip.sha256" -Raw
+          if ($checksum -notmatch "^[0-9a-f]{64}  $artifact\.zip\r?\n?$") {
+            throw "checksum is not sha256sum format"
+          }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ai-memory-windows-x86_64
+          path: |
+            ai-memory-windows-x86_64.zip
+            ai-memory-windows-x86_64.zip.sha256
+
   release:
     name: create github release
-    needs: build
+    needs: [build, windows]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -136,5 +204,5 @@ jobs:
           ls -l dist/
           gh release create "$TAG" \
             --title "$TAG (binários CLI para o passabot-memory)" \
-            --notes "Binários pré-buildados do \`ai-memory\` (fork ze-codigos, branch \`passabot/upstream-patches\`, commit ${GITHUB_SHA}) consumidos pelo \`install.sh\` do plugin passabot-memory. Targets: linux x86_64/aarch64, macos aarch64/x86_64 (Windows = WSL2, usa o linux x86_64)." \
-            dist/*.tar.gz dist/*.tar.gz.sha256
+            --notes "Binários pré-buildados do \`ai-memory\` (fork ze-codigos, branch \`passabot/upstream-patches\`, commit ${GITHUB_SHA}) consumidos pelo \`install.sh\` do plugin passabot-memory. Targets: linux x86_64/aarch64, macos aarch64/x86_64, windows x86_64 (zip com ai-memory.exe, consumido pelo install.ps1)." \
+            dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.zip dist/*.zip.sha256
