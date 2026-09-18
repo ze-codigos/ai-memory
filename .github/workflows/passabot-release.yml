@@ -19,18 +19,11 @@ name: passabot-release
 # macos x86_64 and windows x86_64 (MEM-11: the plugin runs natively on
 # Windows through Git Bash; the Claude Desktop app does not load plugins in
 # WSL sessions, so the native binary is the only way there).
-#
-# MEM-11 (temporary, remove before the PR merges): pushes to the feature
-# branch build ONLY the windows job so the .exe can be fetched as a workflow
-# artifact (`gh run download`) without cutting a tag. workflow_dispatch is not
-# an option because it needs the workflow on the default branch.
 
 on:
   push:
     tags:
       - "passabot-v*"
-    branches:
-      - "feat/MEM-11-windows-nativo"
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,7 +34,6 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.artifact }}
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -166,7 +158,6 @@ jobs:
   release:
     name: create github release
     needs: [build, windows]
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
