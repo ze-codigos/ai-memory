@@ -1013,6 +1013,9 @@ mod tests {
         assert_eq!(runs.get(), 2, "the success is memoised as usual");
     }
 
+    // /bin/echo nao existe no Windows: o comando falha e o cliente cai no header
+    // estatico (o fallback correto). Mesmo motivo do teste vizinho, que ja e' unix-only.
+    #[cfg(unix)]
     #[test]
     fn authenticate_honours_the_header_command_and_memoises_per_endpoint() {
         // O launcher usa UM endpoint pra sessao inteira: o comando roda no
