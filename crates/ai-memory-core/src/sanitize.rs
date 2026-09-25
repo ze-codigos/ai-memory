@@ -184,6 +184,21 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r#"\b(?:PGPASSWORD|(?:[A-Z][A-Z0-9_]*_)?(?:DB|DATABASE|PG|MYSQL|REDIS|MONGO|RABBITMQ|SMTP|MAIL|FTP|ADMIN|ROOT|USER)_(?:PASS|PWD))\s*=\s*["']?[^\s"'$\[{][^\s"']*"#,
         "env_secret",
     ),
+    // libpq keyword/value strings. `\b` keeps `DB_password=` (env rule's job)
+    // and `PGPASSWORD=` out; a `?password=` was already taken by the query
+    // rule above. No whitespace after `=`, so `password= host=db` does not
+    // swallow the next keyword.
+    (
+        r#"(?i)\bpassword\s*=(?:[^\s'"&$\[{][^\s'"&]*|'[^'$\[{][^']*')"#,
+        "libpq_password",
+    ),
+    // YAML/config lines whose key is a password word. The value must be a
+    // single 6+ char token running to end of line (optionally quoted), so
+    // `password: use o cofre` and placeholders survive.
+    (
+        r#"(?im)^[ \t]*(?:-[ \t]+)?["']?(?:senha|password|passwd|pwd)["']?[ \t]*:[ \t]*["']?[^\s"'$<\[{][^\s"']{5,}["']?[ \t]*\r?$"#,
+        "yaml_secret_field",
+    ),
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
     // even without `sk-` shape).
@@ -775,6 +790,81 @@ mod tests {
             "COMPASS=north",
             "SURPASS=1",
             "USERNAME=joao",
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+    }
+
+    /// libpq keyword/value connection strings (`psql 'host=… password=…'`):
+    /// no underscore-prefixed name and no `?`/`&`, so neither the env nor the
+    /// query-string rule reached them.
+    #[test]
+    fn scrubs_libpq_keyword_password() {
+        for txt in [
+            "psql 'host=db user=app password=FAKEfake123'",
+            "dsn = host=db password=FAKEfake123 dbname=maracufly",
+            "psql \"password='FAKEfake 123' host=db\"",
+        ] {
+            let out = s().scrub(txt);
+            assert!(
+                out.contains("[REDACTED:libpq_password]"),
+                "not redacted: {txt} -> {out}"
+            );
+            assert!(!out.contains("FAKEfake"), "secret survived: {out}");
+        }
+        // Surrounding keywords stay readable.
+        let out = s().scrub("psql 'host=db user=app password=FAKEfake123'");
+        assert!(out.contains("host=db user=app"), "context lost: {out}");
+    }
+
+    #[test]
+    fn libpq_password_leaves_empty_and_references() {
+        let s = s();
+        for text in [
+            "password= host=db",
+            "password=$PGPASS",
+            "password=${DB_PASSWORD}",
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+    }
+
+    /// YAML/config `senha:` / `password:` lines. The JSON rule needs quotes on
+    /// the key and the header rule does not know `senha`.
+    #[test]
+    fn scrubs_yaml_secret_fields() {
+        for txt in [
+            "senha: FAKEfake123",
+            "  password: \"FAKEfake123\"",
+            "db:\n  user: app\n  passwd: 'FAKEfake123'\n  host: x",
+            "- pwd: FAKEfake123\r\n",
+        ] {
+            let out = s().scrub(txt);
+            assert!(
+                out.contains("[REDACTED:"),
+                "not redacted: {txt:?} -> {out:?}"
+            );
+            assert!(!out.contains("FAKEfake123"), "secret survived: {out:?}");
+        }
+        let out = s().scrub("db:\n  user: app\n  passwd: 'FAKEfake123'\n  host: x");
+        assert!(
+            out.contains("user: app") && out.contains("host: x"),
+            "neighbours lost: {out:?}"
+        );
+    }
+
+    /// Prose and placeholders after "senha:" must survive — the strip is
+    /// irreversible.
+    #[test]
+    fn yaml_secret_field_leaves_prose_and_placeholders() {
+        let s = s();
+        for text in [
+            "password: use o cofre",
+            "senha: veja o 1Password",
+            "senha: <redigida>",
+            "password: ${DB_PASSWORD}",
+            "senha: [REDACTED:env_secret]",
+            "password: abc",
         ] {
             assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
         }
