@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher knew. Such a record is abandoned after 48h. (#7)
 
 ### Fixed
+- The privacy strip now redacts credential shapes that reached storage in
+  clear: `PGPASSWORD=` / `MYSQL_PWD=` and service-prefixed `*_PASS=` /
+  `*_PWD=` (e.g. `docker run -e DB_PASS=…`), libpq `password=` keywords,
+  YAML `senha:` / `password:` lines, signed Slack / Teams / Power Automate
+  webhook URLs, and the Hero docs `apiDocToken.<id>=` cookie. Variable
+  references (`$VAR`, `${VAR}`), placeholders and prose after `password:`
+  are left readable, since the strip is irreversible (#12).
 - Batch consolidation now emits `[[wikilinks]]` that actually resolve.
   The prompt asked for links but never showed the model which pages
   exist, so it invented targets from names that scrolled past in the
