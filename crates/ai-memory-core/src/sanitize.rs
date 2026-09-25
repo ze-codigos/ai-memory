@@ -199,26 +199,38 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // Client env vars the generic catch-all below misses: `PGPASSWORD` has no
     // underscore before PASSWORD, and `_PASS`/`_PWD` are not in its suffix
     // list. `_PASS` alone is too common (`BY_PASS`, `FIRST_PASS`), so it is
-    // only a secret behind a service prefix. A value starting with `$`/`${`
-    // is a variable reference — the shape the org rule tells agents to use —
-    // and is left readable.
+    // only a secret behind a service prefix (`USER_PASS` is as often a flag).
+    // A value starting with `$`/`${` is a variable reference — the shape the
+    // org rule tells agents to use — and is left readable, as are `<…>`/`***`
+    // placeholders and backtick substitutions. `=` with no surrounding space
+    // is the shell/dotenv/`-e` shape; `DB_PASS = os.environ[…]` and
+    // `DB_PASS == x` are code. `\\?` accepts the JSON-escaped quote (`\"`)
+    // that compact tool responses and workstream metadata carry.
     (
-        r#"\b(?:PGPASSWORD|(?:[A-Z][A-Z0-9_]*_)?(?:DB|DATABASE|PG|MYSQL|REDIS|MONGO|RABBITMQ|SMTP|MAIL|FTP|ADMIN|ROOT|USER)_(?:PASS|PWD))\s*=\s*["']?[^\s"'$\[{][^\s"']*"#,
+        r#"\b(?:PGPASSWORD|(?:[A-Z][A-Z0-9_]*_)?(?:DB|DATABASE|PG|MYSQL|REDIS|MONGO|RABBITMQ|SMTP|MAIL|FTP|ADMIN|ROOT)_(?:PASS|PWD))=\\?["']?[^\s"'\\$\[{=<*`][^\s"'\\]*"#,
         "env_secret",
     ),
-    // libpq keyword/value strings. `\b` keeps `DB_password=` (env rule's job)
-    // and `PGPASSWORD=` out; a `?password=` was already taken by the query
-    // rule above. No whitespace after `=`, so `password= host=db` does not
-    // swallow the next keyword.
+    // libpq keyword/value strings and `password=` keyword arguments. `\b`
+    // keeps `DB_password=` (env rule's job) and `PGPASSWORD=` out; a
+    // `?password=` was already taken by the query rule above. A quoted value
+    // (`"…"`, `\"…\"` in JSON, `'…'`) is a literal and always a secret. A bare
+    // value stops at `,`/`)`/`;` and must carry a digit: that spares code
+    // (`password=password)`, `password=settings.DB_PASSWORD`, `%s`) at the
+    // cost of all-letter passwords. No whitespace after `=`, so
+    // `password= host=db` does not swallow the next keyword.
     (
-        r#"(?i)\bpassword\s*=(?:[^\s'"&$\[{][^\s'"&]*|'[^'$\[{][^']*')"#,
+        r#"(?i)\bpassword\s*=(?:\\?"[^"\\$\[{%][^"\\]*\\?"|'[^'$\[{%][^']*'|[^\s'"\\&$\[{(),;=%<*]*\d[^\s'"\\&(),;]*)"#,
         "libpq_password",
     ),
     // YAML/config lines whose key is a password word. The value must be a
-    // single 6+ char token running to end of line (optionally quoted), so
-    // `password: use o cofre` and placeholders survive.
+    // single token running to end of line (optionally quoted) and carry a
+    // digit, so prose (`senha: alterada`, `password: use o cofre`), masks
+    // (`********`), placeholders and source-code field types
+    // (`password: String,`) survive. `pwd` is left out: it is the working
+    // directory far more often than a password. `R` makes `$` stop before a
+    // CRLF, so Windows line endings are kept.
     (
-        r#"(?im)^[ \t]*(?:-[ \t]+)?["']?(?:senha|password|passwd|pwd)["']?[ \t]*:[ \t]*["']?[^\s"'$<\[{][^\s"']{5,}["']?[ \t]*\r?$"#,
+        r#"(?imR)^[ \t]*(?:-[ \t]+)?["']?(?:senha|password|passwd)["']?[ \t]*:[ \t]*["']?[^\s"'$<\[{*,;]*\d[^\s"',;]*["']?[ \t]*$"#,
         "yaml_secret_field",
     ),
     // Hero API-docs gate cookie, `apiDocToken.<id>=<value>`. The name alone
@@ -862,7 +874,7 @@ mod tests {
             "senha: FAKEfake123",
             "  password: \"FAKEfake123\"",
             "db:\n  user: app\n  passwd: 'FAKEfake123'\n  host: x",
-            "- pwd: FAKEfake123\r\n",
+            "- senha: FAKEfake123\r\n",
         ] {
             let out = s().scrub(txt);
             assert!(
@@ -890,6 +902,101 @@ mod tests {
             "password: ${DB_PASSWORD}",
             "senha: [REDACTED:env_secret]",
             "password: abc",
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+    }
+
+    /// Review C1: Portuguese prose, masked values and source-code field
+    /// declarations after a password-word key are not secrets. `pwd` is the
+    /// working directory far more often than a password.
+    #[test]
+    fn yaml_secret_field_leaves_prose_code_and_paths() {
+        let s = s();
+        for text in [
+            "Senha: alterada",
+            "senha: obrigatória",
+            "- senha: pendente",
+            "senha: redigida.",
+            "Senha: ********",
+            "  password: string;",
+            "    password: String,",
+            "    pwd: PathBuf,",
+            "PWD: /home/esdrasgc/projetos",
+            "pwd: /home/esdrasgc",
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+    }
+
+    /// CRLF input keeps its line endings.
+    #[test]
+    fn yaml_secret_field_keeps_crlf() {
+        let out = s().scrub("user: app\r\n  passwd: 'FAKEfake123'\r\nhost: x\r\n");
+        assert!(!out.contains("FAKEfake123"), "secret survived: {out:?}");
+        assert!(
+            out.ends_with("\r\nhost: x\r\n"),
+            "line endings changed: {out:?}"
+        );
+        assert!(out.contains("]\r\n"), "CR eaten: {out:?}");
+    }
+
+    /// Review C2: `scrub` also runs on compact JSON (workstream metadata,
+    /// object tool responses), where a quote arrives as `\"`. The escape
+    /// must neither leak the value nor destroy a variable reference.
+    #[test]
+    fn env_and_libpq_rules_handle_json_escaped_quotes() {
+        for txt in [
+            r#"{"command":"PGPASSWORD=\"FAKEfake123\" psql -h db"}"#,
+            r#"{"cmd":"psql password=\"FAKEfake123\" host=db"}"#,
+        ] {
+            let out = s().scrub(txt);
+            assert!(out.contains("[REDACTED:"), "not redacted: {txt} -> {out}");
+            assert!(!out.contains("FAKEfake123"), "secret survived: {out}");
+        }
+        let text = r#"{"command":"PGPASSWORD=\"$AURORA_PROD_DB_PASSWORD\" psql"}"#;
+        assert_eq!(s().scrub(text), text, "variable reference destroyed");
+    }
+
+    /// Review I1: hardcoded double-quoted literals are secrets; variable
+    /// names, format placeholders and trailing keywords are not.
+    #[test]
+    fn libpq_password_catches_quoted_literals_and_spares_code() {
+        for txt in [
+            r#"password="FAKEfake123""#,
+            r#"--password="FAKEfake123""#,
+            r#"psycopg.connect(host="db", password="FAKEfake123")"#,
+        ] {
+            let out = s().scrub(txt);
+            assert!(out.contains("[REDACTED:"), "not redacted: {txt} -> {out}");
+            assert!(!out.contains("FAKEfake123"), "secret survived: {out}");
+        }
+        let s = s();
+        for text in [
+            "psycopg.connect(host=h, password=password)",
+            "URL.create(password=settings.DB_PASSWORD, host=h)",
+            "auth=(user, password=pw)",
+            "cursor.execute(sql, password=%s)",
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+        let out = s.scrub("Server=x;Password=FAKE1fake;Database=d");
+        assert!(out.ends_with(";Database=d"), "trailing keyword lost: {out}");
+        assert!(!out.contains("FAKE1fake"), "secret survived: {out}");
+    }
+
+    /// Review I2: comparisons, spaced source-code assignments, `USER_PASS`
+    /// flags and placeholders are not secrets.
+    #[test]
+    fn short_suffix_env_spares_code_and_placeholders() {
+        let s = s();
+        for text in [
+            "DB_PASS == other",
+            "if DB_PASS=='': pass",
+            r#"DB_PASS = os.environ["DB_PASS"]"#,
+            "USER_PASS=true",
+            "DB_PASS=<senha>",
+            "DB_PASS=***",
         ] {
             assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
         }
