@@ -21,7 +21,12 @@
 //! xoxb/xoxp…, AWS AKIA/ASIA…), PEM-bracketed private
 //! keys, URL-embedded credentials (`postgres://user:pass@host`), and
 //! anything matching the generic `*_(KEY|TOKEN|SECRET|PASSWORD|
-//! CREDENTIAL)=value` shape. Operators can extend the list via
+//! CREDENTIAL)=value` shape. The ze-codigos fork adds client env vars
+//! (`PGPASSWORD`, `MYSQL_PWD`, service-prefixed `*_PASS`/`*_PWD`), libpq
+//! `password=` keywords, YAML `senha:`/`password:` lines, signed
+//! Slack/Teams/Power Automate webhook URLs and the Hero docs cookie; values
+//! that are variable references (`$VAR`, `${VAR}`) or placeholders (`<…>`)
+//! are left readable. Operators can extend the list via
 //! `[sanitize].extra_patterns` and exempt substrings via
 //! `[sanitize].allowlist` — the allowlist is checked *per match*, so a
 //! pattern still runs but an allowlisted span survives unchanged.
@@ -154,6 +159,23 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // upstream header rule above (better false-positive discipline); what
     // remains are the four shapes it does not cover.
     //
+    // Signed webhook URLs: the path (Slack, Teams) or the trigger URL (Power
+    // Automate / Logic Apps) is the credential — anyone holding it can post.
+    // Anchored on the vendor host plus the credential-bearing path so docs
+    // links such as api.slack.com or learn.microsoft.com survive. Placed
+    // before the query-string rule so the whole URL gets one label.
+    (
+        r#"https://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_\-]+"#,
+        "webhook_url",
+    ),
+    (
+        r#"https://[A-Za-z0-9.\-]*webhook\.office\.com/[^\s"'<>]+"#,
+        "webhook_url",
+    ),
+    (
+        r#"https://[A-Za-z0-9.\-]*(?:logic\.azure\.com|api\.powerplatform\.com)(?::\d+)?/[^\s"'<>]*/triggers/[^\s"'<>]+"#,
+        "webhook_url",
+    ),
     // curl `-u`/`--user` inline credentials.
     (
         r#"(?i)(?:^|\s)--?u(?:ser)?[ =]+["']?[^\s:"']+:[^\s"']+"#,
@@ -199,6 +221,9 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r#"(?im)^[ \t]*(?:-[ \t]+)?["']?(?:senha|password|passwd|pwd)["']?[ \t]*:[ \t]*["']?[^\s"'$<\[{][^\s"']{5,}["']?[ \t]*\r?$"#,
         "yaml_secret_field",
     ),
+    // Hero API-docs gate cookie, `apiDocToken.<id>=<value>`. The name alone
+    // (as it appears in docs and runbooks) is kept.
+    (r#"apiDocToken\.\d+=[^;\s"']{8,}"#, "cookie_token"),
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
     // even without `sk-` shape).
@@ -867,6 +892,86 @@ mod tests {
             "password: abc",
         ] {
             assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+    }
+
+    /// Signed webhook URLs are bearer-equivalent: whoever has the URL can post.
+    /// Fixtures are assembled at runtime so secret scanners never see a
+    /// webhook-shaped literal in this file.
+    #[test]
+    fn scrubs_signed_webhook_urls() {
+        let slack = format!(
+            "https://hooks.slack.com/{}/T0FAKE000/B0FAKE000/FAKEfakeFAKE",
+            "services"
+        );
+        let teams = format!(
+            "https://acme.{}/webhookb2/FAKE-guid@FAKE-tenant/IncomingWebhook/FAKEfake/FAKE-id",
+            "webhook.office.com"
+        );
+        let flow = format!(
+            "https://prod-12.westus.{}:443/workflows/FAKE/triggers/manual/paths/invoke?api-version=1&sig=FAKEsig",
+            "logic.azure.com"
+        );
+        let pp = format!(
+            "https://FAKEenv.{}/powerautomate/automations/direct/workflows/FAKE/triggers/manual/paths/invoke",
+            "environment.api.powerplatform.com"
+        );
+        for url in [&slack, &teams, &flow, &pp] {
+            let out = s().scrub(&format!("curl -X POST {url} -d '{{}}'"));
+            assert!(
+                out.contains("[REDACTED:webhook_url]"),
+                "not redacted: {url} -> {out}"
+            );
+            assert!(!out.contains("FAKE"), "webhook survived: {out}");
+            assert!(
+                out.starts_with("curl -X POST ") && out.ends_with(" -d '{}'"),
+                "context lost: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_pattern_leaves_documentation_urls() {
+        let s = s();
+        for text in [
+            "https://api.slack.com/messaging/webhooks",
+            "https://learn.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/what-are-webhooks-and-connectors",
+            "https://hooks.slack.com/",
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+    }
+
+    /// Hero API docs gate cookie (`apiDocToken.<id>=<value>`).
+    #[test]
+    fn scrubs_hero_doc_cookie() {
+        let out = s().scrub("Cookie: apiDocToken.753206=FAKEfakeFAKE1234; other=1");
+        assert!(out.contains("[REDACTED:cookie_token]"), "got: {out}");
+        assert!(!out.contains("FAKEfake"), "cookie survived: {out}");
+        assert!(out.contains("other=1"), "neighbour cookie lost: {out}");
+
+        let text = "o cookie apiDocToken.753206 fica no .env";
+        assert_eq!(s().scrub(text), text);
+    }
+
+    /// Every new shape must be stable under a second pass (consolidator and
+    /// wiki writer can both scrub the same text).
+    #[test]
+    fn new_patterns_are_idempotent() {
+        let slack = format!(
+            "https://hooks.slack.com/{}/T0FAKE000/B0FAKE000/FAKEfakeFAKE",
+            "services"
+        );
+        for txt in [
+            "PGPASSWORD=FAKEfake123 psql",
+            "docker run -e DB_PASS=FAKEfake123 img",
+            "psql 'host=db password=FAKEfake123'",
+            "senha: FAKEfake123",
+            slack.as_str(),
+            "Cookie: apiDocToken.753206=FAKEfakeFAKE1234",
+        ] {
+            let once = s().scrub(txt);
+            assert_eq!(s().scrub(&once), once, "not idempotent: {txt}");
         }
     }
 
