@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher knew. Such a record is abandoned after 48h. (#7)
 
 ### Fixed
+- `PGPASSWORD=` / `DB_PASS=`-style assignments and libpq `password=` at the
+  start of a line inside JSON-serialized tool output are now redacted: the
+  name follows a literal `\n` there, where the word boundary the rules
+  required does not hold. The escape is kept (#14).
 - The YAML `senha:` / `password:` redaction now also fires inside
   JSON-serialized tool output, where hook capture stores a line break as the
   two characters `\n`; before, the value reached storage in clear. Escaped
