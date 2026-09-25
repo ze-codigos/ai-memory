@@ -174,6 +174,16 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r#"(?i)[?&](?:api_?key|apikey|token|access_token|refresh_token|secret|client_secret|password|passwd|senha|signature|sig|auth)=[^&\s"']+"#,
         "query_credentials",
     ),
+    // Client env vars the generic catch-all below misses: `PGPASSWORD` has no
+    // underscore before PASSWORD, and `_PASS`/`_PWD` are not in its suffix
+    // list. `_PASS` alone is too common (`BY_PASS`, `FIRST_PASS`), so it is
+    // only a secret behind a service prefix. A value starting with `$`/`${`
+    // is a variable reference — the shape the org rule tells agents to use —
+    // and is left readable.
+    (
+        r#"\b(?:PGPASSWORD|(?:[A-Z][A-Z0-9_]*_)?(?:DB|DATABASE|PG|MYSQL|REDIS|MONGO|RABBITMQ|SMTP|MAIL|FTP|ADMIN|ROOT|USER)_(?:PASS|PWD))\s*=\s*["']?[^\s"'$\[{][^\s"']*"#,
+        "env_secret",
+    ),
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
     // even without `sk-` shape).
@@ -728,6 +738,46 @@ mod tests {
         assert!(out2.contains("[REDACTED:"));
         let out3 = s().scrub("DB_PASSWORD=hunter2");
         assert!(out3.contains("[REDACTED:"));
+    }
+
+    /// Postgres/MySQL client env vars and service-prefixed `_PASS`/`_PWD`
+    /// assignments: the generic catch-all needs a `_PASSWORD`-style suffix
+    /// after an underscore, so `PGPASSWORD=` and `DB_PASS=` slipped through.
+    #[test]
+    fn scrubs_short_suffix_env_passwords() {
+        for txt in [
+            "PGPASSWORD=FAKEfake123 psql -h db",
+            "export MYSQL_PWD=FAKEfake123",
+            "docker run -e DB_PASS=FAKEfake123 img",
+            "REDIS_PWD=FAKEfake123",
+            "APP_DB_PASS='FAKEfake123'",
+        ] {
+            let out = s().scrub(txt);
+            assert!(
+                out.contains("[REDACTED:env_secret]"),
+                "not redacted: {txt} -> {out}"
+            );
+            assert!(!out.contains("FAKEfake123"), "secret survived: {out}");
+        }
+    }
+
+    /// The rule tells agents to pass `$VAR` instead of the literal; that
+    /// command must survive, and so must identifiers that merely contain PASS.
+    #[test]
+    fn short_suffix_env_leaves_variable_references() {
+        let s = s();
+        for text in [
+            r#"PGPASSWORD="$AURORA_PROD_DB_PASSWORD" psql"#,
+            "DB_PASS=$DB_PASSWORD",
+            "MYSQL_PWD=${MYSQL_ROOT_PASSWORD}",
+            "BY_PASS=true",
+            "FIRST_PASS=1",
+            "COMPASS=north",
+            "SURPASS=1",
+            "USERNAME=joao",
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
     }
 
     /// The value character class excludes `[`, so a value already replaced
