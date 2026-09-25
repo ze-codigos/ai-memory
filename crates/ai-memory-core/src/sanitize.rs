@@ -246,9 +246,20 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // (`********`), placeholders and source-code field types
     // (`password: String,`) survive. `pwd` is left out: it is the working
     // directory far more often than a password. `R` makes `$` stop before a
-    // CRLF, so Windows line endings are kept.
+    // CRLF, so Windows line endings are kept. The key is kept readable.
     (
-        r#"(?imR)^[ \t]*(?:-[ \t]+)?["']?(?:senha|password|passwd)["']?[ \t]*:[ \t]*["']?[^\s"'$<\[{*,;]*\d[^\s"',;]*["']?[ \t]*$"#,
+        r#"(?imR)(?P<keep_pre>^[ \t]*(?:-[ \t]+)?["']?(?:senha|password|passwd)["']?[ \t]*:[ \t]*)["']?[^\s"'$<\[{*,;]*\d[^\s"',;]*["']?[ \t]*$"#,
+        "yaml_secret_field",
+    ),
+    // The same lines inside a JSON string — how hook capture stores tool
+    // output — where a line break is the two characters `\n` and `^`/`$`
+    // never fire. The line must end at the next escape (`\n`, `\"`) or the
+    // closing quote; only the backslash is consumed (and kept), so on the
+    // next line the pattern resumes at the bare `n`, which `\b` accepts.
+    // Escaped tabs (`\t`), escaped backslashes inside the value (`\\`) and
+    // quotes escaped more than once (JSON inside a JSON string) are accepted.
+    (
+        r#"(?i)(?P<keep_pre>(?:\\|\b)n(?:[ \t]|\\t)*(?:-(?:[ \t]|\\t)+)?(?:\\*["'])?(?:senha|password|passwd)(?:\\*["'])?(?:[ \t]|\\t)*:(?:[ \t]|\\t)*)(?:\\*["'])?(?:[^\s"'\\$<\[{*,;]|\\\\)*\d(?:[^\s"'\\,;]|\\\\)*(?:\\*["'])?(?:[ \t]|\\t)*(?P<keep_post>\\|"|$)"#,
         "yaml_secret_field",
     ),
     // Hero API-docs gate cookie, `apiDocToken.<id>=<value>`. The name alone
@@ -345,7 +356,14 @@ impl Sanitizer {
                         m.to_string()
                     } else {
                         debug!(pattern = re.as_str(), "sanitize: redacted match");
-                        format!("[REDACTED:{label}]")
+                        // A pattern may name the context it has to consume
+                        // but must not destroy (`keep_pre` / `keep_post`).
+                        let keep = |name| caps.name(name).map_or("", |g| g.as_str());
+                        format!(
+                            "{}[REDACTED:{label}]{}",
+                            keep("keep_pre"),
+                            keep("keep_post")
+                        )
                     }
                 })
                 .into_owned();
@@ -932,6 +950,80 @@ mod tests {
         ] {
             assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
         }
+    }
+
+    /// Hook capture stores tool output as a JSON string, so a line break
+    /// reaches the sanitizer as the two characters `\n`. The YAML rule must
+    /// fire there too (smoke of #12: `senha: …` survived) and keep the key
+    /// and the surrounding escapes readable.
+    #[test]
+    fn yaml_secret_field_inside_json_serialized_output() {
+        let txt =
+            r#"{"stdout":"x\nsenha: FAKEfake123\npassword: \"FAKEfake456\"\ny: 1","stderr":""}"#;
+        let out = s().scrub(txt);
+        assert!(
+            !out.contains("FAKEfake123") && !out.contains("FAKEfake456"),
+            "secret survived: {out}"
+        );
+        assert!(
+            out.contains(r#"\nsenha: [REDACTED:yaml_secret_field]\n"#),
+            "key or escapes lost: {out}"
+        );
+        assert!(out.ends_with(r#"\ny: 1","stderr":""}"#), "tail lost: {out}");
+
+        let tail = r#"{"stdout":"x\nsenha: FAKEfake123"}"#;
+        let out = s().scrub(tail);
+        assert_eq!(
+            out,
+            r#"{"stdout":"x\nsenha: [REDACTED:yaml_secret_field]"}"#
+        );
+    }
+
+    /// Prose and code inside JSON-serialized output survive, and a second
+    /// pass changes nothing.
+    #[test]
+    fn yaml_secret_field_in_json_spares_prose_and_is_idempotent() {
+        let s = s();
+        for text in [
+            r#"{"stdout":"a\nsenha: alterada\nb"}"#,
+            r#"{"stdout":"struct X {\n    password: String,\n}"}"#,
+            r#"{"stdout":"a\nsenha: veja o 1Password\nb"}"#,
+            r#"{"stdout":"a\npassword: ${DB_PASSWORD}\nb"}"#,
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+        let once = s.scrub(r#"{"stdout":"x\nsenha: FAKEfake123\npasswd: 'FAKE1'\ny"}"#);
+        assert!(!once.contains("FAKE"), "secret survived: {once}");
+        assert_eq!(s.scrub(&once), once, "not idempotent");
+    }
+
+    /// Review of the JSON rule: a JSON-escaped backslash inside the value, a
+    /// JSON-escaped tab (`\t`) around the key, and a doubly escaped quote
+    /// (JSON inside a JSON string) must not let the value through.
+    #[test]
+    fn yaml_secret_field_in_json_handles_escapes() {
+        for (txt, secret) in [
+            (r#"{"o":"x\nsenha: 12\\ab\ny"}"#, r"\\ab"),
+            (r#"{"o":"x\nsenha: abc\\1def\ny"}"#, "1def"),
+            (r#"{"o":"x\n\tsenha: FAKEe5\ny"}"#, "FAKEe5"),
+            (r#"{"o":"x\nsenha:\tFAKEf6\ny"}"#, "FAKEf6"),
+            (
+                r#"{"o":"{\"stdout\":\"x\\nsenha: \\\"FAKEm14\\\"\\ny\"}"}"#,
+                "FAKEm14",
+            ),
+        ] {
+            let out = s().scrub(txt);
+            assert!(!out.contains(secret), "secret survived: {txt} -> {out}");
+            assert!(out.contains("senha:"), "key lost: {out}");
+            assert_eq!(s().scrub(&out), out, "not idempotent: {txt}");
+        }
+    }
+
+    /// The key stays readable in plain text as well.
+    #[test]
+    fn yaml_secret_field_keeps_the_key() {
+        let out = s().scrub("db:\n  senha: FAKEfake123\n  host: x");
+        assert_eq!(out, "db:\n  senha: [REDACTED:yaml_secret_field]\n  host: x");
     }
 
     /// CRLF input keeps its line endings.
