@@ -196,7 +196,25 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r#"(?i)[?&](?:api_?key|apikey|token|access_token|refresh_token|secret|client_secret|password|passwd|senha|signature|sig|auth)=[^&\s"']+"#,
         "query_credentials",
     ),
-    // Client env vars the generic catch-all below misses: `PGPASSWORD` has no
+    // Provider-specific env-var assignments (kept explicit for clarity
+    // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
+    // even without `sk-` shape).
+    (
+        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)\s*[=:]\s*\S+"#,
+        "env_secret",
+    ),
+    // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
+    // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
+    (
+        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)\s*[=:]\s*\S+"#,
+        "env_secret",
+    ),
+    // ze-codigos fork, continued: these run AFTER the provider and generic
+    // env rules on purpose. Their value classes stop only at whitespace or a
+    // quote, so running first they could swallow the key of a glued-on
+    // `…_PASSWORD=` and hide it from the catch-all; running last, anything
+    // the older rules claimed is already `[REDACTED:…]`, which they skip.
+    // Client env vars the generic catch-all above misses: `PGPASSWORD` has no
     // underscore before PASSWORD, and `_PASS`/`_PWD` are not in its suffix
     // list. `_PASS` alone is too common (`BY_PASS`, `FIRST_PASS`), so it is
     // only a secret behind a service prefix (`USER_PASS` is as often a flag).
@@ -236,19 +254,6 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // Hero API-docs gate cookie, `apiDocToken.<id>=<value>`. The name alone
     // (as it appears in docs and runbooks) is kept.
     (r#"apiDocToken\.\d+=[^;\s"']{8,}"#, "cookie_token"),
-    // Provider-specific env-var assignments (kept explicit for clarity
-    // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
-    // even without `sk-` shape).
-    (
-        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)\s*[=:]\s*\S+"#,
-        "env_secret",
-    ),
-    // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
-    // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
-    (
-        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)\s*[=:]\s*\S+"#,
-        "env_secret",
-    ),
     // Filesystem paths that commonly contain credentials.
     (r"(?:/[^/\s]+)*/\.ssh(?:/[^\s]+)?", "credential_path"),
     (r"(?:/[^/\s]+)*/\.aws(?:/[^\s]+)?", "credential_path"),
@@ -999,6 +1004,22 @@ mod tests {
             "DB_PASS=***",
         ] {
             assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
+        }
+    }
+
+    /// Security review: a new rule's value class must not swallow the key of
+    /// a glued-on assignment the generic catch-all used to redact.
+    #[test]
+    fn new_rules_do_not_hide_a_following_generic_secret() {
+        for txt in [
+            r#"DB_PASS=aDB_PASSWORD="FAKEfake123""#,
+            "apiDocToken.1=abcdefghDB_PASSWORD: FAKEfake123",
+        ] {
+            let out = s().scrub(txt);
+            assert!(
+                !out.contains("FAKEfake123"),
+                "secret survived: {txt} -> {out}"
+            );
         }
     }
 
