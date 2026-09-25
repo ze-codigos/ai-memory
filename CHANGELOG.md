@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher knew. Such a record is abandoned after 48h. (#7)
 
 ### Fixed
+- The YAML `senha:` / `password:` redaction now also fires inside
+  JSON-serialized tool output, where hook capture stores a line break as the
+  two characters `\n`; before, the value reached storage in clear. Escaped
+  tabs, backslashes and nested quotes are handled, and the key stays readable
+  (`senha: [REDACTED:…]`) unless an earlier header rule already claimed the
+  line (#13).
 - The privacy strip now redacts credential shapes that reached storage in
   clear: `PGPASSWORD=` / `MYSQL_PWD=` and service-prefixed `*_PASS=` /
   `*_PWD=` (e.g. `docker run -e DB_PASS=…`), libpq `password=` keywords,
