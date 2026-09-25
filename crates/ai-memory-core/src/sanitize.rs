@@ -223,9 +223,12 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // placeholders and backtick substitutions. `=` with no surrounding space
     // is the shell/dotenv/`-e` shape; `DB_PASS = os.environ[…]` and
     // `DB_PASS == x` are code. `\\?` accepts the JSON-escaped quote (`\"`)
-    // that compact tool responses and workstream metadata carry.
+    // that compact tool responses and workstream metadata carry. At the start
+    // of a line inside such JSON the name follows a literal `\n`, where `\b`
+    // does not hold, so an escaped `\n`/`\r`/`\t` also opens the match and
+    // is kept.
     (
-        r#"\b(?:PGPASSWORD|(?:[A-Z][A-Z0-9_]*_)?(?:DB|DATABASE|PG|MYSQL|REDIS|MONGO|RABBITMQ|SMTP|MAIL|FTP|ADMIN|ROOT)_(?:PASS|PWD))=\\?["']?[^\s"'\\$\[{=<*`][^\s"'\\]*"#,
+        r#"(?:(?P<keep_pre>\\[nrt])|\b)(?:PGPASSWORD|(?:[A-Z][A-Z0-9_]*_)?(?:DB|DATABASE|PG|MYSQL|REDIS|MONGO|RABBITMQ|SMTP|MAIL|FTP|ADMIN|ROOT)_(?:PASS|PWD))=\\?["']?[^\s"'\\$\[{=<*`][^\s"'\\]*"#,
         "env_secret",
     ),
     // libpq keyword/value strings and `password=` keyword arguments. `\b`
@@ -235,9 +238,10 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // value stops at `,`/`)`/`;` and must carry a digit: that spares code
     // (`password=password)`, `password=settings.DB_PASSWORD`, `%s`) at the
     // cost of all-letter passwords. No whitespace after `=`, so
-    // `password= host=db` does not swallow the next keyword.
+    // `password= host=db` does not swallow the next keyword. Like the env
+    // rule above, it also starts after a JSON-escaped `\n`/`\r`/`\t`.
     (
-        r#"(?i)\bpassword\s*=(?:\\?"[^"\\$\[{%][^"\\]*\\?"|'[^'$\[{%][^']*'|[^\s'"\\&$\[{(),;=%<*]*\d[^\s'"\\&(),;]*)"#,
+        r#"(?i)(?:(?P<keep_pre>\\[nrt])|\b)password\s*=(?:\\?"[^"\\$\[{%][^"\\]*\\?"|'[^'$\[{%][^']*'|[^\s'"\\&$\[{(),;=%<*]*\d[^\s'"\\&(),;]*)"#,
         "libpq_password",
     ),
     // YAML/config lines whose key is a password word. The value must be a
@@ -1016,6 +1020,47 @@ mod tests {
             assert!(!out.contains(secret), "secret survived: {txt} -> {out}");
             assert!(out.contains("senha:"), "key lost: {out}");
             assert_eq!(s().scrub(&out), out, "not idempotent: {txt}");
+        }
+    }
+
+    /// Smoke of #13: at the start of a line inside JSON-serialized output the
+    /// name follows the literal escape `\n`, where `\b` does not hold (`n`
+    /// and `P` are both word characters), so `PGPASSWORD=` went through.
+    #[test]
+    fn env_and_libpq_rules_fire_after_json_escapes() {
+        for (txt, kept) in [
+            (
+                r#"{"o":"x\nPGPASSWORD=FAKEfake123\ny"}"#,
+                r"x\n[REDACTED:env_secret]\ny",
+            ),
+            (
+                r#"{"o":"x\n\tDB_PASS=FAKEfake123\ny"}"#,
+                r"\t[REDACTED:env_secret]\ny",
+            ),
+            (
+                r#"{"o":"x\r\nMYSQL_PWD=FAKEfake123"}"#,
+                r"\r\n[REDACTED:env_secret]",
+            ),
+            (
+                r#"{"o":"x\npassword=FAKEfake123 host=db"}"#,
+                r"x\n[REDACTED:libpq_password] host=db",
+            ),
+        ] {
+            let out = s().scrub(txt);
+            assert!(
+                !out.contains("FAKEfake123"),
+                "secret survived: {txt} -> {out}"
+            );
+            assert!(out.contains(kept), "escape lost: {txt} -> {out}");
+            assert_eq!(s().scrub(&out), out, "not idempotent: {txt}");
+        }
+        let s = s();
+        for text in [
+            r#"{"o":"x\nPGPASSWORD=\"$AURORA_PROD_DB_PASSWORD\" psql"}"#,
+            r#"{"o":"x\nFIRST_PASS=1\ny"}"#,
+            r#"{"o":"x\nfn f(password=password)"}"#,
+        ] {
+            assert_eq!(s.scrub(text), text, "must survive verbatim: {text}");
         }
     }
 
