@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher knew. Such a record is abandoned after 48h. (#7)
 
 ### Fixed
+- The hook spool drainer no longer charges a retry attempt when no server
+  took the request (connection refused, DNS failure, timeout). The
+  mid-session catch-up on `post-tool-use` uses 250ms as both its budget and
+  its request timeout; against a remote server slower than that every tool
+  call timed out, bumped the oldest event's `attempts`, and deleted it at
+  `MAX_ATTEMPTS` within a single long turn — silent loss, since the
+  catch-up's result is discarded. Only a server that answered and refused
+  is charged now; a dead address is bounded by the 7-day TTL. Same contract
+  as upstream 49b5f970. `hook-drain --help` states the contract so the
+  passabot-memory companion can tell a fixed binary from an old one.
 - `PGPASSWORD=` / `DB_PASS=`-style assignments and libpq `password=` at the
   start of a line inside JSON-serialized tool output are now redacted: the
   name follows a literal `\n` there, where the word boundary the rules

@@ -102,6 +102,8 @@ pub enum Command {
     /// hook config; mirrors hooks/<agent>/<event>.sh.
     Hook(HookArgs),
     /// Hidden hook spool drainer used by native session-end hooks.
+    ///
+    /// Transport errors (refused, DNS, timeout) never charge retry attempts.
     #[command(hide = true, name = "hook-drain")]
     HookDrain(HookDrainArgs),
     /// Print MCP server registration snippets for any supported client.
