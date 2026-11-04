@@ -39,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher knew. Such a record is abandoned after 48h. (#7)
 
 ### Fixed
+- `gemini-3.8-flash` no longer spends hidden thinking tokens on strict-JSON
+  calls (consolidation, auto-improve, lint): the Gemini provider sends
+  `thinkingBudget = 0` for it, as it already did for 2.5 and 3.5 Flash.
+  Cherry-picked from upstream 5151b6af (2.6.0).
+- The auto-improve review, per-session and cross-session (experience), asks
+  for 32K output tokens instead of 16K, from one shared constant. Long
+  sessions' reviews were cut mid-JSON and failed with `serde: EOF while
+  parsing`, about three a day in production, losing that session's
+  gotcha/procedure extraction.
 - `PGPASSWORD=` / `DB_PASS=`-style assignments and libpq `password=` at the
   start of a line inside JSON-serialized tool output are now redacted: the
   name follows a literal `\n` there, where the word boundary the rules
