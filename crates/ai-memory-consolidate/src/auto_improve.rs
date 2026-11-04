@@ -48,7 +48,13 @@ pub const DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS: usize = MAX_PROPOSAL_BODY_C
 pub const DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS: usize = 2_000;
 /// Default approximate token budget for one procedure page.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS: usize = 2_000;
-const DEFAULT_REVIEW_MAX_TOKENS: u32 = 16_000;
+/// Output budget for one review, shared by the per-session reviewer and the
+/// cross-session experience review (both decode `AutoImproveLlmResponse`).
+/// 16K cut long sessions' answers mid-JSON (serde EOF at ~60-90K chars
+/// observed in production). 32K covers those; it is not the theoretical
+/// maximum (5 proposals x 32K-char bodies is ~40K+ tokens). It matches the
+/// budget `lint` already sends; only generated tokens are billed.
+pub(crate) const DEFAULT_REVIEW_MAX_TOKENS: u32 = 32_000;
 const MAX_SESSION_PAGE_CHARS: usize = 32_000;
 const SAMPLE_LIMIT_WITH_SESSION_PAGE: usize = 48;
 const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
@@ -1872,7 +1878,12 @@ mod tests {
     use jiff::Timestamp;
     use tempfile::TempDir;
 
-    struct FakeLlm;
+    /// Records the output budget of the last structured call so tests can pin
+    /// the reviewer's `max_tokens`.
+    #[derive(Default)]
+    struct FakeLlm {
+        last_max_tokens: std::sync::Mutex<Option<u32>>,
+    }
 
     #[test]
     fn auto_improve_prompt_rejects_embedded_memory_instructions() {
@@ -1901,9 +1912,10 @@ mod tests {
 
         async fn complete_structured_raw(
             &self,
-            _request: ChatRequest,
+            request: ChatRequest,
             _schema: serde_json::Value,
         ) -> LlmResult<serde_json::Value> {
+            *self.last_max_tokens.lock().unwrap() = Some(request.max_tokens);
             Ok(serde_json::json!({
                 "summary": "found one durable procedure",
                 "proposals": [{
@@ -2308,9 +2320,10 @@ mod tests {
                 .unwrap();
         }
 
+        let llm = FakeLlm::default();
         let report = run_auto_improve_review(
             &store.reader,
-            &FakeLlm,
+            &llm,
             ws,
             proj,
             session_id,
@@ -2327,6 +2340,9 @@ mod tests {
         assert_eq!(report.proposals.len(), 1);
         assert_eq!(report.proposals[0].path, "procedures/release.md");
         assert!(report.rejected_candidates.is_empty());
+        // A long session's review used to stop at 16K output tokens and fail
+        // with a serde EOF on the cut JSON (~60-90K chars). It now asks for 32K.
+        assert_eq!(*llm.last_max_tokens.lock().unwrap(), Some(32_000));
     }
 
     #[test]

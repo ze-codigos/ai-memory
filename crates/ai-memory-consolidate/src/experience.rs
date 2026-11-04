@@ -48,8 +48,6 @@ impl Default for ExperienceConfig {
     }
 }
 
-const REVIEW_MAX_TOKENS: u32 = 16_000;
-
 /// Run one cross-session review for a scope. Returns the same report
 /// shape as the per-session reviewer so callers stage proposals through
 /// the identical path.
@@ -183,7 +181,7 @@ pub async fn run_experience_review(
             role: Role::User,
             content: prompt,
         }],
-        max_tokens: REVIEW_MAX_TOKENS,
+        max_tokens: crate::auto_improve::DEFAULT_REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
     let raw: AutoImproveLlmResponse = complete_structured(llm, request)
